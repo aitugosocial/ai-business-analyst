@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+*.egg-info/
+
+# Logs
+ai/logs/*.log
+
+# Data and models
+ai/data/*.csv
+*.model
+*.bin
+
+# IDE
+.vscode/
+*.code-workspace
