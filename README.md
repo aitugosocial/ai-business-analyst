@@ -12,7 +12,7 @@ A FastAPI-based app for recommending AI tools and providing business insights fo
 
 ## Structure
 - ai/: AI logic (recommendation, analyst)
-- web/: Frontend (Collins)
-- db/: DB setup (Collins)
-- api/: FastAPI backend (shared)
+- web/: Frontend
+- db/: DB setup
+- api/: FastAPI backend 
 - tests/: Tests
