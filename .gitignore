@@ -17,4 +17,8 @@ ai/data/*.csv
 
 # IDE
 .vscode/
+<<<<<<< HEAD
 *.code-workspace
+=======
+*.code-workspace
+>>>>>>> master
