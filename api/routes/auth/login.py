@@ -262,12 +262,16 @@ def update_profile(
     user = current_user
     role = "admin" if user.is_admin else "user"
 
+    email_changed = False
     if update_data.email and update_data.email != user.email:
-        # Check if email is already taken
-        existing_user = db.query(User).filter(User.email == update_data.email).first()
+        existing_user = db.query(User).filter(
+            User.email == update_data.email,
+            User.id != user.id,
+        ).first()
         if existing_user:
-            raise HTTPException(status_code=400, detail="Email is already in use")
+            raise HTTPException(status_code=400, detail="Email is already in use by another account")
         user.email = update_data.email
+        email_changed = True
 
     if update_data.name:
         user.name = update_data.name
@@ -285,6 +289,16 @@ def update_profile(
     db.commit()
     db.refresh(user)
 
+    # JWT sub is the user's email. Changing the email invalidates the existing
+    # token immediately, so issue a fresh one with the new address as sub.
+    if email_changed:
+        new_token = create_access_token(
+            {"sub": user.email},
+            expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        )
+    else:
+        new_token = ""
+
     return {
         "id": user.id,
         "name": user.name,
@@ -299,7 +313,7 @@ def update_profile(
         "two_factor_enabled": user.two_factor_enabled,
         "email_notifications": user.email_notifications,
         "created_at": user.created_at,
-        "access_token": "", # Frontend already has it, or we could pass update_data's if needed
+        "access_token": new_token,
         "token_type": "bearer",
         "is_beta_user": user.is_beta_user,
         "subscription_expires_at": user.subscription_expires_at,
