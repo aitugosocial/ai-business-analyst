@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 from datetime import datetime
 
 from database.pg_connections import get_db
@@ -192,10 +193,10 @@ async def get_unread_alerts_count(
     current_user=Depends(get_current_user),
 ):
     """
-    Returns the count of active alerts the current user has not yet viewed.
-    Polled by the frontend every 2 minutes to drive the sidebar badge.
-    The counter reflects ALL alerts in the database the user hasn't opened —
-    it drops to 0 after the user visits the alerts page (mark-all-read).
+    Returns the count of active alerts the current user has not yet viewed,
+    scoped to alerts published on or after their account creation date.
+    A user only 'owns' alerts that existed when they joined or arrived later.
+    Polled every 2 minutes; also triggered after each page is viewed.
     """
     user_id = current_user.id
     viewed_ids = (
@@ -204,7 +205,11 @@ async def get_unread_alerts_count(
     )
     count = (
         db.query(func.count(Alert.id))
-        .filter(Alert.is_active == True, ~Alert.id.in_(viewed_ids))
+        .filter(
+            Alert.is_active == True,
+            Alert.created_at >= current_user.created_at,
+            ~Alert.id.in_(viewed_ids),
+        )
         .scalar()
     ) or 0
     return {"count": count}
@@ -232,7 +237,14 @@ async def get_alerts_paginated(
     limit = max(1, min(limit, 50))
     skip = (page - 1) * limit
 
-    base_query = db.query(Alert).filter(Alert.is_active == True)
+    base_query = db.query(Alert).filter(
+        Alert.is_active == True,
+        # Only surface alerts that existed on or after the user's join date.
+        # For users registered before all alerts this is all alerts.
+        # For new users this scopes to alerts published after they signed up,
+        # keeping the list and the unread-count consistent with each other.
+        Alert.created_at >= current_user.created_at,
+    )
     if category:
         base_query = base_query.filter(Alert.category == category)
     if priority:
@@ -621,6 +633,53 @@ def pin_alert(
     db.commit()
 
     return {"message": "Alert pinned", "is_pinned": True}
+
+class MarkPageReadRequest(BaseModel):
+    alert_ids: List[int]
+
+@router.post("/alerts/mark-page-read")
+async def mark_page_alerts_read(
+    body: MarkPageReadRequest,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Mark a specific set of alert IDs as viewed for the current user.
+    Called after each page of alerts is rendered so the sidebar badge
+    decrements page-by-page rather than resetting all at once.
+    """
+    if not body.alert_ids:
+        return {"status": "ok", "marked": 0}
+
+    user_id = current_user.id
+    existing_map = {
+        ua.alert_id: ua
+        for ua in db.query(UserAlert).filter(
+            UserAlert.user_id == user_id,
+            UserAlert.alert_id.in_(body.alert_ids),
+        ).all()
+    }
+    now = datetime.utcnow()
+    newly_marked = 0
+    for alert_id in body.alert_ids:
+        existing = existing_map.get(alert_id)
+        if not existing:
+            db.add(UserAlert(
+                user_id=user_id,
+                alert_id=alert_id,
+                has_viewed=True,
+                is_attended=True,
+                viewed_at=now,
+                chops_earned_from_view=0,
+            ))
+            newly_marked += 1
+        elif not existing.has_viewed:
+            existing.has_viewed = True
+            existing.viewed_at = now
+            newly_marked += 1
+    db.commit()
+    return {"status": "ok", "marked": newly_marked}
+
 
 @router.post("/alerts/mark-all-read")
 async def mark_all_alerts_read(
