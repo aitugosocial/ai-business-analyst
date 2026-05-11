@@ -647,14 +647,20 @@ async def mark_page_alerts_read(
     Mark a specific set of alert IDs as viewed for the current user.
     Called after each page of alerts is rendered so the sidebar badge
     decrements page-by-page rather than resetting all at once.
+
+    IMPORTANT: existing UserAlert rows are NEVER modified — any
+    previously recorded chops, share events, or viewed timestamps are
+    left exactly as the user earned them. Only alerts that have NO
+    existing row at all get a new has_viewed=True record inserted.
     """
     if not body.alert_ids:
         return {"status": "ok", "marked": 0}
 
     user_id = current_user.id
-    existing_map = {
-        ua.alert_id: ua
-        for ua in db.query(UserAlert).filter(
+    # Only look up which alert_ids already have ANY record for this user.
+    already_tracked = {
+        row[0]
+        for row in db.query(UserAlert.alert_id).filter(
             UserAlert.user_id == user_id,
             UserAlert.alert_id.in_(body.alert_ids),
         ).all()
@@ -662,21 +668,18 @@ async def mark_page_alerts_read(
     now = datetime.utcnow()
     newly_marked = 0
     for alert_id in body.alert_ids:
-        existing = existing_map.get(alert_id)
-        if not existing:
+        if alert_id not in already_tracked:
             db.add(UserAlert(
                 user_id=user_id,
                 alert_id=alert_id,
                 has_viewed=True,
-                is_attended=True,
                 viewed_at=now,
                 chops_earned_from_view=0,
             ))
             newly_marked += 1
-        elif not existing.has_viewed:
-            existing.has_viewed = True
-            existing.viewed_at = now
-            newly_marked += 1
+        # Any existing row — regardless of its current state — is left
+        # completely untouched so no previously earned chops or actions
+        # are overwritten.
     db.commit()
     return {"status": "ok", "marked": newly_marked}
 
@@ -694,10 +697,11 @@ async def mark_all_alerts_read(
     user = current_user
     all_alert_ids = [a.id for a in db.query(Alert.id).filter(Alert.is_active == True).all()]
 
-    # Bulk fetch existing UserAlert rows — eliminates N+1
-    existing_map = {
-        ua.alert_id: ua
-        for ua in db.query(UserAlert).filter(
+    # Only find alert_ids that have ANY existing record — those are left untouched
+    # to preserve earned chops, share events, and any other recorded actions.
+    already_tracked = {
+        row[0]
+        for row in db.query(UserAlert.alert_id).filter(
             UserAlert.user_id == user.id,
             UserAlert.alert_id.in_(all_alert_ids),
         ).all()
@@ -705,19 +709,14 @@ async def mark_all_alerts_read(
 
     now = datetime.utcnow()
     for alert_id in all_alert_ids:
-        existing = existing_map.get(alert_id)
-        if not existing:
+        if alert_id not in already_tracked:
             db.add(UserAlert(
                 user_id=user.id,
                 alert_id=alert_id,
                 has_viewed=True,
-                is_attended=True,
                 viewed_at=now,
                 chops_earned_from_view=0,
             ))
-        elif not existing.has_viewed:
-            existing.has_viewed = True
-            existing.viewed_at = now
 
     db.commit()
     # Clear all alert cache variants for this user
