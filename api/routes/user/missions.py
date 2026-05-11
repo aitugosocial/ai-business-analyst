@@ -5,7 +5,7 @@ Each action plan becomes a trackable mission
 """
 import logging
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -474,7 +474,7 @@ async def complete_mission_step(
 
             if 'completion_dates' not in user_progress:
                 user_progress['completion_dates'] = {}
-            user_progress['completion_dates'][step_id] = datetime.utcnow().isoformat()
+            user_progress['completion_dates'][step_id] = datetime.now(timezone.utc).isoformat()
 
             # Award chops (20 points per step)
             current_user.total_chops = (current_user.total_chops or 0) + 20

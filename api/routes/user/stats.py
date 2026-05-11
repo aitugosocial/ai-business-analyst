@@ -7,7 +7,7 @@ Provides user-specific stats like total analyses count.
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, cast, Date
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from database.pg_connections import get_db
 from database.pg_models import BusinessAnalysis, User, Commission, Referral
@@ -112,7 +112,7 @@ async def get_user_stats(
             if user_obj:
                 total_referrals = user_obj.referral_count or 0
 
-            month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             referrals_this_month = db.query(func.count(Referral.id)).filter(
                 Referral.referrer_id == user_id,
                 Referral.created_at >= month_start
@@ -232,7 +232,7 @@ def _compute_streak(db: Session, user_id: int) -> int:
     """Count consecutive days with at least one analysis, going backwards from today.
     Uses a single query fetching all active days in the past year instead of one query per day.
     """
-    today = datetime.utcnow().date()
+    today = datetime.now(timezone.utc).date()
     cutoff = today - timedelta(days=365)
 
     rows = db.query(
@@ -296,7 +296,7 @@ async def get_user_progress(
         ).scalar() or 0
 
         # 30-day analyses (for "this month" missions done metric)
-        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+        thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
         analyses_30d = db.query(func.count(BusinessAnalysis.id)).filter(
             BusinessAnalysis.user_id == user_id,
             BusinessAnalysis.created_at >= thirty_days_ago

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timezone
 
 from database.pg_connections import get_db
 from database.pg_models import (User, Alert, Referral, UserAlert, UserResponse, UserCreate, AlertResponse, AlertCreate,
@@ -250,7 +250,7 @@ async def get_alerts_paginated(
     if priority:
         base_query = base_query.filter(Alert.priority == priority)
     if today_only:
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         base_query = base_query.filter(Alert.created_at >= today_start)
 
     total = base_query.count()
@@ -388,7 +388,7 @@ async def view_alert(request: ViewAlertRequest, current_user = Depends(get_curre
             alert_id=request.alert_id,
             has_viewed=True,
             is_attended=True,
-            viewed_at=datetime.utcnow(),
+            viewed_at=datetime.now(timezone.utc),
             chops_earned_from_view=chops_to_award
         )
 
@@ -418,7 +418,7 @@ async def view_alert(request: ViewAlertRequest, current_user = Depends(get_curre
 
         user_alert.has_viewed = True
         user_alert.is_attended = True
-        user_alert.viewed_at = datetime.utcnow()
+        user_alert.viewed_at = datetime.now(timezone.utc)
         user_alert.chops_earned_from_view = chops_to_award
 
         # Award chops
@@ -486,7 +486,7 @@ def share_alert(request: ShareAlertRequest, current_user = Depends(get_current_u
             alert_id=request.alert_id,
             has_shared=True,
             is_attended=True,
-            shared_at=datetime.utcnow(),
+            shared_at=datetime.now(timezone.utc),
             chops_earned_from_share=chops_to_award
         )
 
@@ -516,7 +516,7 @@ def share_alert(request: ShareAlertRequest, current_user = Depends(get_current_u
 
         user_alert.has_shared = True
         user_alert.is_attended = True
-        user_alert.shared_at = datetime.utcnow()
+        user_alert.shared_at = datetime.now(timezone.utc)
         user_alert.chops_earned_from_share = chops_to_award
 
         # Award chops
@@ -665,7 +665,7 @@ async def mark_page_alerts_read(
             UserAlert.alert_id.in_(body.alert_ids),
         ).all()
     }
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     newly_marked = 0
     for alert_id in body.alert_ids:
         if alert_id not in already_tracked:
@@ -707,7 +707,7 @@ async def mark_all_alerts_read(
         ).all()
     }
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     for alert_id in all_alert_ids:
         if alert_id not in already_tracked:
             db.add(UserAlert(
@@ -758,7 +758,7 @@ async def backfill_viewed_alerts(
         for row in db.query(Alert.id).filter(Alert.is_active == True).all()
     ]
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     rows = 0
     for user_id in legacy_ids:
         for alert_id in all_alert_ids:

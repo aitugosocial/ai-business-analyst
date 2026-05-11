@@ -4,7 +4,7 @@ Handles mission management, user progress tracking, and step completions
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -347,7 +347,7 @@ async def complete_step(
 
         # Mark as completed
         user_step.completed = True
-        user_step.completed_at = datetime.utcnow()
+        user_step.completed_at = datetime.now(timezone.utc)
         if request.reflection:
             user_step.reflection = request.reflection
 
@@ -362,7 +362,7 @@ async def complete_step(
         # Check if mission is completed
         if user_mission.completed_steps >= total_steps:
             user_mission.status = 'completed'
-            user_mission.completed_at = datetime.utcnow()
+            user_mission.completed_at = datetime.now(timezone.utc)
 
             # Award mission completion bonus
             mission = db.query(Mission).filter(Mission.id == mission_id).first()

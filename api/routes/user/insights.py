@@ -1,7 +1,7 @@
 
 from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
 
 from database.pg_connections import get_db
 from database.pg_models import (User, Insight, UserInsight, UserResponse, UserCreate, InsightResponse, InsightCreate,
@@ -304,7 +304,7 @@ def view_insight( request: ViewInsightRequest, current_user = Depends(get_curren
             insight_id=request.insight_id,
             has_viewed=True,
             is_attended=True,
-            viewed_at=datetime.utcnow()
+            viewed_at=datetime.now(timezone.utc)
         )
 
         # Award chops based on subscription status (active = 5, free = 1)
@@ -331,7 +331,7 @@ def view_insight( request: ViewInsightRequest, current_user = Depends(get_curren
         # Already viewed, just mark as attended if not already
         if not user_insight.has_viewed:
             user_insight.has_viewed = True
-            user_insight.viewed_at = datetime.utcnow()
+            user_insight.viewed_at = datetime.now(timezone.utc)
             insight.total_views += 1
 
             # Award chops based on subscription status
@@ -389,7 +389,7 @@ def share_insight( request: ShareInsightRequest, current_user = Depends(get_curr
             insight_id=request.insight_id,
             has_shared=True,
             is_attended=True,  # Mark as attended when sharing
-            shared_at=datetime.utcnow()
+            shared_at=datetime.now(timezone.utc)
         )
 
         # Award chops based on subscription status (active = 10, free = 5)
@@ -417,7 +417,7 @@ def share_insight( request: ShareInsightRequest, current_user = Depends(get_curr
         if not user_insight.has_shared:
             user_insight.has_shared = True
             user_insight.is_attended = True  # Mark as attended when sharing
-            user_insight.shared_at = datetime.utcnow()
+            user_insight.shared_at = datetime.now(timezone.utc)
 
             # Award chops based on subscription status
             chops_to_award = 10 if is_pro_user(user.subscription_status) else 5

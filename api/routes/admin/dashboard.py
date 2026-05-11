@@ -5,7 +5,7 @@ logger = logging.getLogger(__name__)
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from database.pg_connections import get_db
 from database.pg_models import User, Commission, Ticket, Review, Subscriptions, Payout
@@ -53,7 +53,7 @@ async def get_dashboard_stats(
         # 3. Active Users (Active in last 30 days)
         # Ensure timezone awareness for PostgreSQL timestamptz comparison
         try:
-            thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+            thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
             # active_users = db.query(User).filter(User.updated_at >= thirty_days_ago).count()
             # Use 'created_at' as fallback if 'updated_at' causes issues, but updated_at should be fine.
             # Adding logging to trace execution

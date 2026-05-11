@@ -8,7 +8,7 @@ Schedule: Run daily at 2 AM UTC
 
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -37,7 +37,7 @@ def expire_old_subscriptions():
     db: Session = next(get_db())
 
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         logger.info(f"Starting subscription expiry check at {now}")
 
         # Find all active subscriptions with past end_date

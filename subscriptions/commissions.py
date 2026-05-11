@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Depends, status, Request, Header, 
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from database.pg_connections import get_db
@@ -156,7 +156,7 @@ async def setup_payout_account(
                 payout_account.paypal_email = account_data.paypal_email
             
             payout_account.payment_method = account_data.payment_method
-            payout_account.updated_at = datetime.utcnow()
+            payout_account.updated_at = datetime.now(timezone.utc)
         else:
             # Create new
             print(f"[Payout Account] Creating new account")
@@ -280,7 +280,7 @@ async def remove_bank_payout_account(
             payout_account.payment_method = None
             payout_account.is_verified = False
 
-        payout_account.updated_at = datetime.utcnow()
+        payout_account.updated_at = datetime.now(timezone.utc)
         db.commit()
 
         return {"status": "success", "message": "Bank account removed successfully"}

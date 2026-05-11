@@ -5,7 +5,7 @@ import os
 
 from fastapi import APIRouter, Depends, Form, HTTPException
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 # import the function to hash the passwords
 from passlib.context import CryptContext
@@ -163,7 +163,7 @@ def signup(
             referrer_id=referrer.id,
             referred_user_id=new_user.id,
             chops_awarded=0,
-            created_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc)
         )
         db.add(referral)
         

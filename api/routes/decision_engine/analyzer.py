@@ -8,7 +8,7 @@ action plans, toolkits, and execution roadmaps.
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -228,7 +228,7 @@ async def analyze_business_goal(
         # already completed (id is present), return it immediately.
         from datetime import timedelta
         from sqlalchemy import desc as _desc
-        recent_cutoff = datetime.utcnow() - timedelta(seconds=60)
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
         recent = (
             db.query(BusinessAnalysis)
             .filter(
@@ -393,7 +393,7 @@ async def analyze_business_goal_stream(
         # Idempotency: return a cached recent result immediately
         from datetime import timedelta
         from sqlalchemy import desc as _desc
-        recent_cutoff = datetime.utcnow() - timedelta(seconds=60)
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
         recent = (
             db.query(BusinessAnalysis)
             .filter(
@@ -634,7 +634,7 @@ async def analyze_business_goal_stream(
     # Idempotency guard (same 60s window as /analyze)
     from datetime import timedelta
     from sqlalchemy import desc as _desc
-    recent_cutoff = datetime.utcnow() - timedelta(seconds=60)
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
     recent = (
         db.query(BusinessAnalysis)
         .filter(

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, Header, Cookie
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List
 from sqlalchemy import func, desc
 from jose import jwt, JWTError
@@ -486,7 +486,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "Reviews API",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 # --------------------------

@@ -8,7 +8,7 @@ GET  /api/mvp-features/stream          — SSE: push updates to customer apps in
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -146,7 +146,7 @@ async def toggle_mvp_feature(
     else:
         feature.is_in_mvp = body.is_in_mvp
 
-    feature.updated_at = datetime.utcnow()
+    feature.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(feature)
 

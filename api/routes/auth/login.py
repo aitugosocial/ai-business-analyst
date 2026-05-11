@@ -3,7 +3,7 @@ import secrets
 import uuid
 from email_validator import validate_email, EmailNotValidError
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -371,14 +371,14 @@ def get_admin_user(
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def create_refresh_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -462,8 +462,8 @@ def login(request: ShowUser, response: Response, fastapi_request: Request, db: S
     # Update Last Active - this also auto-reactivates inactive users
     # (inactive = no login for 30 days, but is_active is still True)
     # When they login again, they become active automatically
-    user.updated_at = datetime.utcnow()
-    user.last_login = datetime.utcnow()
+    user.updated_at = datetime.now(timezone.utc)
+    user.last_login = datetime.now(timezone.utc)
 
     # Note: Subscription status sync moved to dashboard load (lazy loading)
     # to prevent blocking login endpoint

@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
 from database.pg_models import UserNotification, NotificationType
 from api.routes.support.customer_service import notification_manager
 import json
@@ -27,7 +27,7 @@ class NotificationService:
                 title=title,
                 message=message,
                 link=link,
-                created_at=datetime.utcnow()
+                created_at=datetime.now(timezone.utc)
             )
             db.add(notification)
             db.commit()

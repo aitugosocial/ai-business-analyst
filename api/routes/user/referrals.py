@@ -1,7 +1,7 @@
 
 from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from database.pg_connections import get_db
@@ -156,5 +156,5 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "Referrals API",
-        "timestamp": datetime.utcnow()
+        "timestamp": datetime.now(timezone.utc)
     }

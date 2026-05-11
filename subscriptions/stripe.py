@@ -127,7 +127,7 @@ def get_currency_from_request(request) -> str:
 
 
 def generate_tx_ref(prefix: str = "STRIPE") -> str:
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     random_str = secrets.token_hex(4).upper()
     return f"{prefix}-{timestamp}-{random_str}"
 
@@ -203,7 +203,7 @@ def resolve_stripe_subscription_state(user: User, db: Session) -> dict:
     active_db_sub = db.query(Subscriptions).filter(
         Subscriptions.user_id == user.id,
         Subscriptions.subscription_status == "active",
-        Subscriptions.end_date > datetime.utcnow(),
+        Subscriptions.end_date > datetime.now(timezone.utc),
     ).order_by(Subscriptions.created_at.desc()).first()
 
     if active_db_sub:
@@ -239,7 +239,7 @@ def resolve_stripe_subscription_state(user: User, db: Session) -> dict:
         Subscriptions.user_id == user.id,
         Subscriptions.transaction_id == sub_id,
         Subscriptions.subscription_status == "active",
-        Subscriptions.end_date > datetime.utcnow()
+        Subscriptions.end_date > datetime.now(timezone.utc)
     ).first()
 
     if valid_record:
@@ -279,7 +279,7 @@ def get_subscription_dates_from_stripe(subscription_result: dict, plan_type: str
         except (ValueError, TypeError, OverflowError) as e:
             logger.warning(f"⚠️ Could not parse Stripe timestamps: {e}")
 
-    start = datetime.utcnow()
+    start = datetime.now(timezone.utc)
     delta_map = {"monthly": 30, "quarterly": 90, "yearly": 365}
     return start, start + timedelta(days=delta_map.get(plan_type, 30))
 
@@ -587,7 +587,7 @@ async def verify_payment(
         metadata = verification.get("metadata", {})
         plan_type = metadata.get("plan_type", "monthly")
         tx_ref = metadata.get("tx_ref", generate_tx_ref("STRIPE"))
-        start_date = datetime.utcnow()
+        start_date = datetime.now(timezone.utc)
         delta_map = {"monthly": 30, "quarterly": 90, "yearly": 365}
         end_date = start_date + timedelta(days=delta_map.get(plan_type, 30))
         subscription = Subscriptions(
@@ -784,7 +784,7 @@ async def save_card_for_beta(
         user.card_brand = payment_method.card.brand
         user.card_exp_month = payment_method.card.exp_month
         user.card_exp_year = payment_method.card.exp_year
-        user.card_saved_at = datetime.utcnow()
+        user.card_saved_at = datetime.now(timezone.utc)
 
         requested_plan = (
             getattr(request, 'plan_type', None)
@@ -1214,7 +1214,7 @@ async def stripe_webhook(
                 end_date   = datetime.fromtimestamp(int(period_end))
             else:
                 logger.warning(f"⚠️ Could not determine period for sub {subscription_id} — using fallback dates")
-                start_date = datetime.utcnow()
+                start_date = datetime.now(timezone.utc)
                 sub_meta_obj = getattr(stripe_sub, 'metadata', None)
                 sub_meta_dict = (sub_meta_obj.to_dict() if hasattr(sub_meta_obj, 'to_dict') else dict(sub_meta_obj)) if sub_meta_obj else {}
                 plan_fallback = sub_meta_dict.get("plan_type", "monthly")
@@ -1343,7 +1343,7 @@ async def stripe_webhook(
             new_sub = Subscriptions(
                 user_id=user.id, subscription_plan=plan_type,
                 transaction_id=payment_intent_id,
-                tx_ref=f"RENEW-{user.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+                tx_ref=f"RENEW-{user.id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
                 amount=Decimal(str(amount_paid / 100)),
                 currency=currency.upper(),
                 status="completed", subscription_status="active",
@@ -1513,7 +1513,7 @@ async def stripe_webhook(
             plan_type = metadata.get("plan_type", "monthly")
             tx_ref = metadata.get("tx_ref", generate_tx_ref("STRIPE"))
             if user_id:
-                start = datetime.utcnow()
+                start = datetime.now(timezone.utc)
                 delta_map = {"monthly": 30, "quarterly": 90, "yearly": 365}
                 end = start + timedelta(days=delta_map.get(plan_type, 30))
                 subscription = Subscriptions(
@@ -1668,7 +1668,7 @@ async def create_subscription_with_saved_card(
                 user.card_brand = pm.card.brand
                 user.card_exp_month = pm.card.exp_month
                 user.card_exp_year = pm.card.exp_year
-                user.card_saved_at = datetime.utcnow()
+                user.card_saved_at = datetime.now(timezone.utc)
             except Exception as card_err:
                 logger.warning(f"⚠️ Could not save card details: {str(card_err)}")
             db.commit()
@@ -1723,7 +1723,7 @@ async def create_subscription_with_saved_card(
                 user.card_brand = pm.card.brand
                 user.card_exp_month = pm.card.exp_month
                 user.card_exp_year = pm.card.exp_year
-                user.card_saved_at = datetime.utcnow()
+                user.card_saved_at = datetime.now(timezone.utc)
             except Exception as card_err:
                 logger.warning(f"⚠️ Could not save card details: {str(card_err)}")
             db.commit()
@@ -1862,7 +1862,7 @@ async def confirm_subscription(
                 user.card_brand = pm.card.brand
                 user.card_exp_month = pm.card.exp_month
                 user.card_exp_year = pm.card.exp_year
-                user.card_saved_at = datetime.utcnow()
+                user.card_saved_at = datetime.now(timezone.utc)
         except Exception as card_err:
             logger.warning(f"⚠️ Could not save card details: {str(card_err)}")
 
@@ -1996,7 +1996,7 @@ async def get_user_subscription(
     subscription = db.query(Subscriptions).filter(
         Subscriptions.user_id == user_id,
         Subscriptions.status == "completed",
-        Subscriptions.end_date > datetime.utcnow()
+        Subscriptions.end_date > datetime.now(timezone.utc)
     ).order_by(Subscriptions.created_at.desc()).first()
     if not subscription:
         return {"message": "No active subscription found"}

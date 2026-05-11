@@ -7,7 +7,7 @@ import requests
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 from dotenv import load_dotenv
 import logging
@@ -35,7 +35,7 @@ class MailerLiteEmailService:
             logger.info(f"📧 [LOGGED] TO: {to_email} | SUBJECT: {subject}")
             return {
                 "success": True,
-                "message_id": f"logged_{datetime.utcnow().timestamp()}",
+                "message_id": f"logged_{datetime.now(timezone.utc).timestamp()}",
                 "status": "logged"
             }
 
