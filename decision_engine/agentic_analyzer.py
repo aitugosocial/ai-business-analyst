@@ -676,6 +676,8 @@ OUTPUT FORMAT (JSON only, no markdown fences):
                 return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
             top = tools[0]
             tool_name = top.get("tool_name", "")
+            if not tool_name:
+                return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
             db_row = self.db.query(AITool).filter(AITool.name == tool_name).first()
             website = db_row.url if db_row else None
             price = db_row.pricing if db_row else None
