@@ -228,6 +228,7 @@ CRITICAL RULES:
 4. Explain the consequence if they ignore this (be specific and impactful)
 5. Identify the strategic priority (what they should focus on)
 6. Identify ONE critical action they must STOP doing (wastes time/resources)
+7. RECOMMENDATION MODE: Set "recommendation_mode" to "single_tool" if the bottleneck can be directly addressed by adopting ONE focused AI tool (writing assistant, scheduling tool, analytics dashboard) — the workflow does NOT require tools to hand off to each other. Set "automation_stack" if the bottleneck requires MULTIPLE tools working in sequence (triggers, data flow between apps, cross-platform automation). One tool alone cannot solve it.
 
 OUTPUT FORMAT (JSON):
 {{
@@ -237,7 +238,8 @@ OUTPUT FORMAT (JSON):
         "consequence": "Specific consequence if ignored (1-2 sentences, make it real)"
     }},
     "strategic_priority": "The ONE thing they should focus on (1 sentence)",
-    "what_to_stop": "The ONE action they must stop immediately (1 sentence, be direct)"
+    "what_to_stop": "The ONE action they must stop immediately (1 sentence, be direct)",
+    "recommendation_mode": "single_tool"
 }}
 
 Think like a consultant who charges $500/hour. Be brutally honest, specific, and actionable."""
