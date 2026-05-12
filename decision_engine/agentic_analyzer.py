@@ -630,6 +630,9 @@ OUTPUT FORMAT (JSON only, no markdown fences):
         LLM enrichment is deferred to a BackgroundTask in the route layer.
         """
         try:
+            if recommendation_mode == "single_tool":
+                return await self._recommend_single_tool(user_query)
+
             action_plans = action_plans_result.get("action_plans", []) or []
             stacks = recommend_automation_stacks(
                 user_query=user_query,
@@ -655,11 +658,38 @@ OUTPUT FORMAT (JSON only, no markdown fences):
                 valid_stacks.append(stack)
 
             logger.info(f"Built {len(valid_stacks)} raw automation stacks (enrichment deferred)")
-            return {"recommended_tool_stacks": valid_stacks}
+            return {"recommended_tool_stacks": valid_stacks, "single_tool_recommendation": None}
 
         except Exception as e:
             logger.error(f"Stage 3B failed: {e}", exc_info=True)
-            return {"recommended_tool_stacks": []}
+            return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
+
+    async def _recommend_single_tool(self, user_query: str) -> Dict[str, Any]:
+        """
+        Stage 3B (single_tool mode): Return the single best AI tool for the user's query.
+        Used when recommendation_mode == "single_tool" — one focused tool, no stack needed.
+        """
+        from database.pg_models import AITool
+        try:
+            tools = recommend_tools(user_query, top_k=1, db_session=self.db)
+            if not tools:
+                return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
+            top = tools[0]
+            tool_name = top.get("tool_name", "")
+            db_row = self.db.query(AITool).filter(AITool.name == tool_name).first()
+            website = db_row.url if db_row else None
+            price = db_row.pricing if db_row else None
+            single_tool = {
+                "tool_name": tool_name,
+                "description": top.get("description", ""),
+                "why_this_tool": "Directly addresses your bottleneck with focused AI assistance",
+                "website": website,
+                "price": price,
+            }
+            return {"recommended_tool_stacks": [], "single_tool_recommendation": single_tool}
+        except Exception as e:
+            logger.error(f"Single-tool recommendation failed: {e}", exc_info=True)
+            return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
 
     # =========================================================================
     # STAGE 4: ROADMAP & MOTIVATION AGENT
