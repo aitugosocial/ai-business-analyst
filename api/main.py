@@ -289,7 +289,7 @@ async def startup_event():
                 # Add recommendation_mode and single_tool_recommendation to business_analyses
                 try:
                     db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS recommendation_mode VARCHAR"))
-                    db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS single_tool_recommendation JSONB"))
+                    db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS single_tool_recommendation JSON"))
                 except Exception as e:
                     logger.warning(f"Failed to add recommendation mode columns to business_analyses: {e}")
 
