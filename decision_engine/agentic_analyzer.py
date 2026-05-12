@@ -243,7 +243,7 @@ OUTPUT FORMAT (JSON):
     }},
     "strategic_priority": "The ONE thing they should focus on (1 sentence)",
     "what_to_stop": "The ONE action they must stop immediately (1 sentence, be direct)",
-    "recommendation_mode": "single_tool"
+    "recommendation_mode": "single_tool or automation_stack"
 }}
 
 Think like a consultant who charges $500/hour. Be brutally honest, specific, and actionable."""
