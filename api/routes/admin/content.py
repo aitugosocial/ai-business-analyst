@@ -6,9 +6,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from database.pg_connections import get_db
-from database.pg_models import Alert, Insight, User
+from database.pg_connections import get_db, SessionLocal
+from database.pg_models import Alert, Insight, User, UserNotification
 from api.routes.dependencies import admin_required
+from api.services.notification_service import NotificationService
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +105,41 @@ def list_alerts(
     return {"items": result, "total": total, "skip": skip, "limit": limit}
 
 
+def _fan_out_alert_notifications(alert_id: int, alert_title: str, alert_message: str):
+    """
+    Background task: notify every active user about a new opportunity alert.
+    Runs after the HTTP response is already sent so it never blocks the admin.
+    Uses its own DB session to avoid interfering with the request session.
+    """
+    with SessionLocal() as bg_db:
+        try:
+            user_ids = [
+                row[0]
+                for row in bg_db.query(User.id).filter(User.is_active == True).all()
+            ]
+            short_msg = (alert_message[:97] + "…") if len(alert_message) > 100 else alert_message
+            for uid in user_ids:
+                NotificationService.create_notification(
+                    db=bg_db,
+                    user_id=uid,
+                    type="new_alert",
+                    title=f"🆕 {alert_title}",
+                    message=short_msg,
+                    link="/dashboard/opportunity-alerts",
+                )
+            logger.info(f"[alert fan-out] notified {len(user_ids)} users for alert id={alert_id}")
+        except Exception as exc:
+            logger.error(f"[alert fan-out] failed for alert id={alert_id}: {exc}")
+
+
 @router.post("/alerts", status_code=201)
 def create_alert(
     payload: AlertCreate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(admin_required),
     db: Session = Depends(get_db)
 ):
-    """Manually create a new opportunity alert."""
+    """Manually create a new opportunity alert and fan-out notifications to all users."""
     alert_date = payload.date or date.today().isoformat()
     alert = Alert(
         title=payload.title,
@@ -130,6 +159,13 @@ def create_alert(
     db.commit()
     db.refresh(alert)
     logger.info(f"Admin {current_user.email} created alert id={alert.id}")
+    # Fan-out runs after response is sent — zero latency for the admin
+    background_tasks.add_task(
+        _fan_out_alert_notifications,
+        alert.id,
+        alert.title,
+        alert.why_act_now or "",
+    )
     return {"id": alert.id, "message": "Alert created successfully"}
 
 
