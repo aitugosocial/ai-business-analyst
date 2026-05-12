@@ -1,3 +1,4 @@
+
 from fastapi import APIRouter, HTTPException, Depends, Request, Header
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -117,12 +118,19 @@ def get_stripe_price_id(plan_type: str, currency: str = "USD") -> str:
 
 
 def get_currency_from_request(request) -> str:
-    """Extract and validate currency from a request object. Defaults to USD."""
-    raw = getattr(request, 'currency', None) or DEFAULT_CURRENCY
-    currency = raw.upper().strip()
+    """Extract and validate currency from a request object. Raises 400 if missing or unsupported."""
+    raw = (getattr(request, 'currency', None) or "").strip()
+    if not raw:
+        raise HTTPException(
+            status_code=400,
+            detail="currency is required (USD, GBP, or NGN)."
+        )
+    currency = raw.upper()
     if currency not in SUPPORTED_CURRENCIES:
-        logger.warning(f"⚠️ Unsupported currency '{raw}' — defaulting to USD")
-        return DEFAULT_CURRENCY
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported currency '{raw}'. Accepted: {', '.join(sorted(SUPPORTED_CURRENCIES))}."
+        )
     return currency
 
 
@@ -786,14 +794,49 @@ async def save_card_for_beta(
         user.card_exp_year = payment_method.card.exp_year
         user.card_saved_at = datetime.now(timezone.utc)
 
+        # ── Strict plan / currency / amount validation ────────────────────────
         _valid_plans = {"monthly", "quarterly", "yearly"}
         requested_plan = (getattr(request, 'plan_type', None) or "").lower().strip()
         if requested_plan not in _valid_plans:
-            # Log the bad value so it's visible in Railway logs, then fall back.
-            if requested_plan:
-                logger.warning(f"⚠️ Unknown plan_type '{requested_plan}' from request — defaulting to monthly")
-            requested_plan = getattr(user, 'subscription_plan', None) or "monthly"
-        logger.info(f"[save-card] plan_type={requested_plan} currency={currency} user={user.id}")
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"plan_type '{requested_plan or '(empty)'}' is not valid. "
+                    f"Must be one of: monthly, quarterly, yearly."
+                )
+            )
+
+        # Resolve the Stripe price ID for this exact plan + currency combination.
+        price_id = get_stripe_price_id(requested_plan, currency)
+        if not price_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No Stripe price configured for plan='{requested_plan}' / "
+                    f"currency='{currency}'. Contact support."
+                )
+            )
+
+        # Fetch the real amount from Stripe — payment must not proceed if
+        # the price is missing, zero, or misconfigured.
+        try:
+            charge_amount = get_amount_from_stripe_price(price_id)
+        except Exception as e:
+            logger.error(f"❌ Cannot fetch price amount for {price_id}: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not verify charge amount for price '{price_id}'. Payment blocked."
+            )
+        if charge_amount <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Stripe price '{price_id}' has a zero or negative amount. Payment blocked."
+            )
+
+        logger.info(
+            f"[save-card] ✅ plan={requested_plan} currency={currency} "
+            f"price_id={price_id} amount={charge_amount} user={user.id}"
+        )
         if hasattr(user, 'subscription_plan'):
             user.subscription_plan = requested_plan
 
@@ -831,19 +874,9 @@ async def save_card_for_beta(
         # =====================================================================
         # LAUNCH MODE — three-case resolution
         # =====================================================================
+        # price_id and charge_amount already validated and fetched above.
         plan_type = requested_plan
-        price_id = get_stripe_price_id(plan_type, currency)
-        if not price_id:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"No Stripe price configured for plan '{plan_type}' / currency '{currency}'. "
-                    f"Set STRIPE_{plan_type.upper()}_PRICE_ID_{currency} in environment."
-                )
-            )
-
-        # Get the real price amount directly from Stripe — transparent, no hardcoding
-        amount = get_amount_from_stripe_price(price_id)
+        amount = charge_amount
 
 
         state = resolve_stripe_subscription_state(user, db)
