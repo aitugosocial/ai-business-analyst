@@ -8,7 +8,7 @@ action plans, toolkits, and execution roadmaps.
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -232,7 +232,7 @@ async def analyze_business_goal(
         # already completed (id is present), return it immediately.
         from datetime import timedelta
         from sqlalchemy import desc as _desc
-        recent_cutoff = datetime.utcnow() - timedelta(seconds=60)
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
         recent = (
             db.query(BusinessAnalysis)
             .filter(
@@ -333,6 +333,138 @@ async def analyze_business_goal(
             status_code=500,
             detail=f"Analysis failed: {str(e)}"
         )
+
+
+@router.post("/analyze/stream")
+async def analyze_business_goal_stream(
+    request: Request,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    SSE streaming version of /analyze.
+    Sends progress events so the UI stays live during the LLM call,
+    then delivers the completed result as the final event.
+    """
+    from decision_engine.agentic_analyzer import create_analyzer
+    from decision_engine.multimodal.handler import MultimodalHandler
+
+    user_id = get_user_id(current_user)
+    content_type = request.headers.get("content-type", "")
+    business_goal = ""
+    files = []
+
+    if "application/json" in content_type:
+        body = await request.json()
+        business_goal = body.get("business_goal", "")
+    elif "multipart/form-data" in content_type:
+        form_data = await request.form()
+        business_goal = form_data.get("business_goal", "")
+        files = form_data.getlist("files")
+
+    if not business_goal and not files:
+        raise HTTPException(status_code=400, detail="Business goal or file upload required")
+
+    # Resolve multimodal files before streaming starts
+    if files:
+        mm_handler = MultimodalHandler(use_vision_for_images=True)
+        image_bytes_list, document_bytes_list = [], []
+        for f in files:
+            fb = await f.read()
+            fn = getattr(f, "filename", "").lower()
+            if fn.endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                image_bytes_list.append((fb, fn))
+            elif fn.endswith(('.pdf', '.docx', '.doc', '.xlsx', '.csv', '.txt')):
+                document_bytes_list.append((fb, fn))
+        if image_bytes_list or document_bytes_list:
+            mm_result = mm_handler.process_multimodal_query(
+                user_query=business_goal,
+                image_bytes_list=image_bytes_list,
+                document_bytes_list=document_bytes_list,
+                enhance_with_llm=False,
+            )
+            ctx = mm_result.get("combined_context", "")
+            if ctx:
+                business_goal = f"{business_goal}\n\n[File Context]:\n{ctx}".strip()
+
+    if not business_goal:
+        raise HTTPException(status_code=400, detail="Could not extract content from uploads")
+
+    async def event_stream():
+        def _send(event: str, payload: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+
+        # Idempotency: return a cached recent result immediately
+        from datetime import timedelta
+        from sqlalchemy import desc as _desc
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
+        recent = (
+            db.query(BusinessAnalysis)
+            .filter(
+                BusinessAnalysis.user_id == user_id,
+                BusinessAnalysis.created_at >= recent_cutoff,
+            )
+            .order_by(_desc(BusinessAnalysis.created_at))
+            .first()
+        )
+        if recent:
+            yield _send("progress", {"step": "complete", "pct": 100, "msg": "Retrieved recent analysis"})
+            yield _send("result", {"success": True, "data": format_analysis_for_frontend(recent)})
+            return
+
+        try:
+            yield _send("progress", {"step": "reading", "pct": 5, "msg": "Reading your business challenge…"})
+            await asyncio.sleep(0)
+
+            yield _send("progress", {"step": "analyzing", "pct": 20, "msg": "Identifying bottlenecks…"})
+            await asyncio.sleep(0)
+
+            # Run the actual LLM analysis in a thread so we can keep yielding
+            loop = asyncio.get_event_loop()
+            analyzer = create_analyzer(db)
+
+            # Send intermediate heartbeat while LLM is running
+            async def heartbeat():
+                steps = [
+                    (40, "Mapping strategic constraints…"),
+                    (55, "Building action plans…"),
+                    (70, "Selecting AI tools…"),
+                    (85, "Compiling execution roadmap…"),
+                ]
+                for pct, msg in steps:
+                    await asyncio.sleep(8)
+                    yield _send("progress", {"step": "thinking", "pct": pct, "msg": msg})
+
+            analysis_task = loop.run_in_executor(
+                None,
+                lambda: asyncio.run(analyzer.analyze(user_query=business_goal, user_id=user_id))
+            )
+
+            hb_steps = [
+                (40, "Mapping strategic constraints…"),
+                (55, "Building action plans…"),
+                (70, "Selecting AI tools…"),
+                (85, "Compiling execution roadmap…"),
+            ]
+            for pct, msg in hb_steps:
+                done, _ = await asyncio.wait([analysis_task], timeout=8)
+                if done:
+                    break
+                yield _send("progress", {"step": "thinking", "pct": pct, "msg": msg})
+
+            result = await analysis_task
+            yield _send("progress", {"step": "complete", "pct": 100, "msg": "Analysis complete!"})
+            yield _send("result", {"success": True, "data": result["data"]})
+
+        except Exception as e:
+            logger.error(f"❌ Streaming analysis failed for user {user_id}: {e}", exc_info=True)
+            yield _send("error", {"message": str(e)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/analyses")
@@ -506,7 +638,7 @@ async def analyze_business_goal_stream(
     # Idempotency guard (same 60s window as /analyze)
     from datetime import timedelta
     from sqlalchemy import desc as _desc
-    recent_cutoff = datetime.utcnow() - timedelta(seconds=60)
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
     recent = (
         db.query(BusinessAnalysis)
         .filter(

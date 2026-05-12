@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException, Request, Query
 from fastapi.responses import RedirectResponse
 import httpx
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from database.pg_connections import get_db
 from database.pg_models import User
@@ -160,7 +160,7 @@ async def google_callback(
                 # Update existing user with Google info
                 user.google_id = google_id
                 user.profile_image_url = picture or user.profile_image_url
-                user.last_login = datetime.utcnow()
+                user.last_login = datetime.now(timezone.utc)
                 logger.info(f"Existing user logged in via Google: {email}")
             else:
                 # Create new user
@@ -173,8 +173,8 @@ async def google_callback(
                     role="user",
                     is_active=True,
                     email_verified=True,  # Google emails are pre-verified
-                    created_at=datetime.utcnow(),
-                    last_login=datetime.utcnow(),
+                    created_at=datetime.now(timezone.utc),
+                    last_login=datetime.now(timezone.utc),
                 )
                 
                 # Handle referral code if provided

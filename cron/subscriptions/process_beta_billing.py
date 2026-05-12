@@ -6,7 +6,7 @@ Run daily via cron.
 
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 import stripe
 from sqlalchemy.orm import Session
@@ -42,7 +42,7 @@ def process_beta_billing():
         # 2. Apply timing filter
         if is_beta:
             # If still in beta, ONLY charge if grace period specifically ended (unlikely in beta but safe)
-            query = query.filter(User.grace_period_ends_at <= datetime.utcnow())
+            query = query.filter(User.grace_period_ends_at <= datetime.now(timezone.utc))
         else:
             # IF LAUNCHED: Charge everyone with a card immediately
             # The grace period is only for users WITHOUT cards to add one.
@@ -95,7 +95,7 @@ def process_beta_billing():
                         user_id=user.id,
                         subscription_plan=plan_type,
                         transaction_id=result["subscription_id"],
-                        tx_ref=f"BETA-{user.id}-{datetime.utcnow().strftime('%Y%m%d%H%M')}",
+                        tx_ref=f"BETA-{user.id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}",
                         amount=Decimal("29.99"), # Hardcoded for now, should ideally get from price_id
                         currency="USD",
                         status="completed",

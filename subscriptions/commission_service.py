@@ -2,7 +2,7 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from database.pg_models import Commission, Referral, CommissionSummary, User, NotificationType
 from api.services.notification_service import NotificationService
 import logging
@@ -51,7 +51,7 @@ class CommissionService:
                 currency=subscription.currency,
                 commission_rate=COMMISSION_RATE * 100,
                 status='pending',  # Starts as pending
-                created_at=datetime.utcnow()
+                created_at=datetime.now(timezone.utc)
             )
             
             db.add(commission)
@@ -91,7 +91,7 @@ class CommissionService:
     @staticmethod
     def _update_monthly_summary(user_id: int, amount: Decimal, db: Session):
         """Update or create monthly commission summary"""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         
         summary = db.query(CommissionSummary).filter(
             CommissionSummary.user_id == user_id,
@@ -131,10 +131,10 @@ class CommissionService:
             raise ValueError(f"Commission is not pending (status: {commission.status})")
         
         commission.status = 'approved'
-        commission.approved_at = datetime.utcnow()
+        commission.approved_at = datetime.now(timezone.utc)
         
         # Update summary
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         summary = db.query(CommissionSummary).filter(
             CommissionSummary.user_id == commission.user_id,
             CommissionSummary.year == now.year,
@@ -157,7 +157,7 @@ class CommissionService:
         Auto-approve commissions that are X days old
         Useful for automated approval after verification period
         """
-        cutoff_date = datetime.utcnow() - timedelta(days=days_old)
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_old)
         
         commissions = db.query(Commission).filter(
             Commission.status == 'pending',
@@ -167,7 +167,7 @@ class CommissionService:
         count = 0
         for commission in commissions:
             commission.status = 'approved'
-            commission.approved_at = datetime.utcnow()
+            commission.approved_at = datetime.now(timezone.utc)
             count += 1
         
         db.flush()

@@ -127,7 +127,7 @@ def get_currency_from_request(request) -> str:
 
 
 def generate_tx_ref(prefix: str = "STRIPE") -> str:
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     random_str = secrets.token_hex(4).upper()
     return f"{prefix}-{timestamp}-{random_str}"
 
@@ -203,7 +203,7 @@ def resolve_stripe_subscription_state(user: User, db: Session) -> dict:
     active_db_sub = db.query(Subscriptions).filter(
         Subscriptions.user_id == user.id,
         Subscriptions.subscription_status == "active",
-        Subscriptions.end_date > datetime.utcnow(),
+        Subscriptions.end_date > datetime.now(timezone.utc),
     ).order_by(Subscriptions.created_at.desc()).first()
 
     if active_db_sub:
@@ -239,7 +239,7 @@ def resolve_stripe_subscription_state(user: User, db: Session) -> dict:
         Subscriptions.user_id == user.id,
         Subscriptions.transaction_id == sub_id,
         Subscriptions.subscription_status == "active",
-        Subscriptions.end_date > datetime.utcnow()
+        Subscriptions.end_date > datetime.now(timezone.utc)
     ).first()
 
     if valid_record:
@@ -279,42 +279,79 @@ def get_subscription_dates_from_stripe(subscription_result: dict, plan_type: str
         except (ValueError, TypeError, OverflowError) as e:
             logger.warning(f"⚠️ Could not parse Stripe timestamps: {e}")
 
-    start = datetime.utcnow()
+    start = datetime.now(timezone.utc)
     delta_map = {"monthly": 30, "quarterly": 90, "yearly": 365}
     return start, start + timedelta(days=delta_map.get(plan_type, 30))
 
 
 def _get_invoice_amount_and_currency(sub_result):
     """
-    Read the actual charged amount and currency from the subscription's latest
-    invoice.  Falls back to (None, None) so callers can use their own default.
-    Stripe stores amounts in smallest unit (pence/cents); we return human units.
+    Read the actual charged amount and currency from the subscription's latest invoice.
+    Falls back to (None, None) so callers can use their own default.
+
+    Handles three cases:
+    1. sub_result is a Stripe object with latest_invoice expanded
+    2. sub_result is a dict with 'latest_invoice' key
+    3. sub_result is a dict with only 'subscription_id'/'id' — fetches invoice from Stripe API
     """
+    import os as _os
+    api_key = _os.getenv("STRIPE_SECRET_KEY")
     try:
         li = None
+
+        # Case 1 & 2: invoice already attached to the sub_result
         if hasattr(sub_result, 'latest_invoice'):
             li = sub_result.latest_invoice
         elif isinstance(sub_result, dict):
             li = sub_result.get('latest_invoice')
 
+        # Case 3: sub_result is a dict with only the subscription ID — fetch from Stripe
+        if not li:
+            sub_id = None
+            if isinstance(sub_result, dict):
+                sub_id = sub_result.get('subscription_id') or sub_result.get('id')
+            elif hasattr(sub_result, 'id'):
+                sub_id = sub_result.id
+
+            if sub_id:
+                full_sub = stripe.Subscription.retrieve(
+                    sub_id,
+                    expand=['latest_invoice'],
+                    api_key=api_key,
+                )
+                li = getattr(full_sub, 'latest_invoice', None)
+
         if not li:
             return None, None
 
+        # li may be an invoice ID string — fetch the full object
         if isinstance(li, str):
-            import os as _os
-            invoice = stripe.Invoice.retrieve(li, api_key=_os.getenv("STRIPE_SECRET_KEY"))
+            invoice = stripe.Invoice.retrieve(li, api_key=api_key)
         else:
             invoice = li
 
-        paid = getattr(invoice, 'amount_paid', None)
-        if paid is None and isinstance(invoice, dict):
-            paid = invoice.get('amount_paid')
+        # Try amount_paid first (basil API 2025-03-31 still supports it),
+        # fall back to amount_due and total for edge cases where amount_paid = 0
+        # on the initial creation webhook but the actual charge is non-zero.
+        def _get(obj, *keys):
+            for k in keys:
+                v = getattr(obj, k, None) if not isinstance(obj, dict) else obj.get(k)
+                if v is not None and v != 0:
+                    return v
+            # If all fields are 0, return 0 explicitly (free/trial invoice)
+            for k in keys:
+                v = getattr(obj, k, None) if not isinstance(obj, dict) else obj.get(k)
+                if v is not None:
+                    return v
+            return None
+
+        paid = _get(invoice, 'amount_paid', 'total', 'amount_due')
         currency = getattr(invoice, 'currency', None) or (invoice.get('currency') if isinstance(invoice, dict) else None)
 
         if paid is not None and currency:
             return round(paid / 100, 2), currency.upper()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"[_get_invoice_amount_and_currency] could not read invoice: {e}")
     return None, None
 
 
@@ -405,17 +442,31 @@ async def get_stripe_config():
     return {"publishableKey": publishable_key.strip()}
 
 
+# Module-level price cache — prices change rarely; 10-minute TTL avoids
+# 9 Stripe API round-trips on every page load.
+_price_cache: dict = {}
+_price_cache_at: float = 0.0
+_PRICE_CACHE_TTL = 600  # 10 minutes
+
+
 @router.get("/prices")
 async def get_subscription_prices(current_user: User = Depends(get_current_user)):
     """
     Fetch live subscription prices from Stripe using the Price IDs stored in
-    environment variables. Returns the actual amount for each plan/currency
-    so the frontend never needs hardcoded values.
+    environment variables. Results are cached for 10 minutes so the 9 Stripe
+    API calls only happen once per cache window instead of on every page load.
 
     Env var naming: STRIPE_{PLAN}_PRICE_ID_{CURRENCY}
     e.g. STRIPE_MONTHLY_PRICE_ID_USD, STRIPE_YEARLY_PRICE_ID_NGN
     """
-    # Ensure the API key is set for this call
+    import time
+    global _price_cache, _price_cache_at
+
+    # Serve from cache if warm
+    if _price_cache and time.time() - _price_cache_at < _PRICE_CACHE_TTL:
+        logger.info("[prices] cache hit")
+        return _price_cache
+
     api_key = os.getenv("STRIPE_SECRET_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not configured")
@@ -437,11 +488,8 @@ async def get_subscription_prices(current_user: User = Depends(get_current_user)
                 continue
             try:
                 price_obj = stripe.Price.retrieve(price_id, api_key=api_key)
-                # Use attribute access (works across all Stripe library versions)
-                # unit_amount is in smallest currency unit: cents, pence, kobo
                 unit_amount = getattr(price_obj, "unit_amount", None)
                 if unit_amount is None:
-                    # Fallback for dict-style objects
                     unit_amount = price_obj["unit_amount"] if "unit_amount" in price_obj else 0
                 result[currency][plan] = (unit_amount or 0) / 100
                 logger.info(f"[prices] {env_key} ({price_id}) = {result[currency][plan]}")
@@ -452,6 +500,11 @@ async def get_subscription_prices(current_user: User = Depends(get_current_user)
 
     if errors:
         logger.warning(f"[prices] Some prices could not be fetched: {errors}")
+
+    # Store in module cache only if we got at least some prices
+    if any(v for curr in result.values() for v in curr.values()):
+        _price_cache = result
+        _price_cache_at = time.time()
 
     return result
 
@@ -534,7 +587,7 @@ async def verify_payment(
         metadata = verification.get("metadata", {})
         plan_type = metadata.get("plan_type", "monthly")
         tx_ref = metadata.get("tx_ref", generate_tx_ref("STRIPE"))
-        start_date = datetime.utcnow()
+        start_date = datetime.now(timezone.utc)
         delta_map = {"monthly": 30, "quarterly": 90, "yearly": 365}
         end_date = start_date + timedelta(days=delta_map.get(plan_type, 30))
         subscription = Subscriptions(
@@ -731,7 +784,7 @@ async def save_card_for_beta(
         user.card_brand = payment_method.card.brand
         user.card_exp_month = payment_method.card.exp_month
         user.card_exp_year = payment_method.card.exp_year
-        user.card_saved_at = datetime.utcnow()
+        user.card_saved_at = datetime.now(timezone.utc)
 
         requested_plan = (
             getattr(request, 'plan_type', None)
@@ -1161,7 +1214,7 @@ async def stripe_webhook(
                 end_date   = datetime.fromtimestamp(int(period_end))
             else:
                 logger.warning(f"⚠️ Could not determine period for sub {subscription_id} — using fallback dates")
-                start_date = datetime.utcnow()
+                start_date = datetime.now(timezone.utc)
                 sub_meta_obj = getattr(stripe_sub, 'metadata', None)
                 sub_meta_dict = (sub_meta_obj.to_dict() if hasattr(sub_meta_obj, 'to_dict') else dict(sub_meta_obj)) if sub_meta_obj else {}
                 plan_fallback = sub_meta_dict.get("plan_type", "monthly")
@@ -1275,13 +1328,22 @@ async def stripe_webhook(
             if hasattr(user, 'subscription_plan'):
                 user.subscription_plan = plan_type
 
-            amount_paid = getattr(invoice, 'amount_paid', 0) or 0
-            currency = getattr(invoice, 'currency', 'usd') or 'usd'
+            # amount_paid can be 0 on the initial webhook before Stripe confirms
+            # the charge.  Fall back to total/amount_due so the history record
+            # always shows the real charged amount.
+            def _invoice_val(obj, *keys):
+                for k in keys:
+                    v = getattr(obj, k, None) if not isinstance(obj, dict) else obj.get(k)
+                    if v:
+                        return v
+                return 0
+            amount_paid = _invoice_val(invoice, 'amount_paid', 'total', 'amount_due')
+            currency = getattr(invoice, 'currency', None) or 'usd'
 
             new_sub = Subscriptions(
                 user_id=user.id, subscription_plan=plan_type,
                 transaction_id=payment_intent_id,
-                tx_ref=f"RENEW-{user.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+                tx_ref=f"RENEW-{user.id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
                 amount=Decimal(str(amount_paid / 100)),
                 currency=currency.upper(),
                 status="completed", subscription_status="active",
@@ -1451,7 +1513,7 @@ async def stripe_webhook(
             plan_type = metadata.get("plan_type", "monthly")
             tx_ref = metadata.get("tx_ref", generate_tx_ref("STRIPE"))
             if user_id:
-                start = datetime.utcnow()
+                start = datetime.now(timezone.utc)
                 delta_map = {"monthly": 30, "quarterly": 90, "yearly": 365}
                 end = start + timedelta(days=delta_map.get(plan_type, 30))
                 subscription = Subscriptions(
@@ -1606,7 +1668,7 @@ async def create_subscription_with_saved_card(
                 user.card_brand = pm.card.brand
                 user.card_exp_month = pm.card.exp_month
                 user.card_exp_year = pm.card.exp_year
-                user.card_saved_at = datetime.utcnow()
+                user.card_saved_at = datetime.now(timezone.utc)
             except Exception as card_err:
                 logger.warning(f"⚠️ Could not save card details: {str(card_err)}")
             db.commit()
@@ -1661,7 +1723,7 @@ async def create_subscription_with_saved_card(
                 user.card_brand = pm.card.brand
                 user.card_exp_month = pm.card.exp_month
                 user.card_exp_year = pm.card.exp_year
-                user.card_saved_at = datetime.utcnow()
+                user.card_saved_at = datetime.now(timezone.utc)
             except Exception as card_err:
                 logger.warning(f"⚠️ Could not save card details: {str(card_err)}")
             db.commit()
@@ -1800,7 +1862,7 @@ async def confirm_subscription(
                 user.card_brand = pm.card.brand
                 user.card_exp_month = pm.card.exp_month
                 user.card_exp_year = pm.card.exp_year
-                user.card_saved_at = datetime.utcnow()
+                user.card_saved_at = datetime.now(timezone.utc)
         except Exception as card_err:
             logger.warning(f"⚠️ Could not save card details: {str(card_err)}")
 
@@ -1934,7 +1996,7 @@ async def get_user_subscription(
     subscription = db.query(Subscriptions).filter(
         Subscriptions.user_id == user_id,
         Subscriptions.status == "completed",
-        Subscriptions.end_date > datetime.utcnow()
+        Subscriptions.end_date > datetime.now(timezone.utc)
     ).order_by(Subscriptions.created_at.desc()).first()
     if not subscription:
         return {"message": "No active subscription found"}

@@ -6,7 +6,7 @@ import os
 import stripe
 import requests
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import logging
 import json
@@ -107,7 +107,7 @@ class PayoutService:
             status='pending',
             recipient_email=user.email,
             recipient_name=user.name,
-            requested_at=datetime.utcnow()
+            requested_at=datetime.now(timezone.utc)
         )
         
         db.add(payout)
@@ -185,8 +185,8 @@ class PayoutService:
                                         "transfer": transfer.to_dict(),
                                         "payout": payment.to_dict(),
             })
-            payout.processed_at = datetime.utcnow()
-            payout.completed_at = datetime.utcnow()
+            payout.processed_at = datetime.now(timezone.utc)
+            payout.completed_at = datetime.now(timezone.utc)
 
             # Update commissions linked to this payout
             commissions = db.query(Commission).filter(
@@ -195,7 +195,7 @@ class PayoutService:
             
             for commission in commissions:
                 commission.status = 'paid'
-                commission.paid_at = datetime.utcnow()
+                commission.paid_at = datetime.now(timezone.utc)
             
             # Update user's commission summary
             PayoutService._update_summary_on_payout(payout, db)
@@ -255,7 +255,7 @@ class PayoutService:
                 "amount": float(payout.amount),
                 "currency": payout.currency,
                 "narration": f"Commission payout - {payout.id}",
-                "reference": f"PAYOUT-{payout.id}-{int(datetime.utcnow().timestamp())}",
+                "reference": f"PAYOUT-{payout.id}-{int(datetime.now(timezone.utc).timestamp())}",
                 "callback_url": f"{os.getenv('BASE_URL')}/api/payouts/flutterwave/callback",
                 "debit_currency": "USD",
                 "beneficiary_name": payout_account.account_name or payout.recipient_name
@@ -287,7 +287,7 @@ class PayoutService:
             payout.status = 'processing'  # Flutterwave transfers are async
             payout.provider_payout_id = str(transfer_data.get("id"))
             payout.provider_response = json.dumps(data)
-            payout.processed_at = datetime.utcnow()
+            payout.processed_at = datetime.now(timezone.utc)
             
             db.commit()
             db.refresh(payout)
@@ -305,7 +305,7 @@ class PayoutService:
         except requests.RequestException as e:
             payout.status = 'failed'
             payout.failure_reason = str(e)
-            payout.failed_at = datetime.utcnow()
+            payout.failed_at = datetime.now(timezone.utc)
             payout.retry_count += 1
             db.commit()
             
@@ -326,7 +326,7 @@ class PayoutService:
         
         if transfer_status == "successful":
             payout.status = 'completed'
-            payout.completed_at = datetime.utcnow()
+            payout.completed_at = datetime.now(timezone.utc)
             
             # Update commissions
             commissions = db.query(Commission).filter(
@@ -335,7 +335,7 @@ class PayoutService:
             
             for commission in commissions:
                 commission.status = 'paid'
-                commission.paid_at = datetime.utcnow()
+                commission.paid_at = datetime.now(timezone.utc)
             
             # Update summary
             PayoutService._update_summary_on_payout(payout, db)
@@ -349,7 +349,7 @@ class PayoutService:
             )
         elif transfer_status == "failed":
             payout.status = 'failed'
-            payout.failed_at = datetime.utcnow()
+            payout.failed_at = datetime.now(timezone.utc)
             
             # Revert commissions to 'pending' so they can be paid again
             commissions = db.query(Commission).filter(
@@ -378,7 +378,7 @@ class PayoutService:
         
         if status == "paid":
             payout.status = 'completed'
-            payout.completed_at = datetime.utcnow()
+            payout.completed_at = datetime.now(timezone.utc)
             
             # Update commissions
             commissions = db.query(Commission).filter(
@@ -387,7 +387,7 @@ class PayoutService:
             
             for commission in commissions:
                 commission.status = 'paid'
-                commission.paid_at = datetime.utcnow()
+                commission.paid_at = datetime.now(timezone.utc)
             
             # Update summary
             PayoutService._update_summary_on_payout(payout, db)
@@ -402,7 +402,7 @@ class PayoutService:
             )
         elif status == "failed":
             payout.status = 'failed'
-            payout.failed_at = datetime.utcnow()
+            payout.failed_at = datetime.now(timezone.utc)
             
             # Revert commissions
             commissions = db.query(Commission).filter(
@@ -422,7 +422,7 @@ class PayoutService:
         """
         Update commission summary when payout is completed
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         
         # Get all months affected by the commissions in this payout
         commissions = db.query(Commission).filter(
@@ -467,7 +467,7 @@ class PayoutService:
 
         payout.status = "failed"
         payout.failure_reason = failure_reason or "Funds returned/Reversed"
-        payout.failed_at = datetime.utcnow()
+        payout.failed_at = datetime.now(timezone.utc)
 
         commissions = db.query(Commission).filter(
             Commission.payout_id == payout.id
@@ -483,7 +483,7 @@ class PayoutService:
 
     @staticmethod
     def _reverse_summary_on_payout(payout: Payout, db: Session) -> None:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         commissions = db.query(Commission).filter(
             Commission.payout_id == payout.id
         ).all()

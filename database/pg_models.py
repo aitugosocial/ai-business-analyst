@@ -11,7 +11,7 @@ from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import relationship, synonym
 from sqlalchemy.sql import func
 from sqlalchemy.sql.sqltypes import VARCHAR
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from .pg_connections import Base
@@ -539,8 +539,8 @@ class Ticket(Base):
     issue = Column(Text, nullable=False)
     category = Column(String(50), default="general")  # general, technical, billing, etc.
     status = Column(String(50), default="open")  # open, in_progress, resolved, closed
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     # Relationships
     user = relationship("User", back_populates="tickets")
@@ -555,7 +555,7 @@ class TicketMessage(Base):
     sender_role = Column(String(20), nullable=False)  # "user" or "admin"
     message = Column(Text, nullable=False)
     is_read = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     # Relationships
     ticket = relationship("Ticket", back_populates="messages")
@@ -573,7 +573,7 @@ class Review(Base):
     review_title = Column(String)
     rating = Column(Integer)
     review_text = Column(Text)
-    date_submitted = Column(DateTime, default=datetime.utcnow)
+    date_submitted = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     status = Column(String, default="Submitted")  # published, under-review, rejected (Clinton's)
     category = Column(String, default="General")
     helpful = Column(Integer, default=0)
@@ -588,7 +588,7 @@ class Conversation(Base):
     review_id = Column(Integer, ForeignKey("reviews.id"))
     sender_type = Column(String)  # 'admin' or 'user'
     message = Column(Text)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     is_read = Column(Boolean, default=False)
 
     # Relationships
@@ -680,7 +680,7 @@ class Alert(Base):
     total_views = Column(Integer, default=0)
     total_shares = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     user_alerts = relationship("UserAlert", back_populates="alert")
 
@@ -698,7 +698,7 @@ class UserAlert(Base):
     shared_at = Column(DateTime, nullable=True)
     chops_earned_from_view = Column(Integer, default=0)
     chops_earned_from_share = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", back_populates="user_alerts")
     alert = relationship("Alert", back_populates="user_alerts")
@@ -712,7 +712,7 @@ class Referral(Base):
     referrer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     referred_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     chops_awarded = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     referrer = relationship("User", foreign_keys=[referrer_id], back_populates="referrals")
     referred_user = relationship("User",foreign_keys=[referred_user_id], back_populates="referred_by")
@@ -928,7 +928,7 @@ class Insight(Base):
     what_changed = Column(Text)
     why_it_matters = Column(Text)
     action_to_take = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     is_active = Column(Boolean, default=True)
     total_views = Column(Integer, default=0)
     total_shares = Column(Integer, default=0)
@@ -949,7 +949,7 @@ class UserInsight(Base):
     shared_at = Column(DateTime, nullable=True)
     chops_earned_from_view = Column(Integer, default=0)
     chops_earned_from_share = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", back_populates="user_insights")
     insight = relationship("Insight", back_populates="user_insights")
@@ -961,7 +961,7 @@ class UserPinnedInsight(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     insight_id = Column(Integer, ForeignKey("insights.id"))
-    pinned_at = Column(DateTime, default=datetime.utcnow)
+    pinned_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", back_populates="pinned_insights")
 
@@ -972,7 +972,7 @@ class UserPinnedAlert(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
     alert_id = Column(Integer, ForeignKey("alerts.id"))
-    pinned_at = Column(DateTime, default=datetime.utcnow)
+    pinned_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", back_populates="pinned_alerts")
 
@@ -1011,8 +1011,8 @@ class Trend(Base):
 
     # Metadata
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=True, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, nullable=True, onupdate=lambda: datetime.now(timezone.utc))
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
 

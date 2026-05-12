@@ -4,7 +4,7 @@ Password reset endpoints for forgot password functionality
 import os
 import secrets
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -63,7 +63,7 @@ async def forgot_password(
         reset_token = secrets.token_urlsafe(32)
         
         # Set expiry to 30 minutes from now
-        reset_expires = datetime.utcnow() + timedelta(minutes=30)
+        reset_expires = datetime.now(timezone.utc) + timedelta(minutes=30)
         
         # Update user with reset token and expiry
         user.password_reset_token = reset_token
@@ -132,7 +132,7 @@ async def reset_password(
             )
         
         # Check if token has expired
-        if user.password_reset_expires < datetime.utcnow():
+        if user.password_reset_expires < datetime.now(timezone.utc):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Reset token has expired. Please request a new password reset link."
@@ -151,8 +151,8 @@ async def reset_password(
         # Update user password and mark token as used
         user.password = hashed_password
         user.confirm_password = hashed_password  # Keep confirm_password in sync
-        user.password_reset_used_at = datetime.utcnow()
-        user.updated_at = datetime.utcnow()
+        user.password_reset_used_at = datetime.now(timezone.utc)
+        user.updated_at = datetime.now(timezone.utc)
         
         db.commit()
         

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Header, Cookie
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, and_, case, extract
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from jose import jwt, JWTError
 import traceback
@@ -457,7 +457,7 @@ async def health_check():
         "status": "healthy",
         "service": "Earnings API",
         "commission_rate": f"{int(COMMISSION_RATE * 100)}%",
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 

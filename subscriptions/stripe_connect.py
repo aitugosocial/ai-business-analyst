@@ -7,7 +7,7 @@ import logging
 import traceback
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Body
 from pydantic import BaseModel
@@ -277,7 +277,7 @@ async def get_stripe_account_status(
         if account.details_submitted and account.charges_enabled and account.payouts_enabled:
             payout_account.stripe_account_status = "verified"
             payout_account.is_verified = True
-            payout_account.verified_at = datetime.utcnow()
+            payout_account.verified_at = datetime.now(timezone.utc)
         elif account.charges_enabled:
             payout_account.stripe_account_status = "active"
             payout_account.is_verified = False
@@ -597,8 +597,8 @@ async def stripe_connect_webhook(
                                 existing.payment_method = "stripe"
                                 existing.stripe_account_status = "verified"
                                 existing.is_verified = True
-                                existing.verified_at = datetime.utcnow()
-                                existing.updated_at = datetime.utcnow()
+                                existing.verified_at = datetime.now(timezone.utc)
+                                existing.updated_at = datetime.now(timezone.utc)
                                 payout_account = existing
                                 logger.info(
                                     f"[Stripe Connect /webhook] updated existing PayoutAccount "
@@ -611,7 +611,7 @@ async def stripe_connect_webhook(
                                     stripe_account_id=account_id,
                                     stripe_account_status="verified",
                                     is_verified=True,
-                                    verified_at=datetime.utcnow(),
+                                    verified_at=datetime.now(timezone.utc),
                                 )
                                 db.add(payout_account)
                                 logger.info(
@@ -622,8 +622,8 @@ async def stripe_connect_webhook(
                     # Row already exists — mark verified
                     payout_account.stripe_account_status = "verified"
                     payout_account.is_verified = True
-                    payout_account.verified_at = datetime.utcnow()
-                    payout_account.updated_at = datetime.utcnow()
+                    payout_account.verified_at = datetime.now(timezone.utc)
+                    payout_account.updated_at = datetime.now(timezone.utc)
                     logger.info(
                         f"[Stripe Connect /webhook] account {account_id} marked VERIFIED"
                     )
@@ -632,7 +632,7 @@ async def stripe_connect_webhook(
                 payout_account.stripe_account_status = (
                     "active" if account.charges_enabled else "pending"
                 )
-                payout_account.updated_at = datetime.utcnow()
+                payout_account.updated_at = datetime.now(timezone.utc)
                 if payout_account.is_verified and not account.details_submitted:
                     payout_account.is_verified = False
                     payout_account.verified_at = None
@@ -701,7 +701,7 @@ async def fix_restricted_test_account(
                     "ssn_last_4": "0000",
                 },
                 tos_acceptance={
-                    "date": int(datetime.utcnow().timestamp()),
+                    "date": int(datetime.now(timezone.utc).timestamp()),
                     "ip": "127.0.0.1",
                 },
                 capabilities={
@@ -732,7 +732,7 @@ async def fix_restricted_test_account(
 
         payout_account.stripe_account_status = "active"
         payout_account.is_verified = True
-        payout_account.verified_at = datetime.utcnow()
+        payout_account.verified_at = datetime.now(timezone.utc)
         db.commit()
         logger.info(
             f"[Stripe Connect /test/fix-restricted-account] DB set to active for {account_id}"

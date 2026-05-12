@@ -1,7 +1,7 @@
 
 from fastapi import APIRouter, HTTPException, Depends, WebSocket, WebSocketDisconnect, Cookie
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict
 from jose import jwt, JWTError
 from api.routes.auth.login import SECRET_KEY, ALGORITHM
@@ -175,8 +175,8 @@ async def create_ticket(
             issue=ticket_data.issue.strip(),
             category=ticket_data.category,
             status="open",
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc)
         )
         
         db.add(new_ticket)
@@ -190,7 +190,7 @@ async def create_ticket(
             sender_role="user",
             message=ticket_data.issue.strip(),
             is_read=False,  # Unread by Admin
-            created_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc)
         )
         
         db.add(initial_message)
@@ -387,7 +387,7 @@ async def reply_to_ticket(
             sender_role="user",
             message=message_data.message.strip(),
             is_read=False,
-            created_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc)
         )
         
         db.add(new_message)
@@ -396,7 +396,7 @@ async def reply_to_ticket(
         if ticket.status in ["resolved", "closed"]:
             ticket.status = "in_progress"
         
-        ticket.updated_at = datetime.utcnow()
+        ticket.updated_at = datetime.now(timezone.utc)
         
         db.commit()
         db.refresh(new_message)
@@ -527,7 +527,7 @@ async def admin_reply_to_ticket(
             sender_role="admin",
             message=message_data.message.strip(),
             is_read=False,
-            created_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc)
         )
         
         db.add(new_message)
@@ -536,7 +536,7 @@ async def admin_reply_to_ticket(
         if ticket.status in ["open", "resolved"]:
             ticket.status = "in_progress"
         
-        ticket.updated_at = datetime.utcnow()
+        ticket.updated_at = datetime.now(timezone.utc)
         
         db.commit()
         db.refresh(new_message)
@@ -615,7 +615,7 @@ async def update_ticket_status(
             raise HTTPException(status_code=404, detail="Ticket not found")
         
         ticket.status = status
-        ticket.updated_at = datetime.utcnow()
+        ticket.updated_at = datetime.now(timezone.utc)
         
         # If status is resolved, add a system message
         if status == "resolved":
@@ -625,7 +625,7 @@ async def update_ticket_status(
                 sender_role="system",
                 message="Ticket Resolved",
                 is_read=True, 
-                created_at=datetime.utcnow()
+                created_at=datetime.now(timezone.utc)
             )
             db.add(system_msg)
             
@@ -865,7 +865,7 @@ async def resolve_all_user_tickets(
         
         for ticket in tickets:
             ticket.status = 'resolved'
-            ticket.updated_at = datetime.utcnow()
+            ticket.updated_at = datetime.now(timezone.utc)
             count += 1
             
             # Create a PERSISTENT system message for each resolved ticket
@@ -875,7 +875,7 @@ async def resolve_all_user_tickets(
                 sender_role="system",
                 message="Ticket Resolved",
                 is_read=True,
-                created_at=datetime.utcnow()
+                created_at=datetime.now(timezone.utc)
             )
             db.add(system_message)
             system_messages.append((ticket.id, system_message))

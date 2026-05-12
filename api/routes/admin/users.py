@@ -15,7 +15,7 @@ def format_relative_time(dt: datetime) -> str:
     if not dt:
         return "Never"
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     # Handle timezone-aware datetimes
     if dt.tzinfo is not None:
         dt = dt.replace(tzinfo=None)
@@ -44,7 +44,7 @@ def is_user_inactive(user: User) -> bool:
     if last_activity.tzinfo is not None:
         last_activity = last_activity.replace(tzinfo=None)
 
-    cutoff = datetime.utcnow() - timedelta(days=30)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
     return last_activity < cutoff
 
 
@@ -72,7 +72,7 @@ async def get_user_stats(
         deactivated_users = db.query(func.count(User.id)).filter(User.is_active == False).scalar()
 
         # Inactive Users (no login for 30 days) - use last_login field
-        cutoff_date = datetime.utcnow() - timedelta(days=30)
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=30)
         inactive_users = db.query(func.count(User.id)).filter(
             User.is_active == True,  # Only count active users as "inactive" due to dormancy
             or_(
@@ -194,7 +194,7 @@ async def get_users(
         )
 
     # Status Filter
-    cutoff_date = datetime.utcnow() - timedelta(days=30)
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=30)
 
     if status and status != 'all':
         if status == 'active':
@@ -369,7 +369,7 @@ async def sync_subscription_statuses(
             for sub in user.subscriptions:
                 if sub.status == 'active' and sub.end_date:
                     end_date = sub.end_date.replace(tzinfo=None) if sub.end_date.tzinfo else sub.end_date
-                    if end_date > datetime.utcnow():
+                    if end_date > datetime.now(timezone.utc):
                         active_sub = sub
                         break
                     else:

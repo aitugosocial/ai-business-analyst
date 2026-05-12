@@ -354,13 +354,13 @@ class BetaService:
         if is_beta:
             # Beta user: Grace period starts at launch
             user.is_beta_user = True
-            user.beta_joined_at = datetime.utcnow()
+            user.beta_joined_at = datetime.now(timezone.utc)
             if launch_date:
                 user.grace_period_ends_at = launch_date + timedelta(days=grace_days)
         else:
             # Post-launch user: Grace period starts now
             user.is_beta_user = False
-            user.grace_period_ends_at = datetime.utcnow() + timedelta(days=grace_days)
+            user.grace_period_ends_at = datetime.now(timezone.utc) + timedelta(days=grace_days)
             
         db.add(user)
         db.flush()
@@ -369,7 +369,7 @@ class BetaService:
     def mark_as_beta_user(user: User, db: Session):
         """Mark user as beta participant (force beta status)"""
         user.is_beta_user = True
-        user.beta_joined_at = datetime.utcnow()
+        user.beta_joined_at = datetime.now(timezone.utc)
         
         launch_date = BetaService.get_launch_date()
         if launch_date:
@@ -388,7 +388,7 @@ class BetaService:
         from database.pg_models import NotificationHistory
         
         # Check if notification was sent recently
-        cutoff = datetime.utcnow() - timedelta(hours=24)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
         recent = db.query(NotificationHistory).filter(
             NotificationHistory.user_id == user.id,
             NotificationHistory.notification_type == notification_type,

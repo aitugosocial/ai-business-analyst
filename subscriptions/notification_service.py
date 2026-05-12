@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from database.pg_models import User, UserNotification, NotificationHistory
 
@@ -34,7 +34,7 @@ class NotificationService:
             message=message,
             link=link,
             is_read=False,          # Must stay False until user reads it
-            created_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc)
         )
         db.add(notification)
 
@@ -42,7 +42,7 @@ class NotificationService:
         history = NotificationHistory(
             user_id=user_id,
             notification_type=resolved_type,
-            sent_at=datetime.utcnow()
+            sent_at=datetime.now(timezone.utc)
         )
         db.add(history)
 
@@ -104,7 +104,7 @@ class NotificationService:
             return False
 
         notification.is_read = True
-        notification.read_at = datetime.utcnow()
+        notification.read_at = datetime.now(timezone.utc)
         db.commit()
         return True
 
@@ -120,7 +120,7 @@ class NotificationService:
             UserNotification.is_read == False
         ).all()
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         for n in unread:
             n.is_read = True
             n.read_at = now
@@ -174,7 +174,7 @@ class NotificationService:
             return None
 
         if user.grace_period_ends_at:
-            days_remaining = (user.grace_period_ends_at - datetime.utcnow()).days
+            days_remaining = (user.grace_period_ends_at - datetime.now(timezone.utc)).days
         else:
             days_remaining = BetaService.get_grace_period_days()
 

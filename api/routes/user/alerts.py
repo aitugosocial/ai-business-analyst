@@ -1,17 +1,18 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.orm import Session
-from datetime import datetime
+from pydantic import BaseModel
+from datetime import datetime, timezone
 
 from database.pg_connections import get_db
 from database.pg_models import (User, Alert, Referral, UserAlert, UserResponse, UserCreate, AlertResponse, AlertCreate,
                             ViewAlertRequest, ShareAlertRequest, ChopsBreakdown, PinAlertRequest, UserPinnedAlert)
-from api.routes.auth.login import get_current_user
+from api.routes.auth.login import get_current_user, get_admin_user
 from api.cache import get_cached, set_cached, delete_cached, CacheTTL
 from api.utils.subscription_sync import sync_user_subscription
 
 from typing import Optional, List
 
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 
 router = APIRouter(tags=["alerts"])
 
@@ -121,24 +122,29 @@ async def get_alerts(
 
     alerts = query.order_by(Alert.created_at.desc()).offset(skip).limit(limit).all()
 
-    # Get all pinned alerts for this user
-    pinned_alert_ids = set(
-        db.query(UserPinnedAlert.alert_id)
-        .filter(UserPinnedAlert.user_id == user_id)
+    alert_ids = [a.id for a in alerts]
+
+    # Single bulk query for pinned status — replaces per-alert lookup
+    pinned_alert_ids = {
+        pid[0]
+        for pid in db.query(UserPinnedAlert.alert_id)
+        .filter(UserPinnedAlert.user_id == user_id, UserPinnedAlert.alert_id.in_(alert_ids))
         .all()
-    )
+    }
 
-    pinned_alert_ids = {pid[0] for pid in pinned_alert_ids}
+    # Single bulk query for user-alert interactions — eliminates N+1
+    user_alerts_map = {
+        ua.alert_id: ua
+        for ua in db.query(UserAlert).filter(
+            UserAlert.user_id == user_id,
+            UserAlert.alert_id.in_(alert_ids),
+        ).all()
+    }
 
-    # Always include user interaction data when authenticated
     result = []
     for alert in alerts:
-        user_alert = db.query(UserAlert).filter(
-            UserAlert.user_id == user_id,
-            UserAlert.alert_id == alert.id
-        ).first()
+        user_alert = user_alerts_map.get(alert.id)
 
-        # Mark as attended if the is_attended flag is True OR if user has viewed/shared
         is_attended = False
         has_viewed = False
         has_shared = False
@@ -179,6 +185,132 @@ async def get_alerts(
     await set_cached(cache_key, result_data, CacheTTL.MEDIUM)
 
     return result
+
+
+@router.get("/alerts/unread-count")
+async def get_unread_alerts_count(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Returns the count of active alerts the current user has not yet viewed,
+    scoped to alerts published on or after their account creation date.
+    A user only 'owns' alerts that existed when they joined or arrived later.
+    Polled every 2 minutes; also triggered after each page is viewed.
+    """
+    user_id = current_user.id
+    viewed_ids = (
+        db.query(UserAlert.alert_id)
+        .filter(UserAlert.user_id == user_id, UserAlert.has_viewed == True)
+    )
+    count = (
+        db.query(func.count(Alert.id))
+        .filter(
+            Alert.is_active == True,
+            Alert.created_at >= current_user.created_at,
+            ~Alert.id.in_(viewed_ids),
+        )
+        .scalar()
+    ) or 0
+    return {"count": count}
+
+
+@router.get("/alerts/paginated")
+async def get_alerts_paginated(
+    page: int = 1,
+    limit: int = 7,
+    category: Optional[str] = None,
+    priority: Optional[str] = None,
+    today_only: bool = False,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Paginated alerts endpoint.
+    Returns { data, total, page, pages } so the frontend can drive
+    pagination from the backend instead of fetching all records.
+    When today_only=true only alerts created since midnight UTC today
+    are returned — used by the home-feed dashboard preview.
+    """
+    user_id = current_user.id
+    page = max(1, page)
+    limit = max(1, min(limit, 50))
+    skip = (page - 1) * limit
+
+    base_query = db.query(Alert).filter(
+        Alert.is_active == True,
+        # Only surface alerts that existed on or after the user's join date.
+        # For users registered before all alerts this is all alerts.
+        # For new users this scopes to alerts published after they signed up,
+        # keeping the list and the unread-count consistent with each other.
+        Alert.created_at >= current_user.created_at,
+    )
+    if category:
+        base_query = base_query.filter(Alert.category == category)
+    if priority:
+        base_query = base_query.filter(Alert.priority == priority)
+    if today_only:
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        base_query = base_query.filter(Alert.created_at >= today_start)
+
+    total = base_query.count()
+    pages = max(1, -(-total // limit))  # ceiling division
+
+    alerts = base_query.order_by(Alert.created_at.desc()).offset(skip).limit(limit).all()
+
+    alert_ids_page = [a.id for a in alerts]
+
+    # Single bulk query for pinned status
+    pinned_ids = {
+        pid[0]
+        for pid in db.query(UserPinnedAlert.alert_id)
+        .filter(UserPinnedAlert.user_id == user_id, UserPinnedAlert.alert_id.in_(alert_ids_page))
+        .all()
+    }
+
+    # Single bulk query for user interactions — eliminates N+1
+    ua_map = {
+        ua.alert_id: ua
+        for ua in db.query(UserAlert).filter(
+            UserAlert.user_id == user_id,
+            UserAlert.alert_id.in_(alert_ids_page),
+        ).all()
+    }
+
+    result = []
+    for alert in alerts:
+        ua = ua_map.get(alert.id)
+        has_viewed = ua.has_viewed if ua else False
+        has_shared = ua.has_shared if ua else False
+        result.append(AlertResponse(**{
+            "id": alert.id,
+            "title": alert.title,
+            "category": alert.category,
+            "priority": alert.priority,
+            "score": alert.score,
+            "time_remaining": alert.time_remaining,
+            "why_act_now": alert.why_act_now,
+            "potential_reward": alert.potential_reward,
+            "action_required": alert.action_required,
+            "source": alert.source,
+            "url": alert.url or "",
+            "date": alert.date,
+            "posted_date": alert.created_at.strftime("%Y-%m-%d") if alert.created_at else alert.date,
+            "total_views": alert.total_views,
+            "total_shares": alert.total_shares,
+            "has_viewed": has_viewed,
+            "has_shared": has_shared,
+            "is_attended": ua.is_attended if ua else False,
+            "is_pinned": alert.id in pinned_ids,
+        }))
+
+    return {
+        "data": [r.model_dump() for r in result],
+        "total": total,
+        "page": page,
+        "pages": pages,
+        "limit": limit,
+    }
 
 
 @router.get("/alerts/{alert_id}", response_model=AlertResponse)
@@ -256,7 +388,7 @@ async def view_alert(request: ViewAlertRequest, current_user = Depends(get_curre
             alert_id=request.alert_id,
             has_viewed=True,
             is_attended=True,
-            viewed_at=datetime.utcnow(),
+            viewed_at=datetime.now(timezone.utc),
             chops_earned_from_view=chops_to_award
         )
 
@@ -286,7 +418,7 @@ async def view_alert(request: ViewAlertRequest, current_user = Depends(get_curre
 
         user_alert.has_viewed = True
         user_alert.is_attended = True
-        user_alert.viewed_at = datetime.utcnow()
+        user_alert.viewed_at = datetime.now(timezone.utc)
         user_alert.chops_earned_from_view = chops_to_award
 
         # Award chops
@@ -354,7 +486,7 @@ def share_alert(request: ShareAlertRequest, current_user = Depends(get_current_u
             alert_id=request.alert_id,
             has_shared=True,
             is_attended=True,
-            shared_at=datetime.utcnow(),
+            shared_at=datetime.now(timezone.utc),
             chops_earned_from_share=chops_to_award
         )
 
@@ -384,7 +516,7 @@ def share_alert(request: ShareAlertRequest, current_user = Depends(get_current_u
 
         user_alert.has_shared = True
         user_alert.is_attended = True
-        user_alert.shared_at = datetime.utcnow()
+        user_alert.shared_at = datetime.now(timezone.utc)
         user_alert.chops_earned_from_share = chops_to_award
 
         # Award chops
@@ -501,6 +633,152 @@ def pin_alert(
     db.commit()
 
     return {"message": "Alert pinned", "is_pinned": True}
+
+class MarkPageReadRequest(BaseModel):
+    alert_ids: List[int]
+
+@router.post("/alerts/mark-page-read")
+async def mark_page_alerts_read(
+    body: MarkPageReadRequest,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Mark a specific set of alert IDs as viewed for the current user.
+    Called after each page of alerts is rendered so the sidebar badge
+    decrements page-by-page rather than resetting all at once.
+
+    IMPORTANT: existing UserAlert rows are NEVER modified — any
+    previously recorded chops, share events, or viewed timestamps are
+    left exactly as the user earned them. Only alerts that have NO
+    existing row at all get a new has_viewed=True record inserted.
+    """
+    if not body.alert_ids:
+        return {"status": "ok", "marked": 0}
+
+    user_id = current_user.id
+    # Only look up which alert_ids already have ANY record for this user.
+    already_tracked = {
+        row[0]
+        for row in db.query(UserAlert.alert_id).filter(
+            UserAlert.user_id == user_id,
+            UserAlert.alert_id.in_(body.alert_ids),
+        ).all()
+    }
+    now = datetime.now(timezone.utc)
+    newly_marked = 0
+    for alert_id in body.alert_ids:
+        if alert_id not in already_tracked:
+            db.add(UserAlert(
+                user_id=user_id,
+                alert_id=alert_id,
+                has_viewed=True,
+                viewed_at=now,
+                chops_earned_from_view=0,
+            ))
+            newly_marked += 1
+        # Any existing row — regardless of its current state — is left
+        # completely untouched so no previously earned chops or actions
+        # are overwritten.
+    db.commit()
+    return {"status": "ok", "marked": newly_marked}
+
+
+@router.post("/alerts/mark-all-read")
+async def mark_all_alerts_read(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Mark every alert as viewed for the current user.
+    Called when the user opens the Opportunity Alerts page so the
+    sidebar badge counter resets immediately and stays reset across sessions.
+    """
+    user = current_user
+    all_alert_ids = [a.id for a in db.query(Alert.id).filter(Alert.is_active == True).all()]
+
+    # Only find alert_ids that have ANY existing record — those are left untouched
+    # to preserve earned chops, share events, and any other recorded actions.
+    already_tracked = {
+        row[0]
+        for row in db.query(UserAlert.alert_id).filter(
+            UserAlert.user_id == user.id,
+            UserAlert.alert_id.in_(all_alert_ids),
+        ).all()
+    }
+
+    now = datetime.now(timezone.utc)
+    for alert_id in all_alert_ids:
+        if alert_id not in already_tracked:
+            db.add(UserAlert(
+                user_id=user.id,
+                alert_id=alert_id,
+                has_viewed=True,
+                viewed_at=now,
+                chops_earned_from_view=0,
+            ))
+
+    db.commit()
+    # Clear all alert cache variants for this user
+    await delete_cached(f"alerts:list:{user.id}:all:all:0:100")
+    return {"status": "ok", "message": "All alerts marked as read"}
+
+
+@router.post("/alerts/admin/backfill-viewed")
+async def backfill_viewed_alerts(
+    db: Session = Depends(get_db),
+    _admin=Depends(get_admin_user),
+):
+    """
+    One-time migration: for every user who has zero UserAlert rows, create
+    has_viewed=True records for all currently active alerts.
+
+    These are legacy accounts whose mark-all-read calls never reached the
+    backend (double /api prefix bug). They appear to have 229 unread alerts
+    but have interacted with the platform normally — they just lack the DB
+    records to prove it. After this runs, their unread count becomes 0 and
+    the badge behaves correctly going forward.
+
+    Safe to run multiple times: only targets users with NO UserAlert rows.
+    """
+    # Users who already have at least one UserAlert record — skip them.
+    users_with_records = {
+        row[0]
+        for row in db.query(UserAlert.user_id).distinct().all()
+    }
+
+    all_user_ids = [row[0] for row in db.query(User.id).all()]
+    legacy_ids = [uid for uid in all_user_ids if uid not in users_with_records]
+
+    if not legacy_ids:
+        return {"status": "ok", "seeded_users": 0, "seeded_rows": 0}
+
+    all_alert_ids = [
+        row[0]
+        for row in db.query(Alert.id).filter(Alert.is_active == True).all()
+    ]
+
+    now = datetime.now(timezone.utc)
+    rows = 0
+    for user_id in legacy_ids:
+        for alert_id in all_alert_ids:
+            db.add(UserAlert(
+                user_id=user_id,
+                alert_id=alert_id,
+                has_viewed=True,
+                is_attended=True,
+                viewed_at=now,
+                chops_earned_from_view=0,
+            ))
+            rows += 1
+
+    db.commit()
+    return {
+        "status": "ok",
+        "seeded_users": len(legacy_ids),
+        "seeded_rows": rows,
+    }
+
 
 # Health check
 @router.get("/")

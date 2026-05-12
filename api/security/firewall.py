@@ -335,11 +335,13 @@ class FirewallMiddleware(BaseHTTPMiddleware):
 
         # 1. Skip firewall for specific paths (metrics, health, static, auth, and critical commerce)
         whitelist = (
-            "/health", "/docs", "/openapi.json", "/assets", 
+            "/health", "/docs", "/openapi.json", "/assets",
             "/api/me", "/users/me", "/user/me",
             "/api/stripe", "/api/payments", "/api/commissions",
             "/api/control", "/api/referrals", "/api/earnings",
-            "/api/customer-service/ws"  # Allow WebSockets
+            "/api/customer-service/ws",  # WebSockets
+            "/api/admin",                # Admin routes — already protected by admin_required
+            "/api/business/analyze/stream",  # SSE streaming — body buffering breaks it
         )
         if request.url.path.startswith(whitelist):
              return await call_next(request)
@@ -353,8 +355,16 @@ class FirewallMiddleware(BaseHTTPMiddleware):
                 # Attach to request state for FirewallManager to use
                 request.state.body = body
                 
-                # Re-seed the stream so endpoints can read it again
+                # Re-seed the stream so the endpoint can read the body once.
+                # Must be stateful: Starlette's middleware calls receive() again
+                # during response streaming and expects http.disconnect, not
+                # another http.request — otherwise it raises RuntimeError.
+                _consumed = False
                 async def receive():
+                    nonlocal _consumed
+                    if _consumed:
+                        return {"type": "http.disconnect"}
+                    _consumed = True
                     return {"type": "http.request", "body": body, "more_body": False}
                 request._receive = receive
                 

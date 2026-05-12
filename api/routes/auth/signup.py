@@ -5,7 +5,7 @@ import os
 
 from fastapi import APIRouter, Depends, Form, HTTPException
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 # import the function to hash the passwords
 from passlib.context import CryptContext
@@ -94,14 +94,36 @@ def signup(
 
         logger.info(f"[SIGNUP] Referral code '{search_code}' validated for referrer ID {referrer.id}")
 
-    # Generate unique referral code for new user
-    logger.info(f"[SIGNUP] Generating referral code...")
-    user_refcode = generate_referral_code()
+    # ── Waitlist referral continuity ─────────────────────────────────────────
+    # The waitlist and main-app share the same database.  If this email existed
+    # on the waitlist, carry over their referral_code (so existing referral links
+    # keep working) and their referral_count (so earned rewards are preserved).
+    waitlist_refcode: str | None = None
+    waitlist_refcount: int = 0
+    try:
+        from sqlalchemy import text as _text
+        wl = db.execute(
+            _text("SELECT referral_code, referral_count FROM waitlist WHERE LOWER(email) = LOWER(:email) LIMIT 1"),
+            {"email": email}
+        ).fetchone()
+        if wl:
+            waitlist_refcode = wl[0]
+            waitlist_refcount = int(wl[1] or 0)
+            logger.info(f"[SIGNUP] Waitlist record found for {email}: code={waitlist_refcode}, count={waitlist_refcount}")
+    except Exception as wl_err:
+        logger.warning(f"[SIGNUP] Could not read waitlist table: {wl_err}")
 
-    # Ensure referral code is unique
-    while db.query(User).filter(User.referral_code == user_refcode).first():
+    # Use waitlist referral code if available and not already taken in users table
+    if waitlist_refcode and not db.query(User).filter(User.referral_code == waitlist_refcode).first():
+        user_refcode = waitlist_refcode
+        logger.info(f"[SIGNUP] Using waitlist referral code: {user_refcode}")
+    else:
+        # Generate unique referral code for new user
+        logger.info(f"[SIGNUP] Generating referral code...")
         user_refcode = generate_referral_code()
-    
+        while db.query(User).filter(User.referral_code == user_refcode).first():
+            user_refcode = generate_referral_code()
+
     logger.info(f"[SIGNUP] Created user referral code: {user_refcode}")
 
     # Create user
@@ -118,6 +140,7 @@ def signup(
         referral_code=user_refcode,
         referrer_code=referrer.referral_code if referrer else None,
         company_name=company_name if company_name else None,
+        referral_count=waitlist_refcount,  # carry over waitlist referral history
     )
 
     logger.info(f"[SIGNUP] Calling BetaService.initialize_grace_period...")
@@ -140,7 +163,7 @@ def signup(
             referrer_id=referrer.id,
             referred_user_id=new_user.id,
             chops_awarded=0,
-            created_at=datetime.utcnow()
+            created_at=datetime.now(timezone.utc)
         )
         db.add(referral)
         

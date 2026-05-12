@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_
 from typing import List, Dict
 from datetime import datetime
@@ -42,11 +42,15 @@ async def get_notifications(
         UserNotification.user_id == user_id
     ).order_by(UserNotification.is_read.asc(), UserNotification.created_at.desc()).limit(20).all()
     
-    # 2. Fetch UserAlerts that haven't been attended
-    user_alerts = db.query(UserAlert).filter(
-        UserAlert.user_id == user_id,
-        UserAlert.is_attended == False
-    ).join(Alert).order_by(Alert.created_at.desc()).all()
+    # 2. Fetch UserAlerts that haven't been attended — joinedload eliminates N+1
+    user_alerts = (
+        db.query(UserAlert)
+        .filter(UserAlert.user_id == user_id, UserAlert.is_attended == False)
+        .join(Alert)
+        .options(joinedload(UserAlert.alert))  # pre-load Alert in the same query
+        .order_by(Alert.created_at.desc())
+        .all()
+    )
     
     result = []
     

@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy import func, extract, case
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from database.pg_connections import get_db
@@ -44,7 +44,7 @@ async def get_revenue_stats(
     verify_admin(current_user)
     
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         current_month_start = datetime(now.year, now.month, 1)
         
         # Monthly Revenue (current month subscriptions)
@@ -420,7 +420,7 @@ async def approve_user_commissions(
             recipient_name=user.name,
             account_details=account_details,
             failure_reason='',  # Initialize as empty string (will be populated on failure)
-            requested_at=datetime.utcnow()
+            requested_at=datetime.now(timezone.utc)
         )
         db.add(payout)
         db.flush()  # Get payout ID
@@ -429,7 +429,7 @@ async def approve_user_commissions(
         for comm in selected_commissions:
             comm.payout_id = payout.id
             comm.status = 'processing'
-            comm.approved_at = datetime.utcnow()
+            comm.approved_at = datetime.now(timezone.utc)
         
         db.flush()
 
@@ -441,7 +441,7 @@ async def approve_user_commissions(
                 # Update: Explicitly mark commissions as paid because payout_service might only set payout status
                 for comm in selected_commissions:
                     comm.status = 'paid'
-                    comm.paid_at = datetime.utcnow()
+                    comm.paid_at = datetime.now(timezone.utc)
                 
                 db.commit()
                 
@@ -483,7 +483,7 @@ async def approve_user_commissions(
             # Mark payout as failed
             payout.status = 'failed'
             payout.failure_reason = str(payout_error)
-            payout.failed_at = datetime.utcnow()
+            payout.failed_at = datetime.now(timezone.utc)
             
             db.commit()
             

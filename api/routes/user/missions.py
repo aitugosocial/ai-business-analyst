@@ -5,7 +5,7 @@ Each action plan becomes a trackable mission
 """
 import logging
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -72,11 +72,24 @@ async def get_user_missions(
         ).order_by(BusinessAnalysis.created_at.desc()).all()
 
         missions = []
+        # Track which strategic priorities we've already turned into a mission.
+        # analyses is ordered newest-first so we keep the latest run per goal.
+        seen_priorities: set = set()
 
         for analysis in analyses:
-            # Skip if no action plans
-            if not _parse_action_plans(analysis) or len(_parse_action_plans(analysis)) == 0:
+            # Parse once — used three times in the original code (N+1 call smell)
+            action_plans = _parse_action_plans(analysis)
+            if not action_plans:
                 continue
+
+            # Deduplicate: skip missions whose strategic_priority / goal we already have.
+            # Use the first 80 chars of goal as a normalised key so near-identical
+            # re-runs of the same analysis don't appear as separate missions.
+            priority_key = (analysis.strategic_priority or (analysis.business_goal or '')[:80]).strip().lower()
+            if priority_key and priority_key in seen_priorities:
+                continue
+            if priority_key:
+                seen_priorities.add(priority_key)
 
             # Get user progress from analysis metadata
             user_progress = analysis.user_progress or {}
@@ -84,7 +97,7 @@ async def get_user_missions(
 
             # Convert action plans to mission steps
             steps = []
-            for idx, action in enumerate(_parse_action_plans(analysis), 1):
+            for idx, action in enumerate(action_plans, 1):
                 step_id = f"{analysis.id}_action_{idx}"
                 is_completed = step_id in completed_steps
 
@@ -155,10 +168,18 @@ async def get_active_missions(
         ).order_by(BusinessAnalysis.created_at.desc()).all()
 
         active_missions = []
+        seen_active: set = set()
 
         for analysis in analyses:
-            if not _parse_action_plans(analysis):
+            action_plans = _parse_action_plans(analysis)
+            if not action_plans:
                 continue
+
+            priority_key = (analysis.strategic_priority or (analysis.business_goal or '')[:80]).strip().lower()
+            if priority_key and priority_key in seen_active:
+                continue
+            if priority_key:
+                seen_active.add(priority_key)
 
             user_progress = analysis.user_progress or {}
             if isinstance(user_progress, str):
@@ -171,7 +192,7 @@ async def get_active_missions(
                 user_progress = {}
 
             completed_steps = user_progress.get('completed_actions', [])
-            total_steps = len(_parse_action_plans(analysis))
+            total_steps = len(action_plans)
 
             # Only include if not fully completed
             if len(completed_steps) < total_steps:
@@ -453,7 +474,7 @@ async def complete_mission_step(
 
             if 'completion_dates' not in user_progress:
                 user_progress['completion_dates'] = {}
-            user_progress['completion_dates'][step_id] = datetime.utcnow().isoformat()
+            user_progress['completion_dates'][step_id] = datetime.now(timezone.utc).isoformat()
 
             # Award chops (20 points per step)
             current_user.total_chops = (current_user.total_chops or 0) + 20

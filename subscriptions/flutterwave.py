@@ -1,11 +1,10 @@
 # subscriptions/flutterwave.py
+from __future__ import annotations
+from typing import Annotated
 from fastapi import APIRouter, HTTPException, Depends, status, Request
 from pydantic import BaseModel
 import requests
-from datetime import datetime
-from typing import Annotated
-from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from decimal import Decimal, InvalidOperation
 
@@ -168,7 +167,7 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                 user.subscription_plan = current_plan
 
                 # Create subscription record
-                start_date = datetime.utcnow()
+                start_date = datetime.now(timezone.utc)
                 end_date = start_date + timedelta(days=plan_duration_days)
 
                 new_subscription = Subscriptions(
@@ -506,7 +505,7 @@ async def payment_health_check():
         "public_key_configured": bool(FLUTTERWAVE_PUBLIC_KEY),
         "secret_key_prefix": FLUTTERWAVE_SECRET_KEY[:15] + "..." if FLUTTERWAVE_SECRET_KEY else None,
         "is_test_mode": FLUTTERWAVE_SECRET_KEY.startswith("FLWSECK_TEST") if FLUTTERWAVE_SECRET_KEY else False,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 

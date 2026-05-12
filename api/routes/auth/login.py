@@ -3,7 +3,7 @@ import secrets
 import uuid
 from email_validator import validate_email, EmailNotValidError
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -262,12 +262,16 @@ def update_profile(
     user = current_user
     role = "admin" if user.is_admin else "user"
 
+    email_changed = False
     if update_data.email and update_data.email != user.email:
-        # Check if email is already taken
-        existing_user = db.query(User).filter(User.email == update_data.email).first()
+        existing_user = db.query(User).filter(
+            User.email == update_data.email,
+            User.id != user.id,
+        ).first()
         if existing_user:
-            raise HTTPException(status_code=400, detail="Email is already in use")
+            raise HTTPException(status_code=400, detail="Email is already in use by another account")
         user.email = update_data.email
+        email_changed = True
 
     if update_data.name:
         user.name = update_data.name
@@ -285,6 +289,16 @@ def update_profile(
     db.commit()
     db.refresh(user)
 
+    # JWT sub is the user's email. Changing the email invalidates the existing
+    # token immediately, so issue a fresh one with the new address as sub.
+    if email_changed:
+        new_token = create_access_token(
+            {"sub": user.email},
+            expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        )
+    else:
+        new_token = ""
+
     return {
         "id": user.id,
         "name": user.name,
@@ -299,7 +313,7 @@ def update_profile(
         "two_factor_enabled": user.two_factor_enabled,
         "email_notifications": user.email_notifications,
         "created_at": user.created_at,
-        "access_token": "", # Frontend already has it, or we could pass update_data's if needed
+        "access_token": new_token,
         "token_type": "bearer",
         "is_beta_user": user.is_beta_user,
         "subscription_expires_at": user.subscription_expires_at,
@@ -357,14 +371,14 @@ def get_admin_user(
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def create_refresh_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -448,8 +462,8 @@ def login(request: ShowUser, response: Response, fastapi_request: Request, db: S
     # Update Last Active - this also auto-reactivates inactive users
     # (inactive = no login for 30 days, but is_active is still True)
     # When they login again, they become active automatically
-    user.updated_at = datetime.utcnow()
-    user.last_login = datetime.utcnow()
+    user.updated_at = datetime.now(timezone.utc)
+    user.last_login = datetime.now(timezone.utc)
 
     # Note: Subscription status sync moved to dashboard load (lazy loading)
     # to prevent blocking login endpoint

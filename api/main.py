@@ -18,6 +18,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from passlib.context import CryptContext
 from sqlalchemy import inspect, text
@@ -117,6 +118,9 @@ if _extra_origins:
 
 origins = _origins_base
 
+
+# GZip compression — reduces JSON payload size by ~70% for typical API responses
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # Initialize and Register Firewall Middleware
 app.add_middleware(FirewallMiddleware)
@@ -576,6 +580,97 @@ async def startup_event():
             db.rollback()
         finally:
             db.close()
+
+        # ── Performance indexes ───────────────────────────────────────────────
+        # CREATE INDEX IF NOT EXISTS is idempotent — safe to run every startup.
+        # These cover every missing index found across the whole project:
+        # foreign keys, filter columns, sort columns, and composite lookups.
+        try:
+            db2 = SessionLocal()
+            index_statements = [
+                # business_analyses
+                "CREATE INDEX IF NOT EXISTS idx_ba_user_id ON business_analyses(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_ba_created_at ON business_analyses(created_at DESC)",
+                # subscriptions
+                "CREATE INDEX IF NOT EXISTS idx_sub_user_id ON subscriptions(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_sub_status ON subscriptions(subscription_status)",
+                "CREATE INDEX IF NOT EXISTS idx_sub_created_at ON subscriptions(created_at DESC)",
+                # alerts
+                "CREATE INDEX IF NOT EXISTS idx_alerts_is_active ON alerts(is_active)",
+                "CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at DESC)",
+                # user_alerts — composite covers both individual and joint lookups
+                "CREATE INDEX IF NOT EXISTS idx_ua_user_id ON user_alerts(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_ua_alert_id ON user_alerts(alert_id)",
+                "CREATE INDEX IF NOT EXISTS idx_ua_composite ON user_alerts(user_id, alert_id)",
+                # user_pinned_alerts
+                "CREATE INDEX IF NOT EXISTS idx_upa_user_id ON user_pinned_alerts(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_upa_alert_id ON user_pinned_alerts(alert_id)",
+                "CREATE INDEX IF NOT EXISTS idx_upa_composite ON user_pinned_alerts(user_id, alert_id)",
+                # referrals
+                "CREATE INDEX IF NOT EXISTS idx_ref_referrer_id ON referrals(referrer_id)",
+                "CREATE INDEX IF NOT EXISTS idx_ref_referred_id ON referrals(referred_user_id)",
+                # commissions
+                "CREATE INDEX IF NOT EXISTS idx_com_user_id ON commissions(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_com_referred_id ON commissions(referred_user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_com_sub_id ON commissions(subscription_id)",
+                "CREATE INDEX IF NOT EXISTS idx_com_status ON commissions(status)",
+                "CREATE INDEX IF NOT EXISTS idx_com_created_at ON commissions(created_at DESC)",
+                # payouts
+                "CREATE INDEX IF NOT EXISTS idx_payout_user_id ON payouts(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_payout_status ON payouts(status)",
+                # payout_accounts
+                "CREATE INDEX IF NOT EXISTS idx_pa_user_id ON payout_accounts(user_id)",
+                # user_notifications
+                "CREATE INDEX IF NOT EXISTS idx_un_user_id ON user_notifications(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_un_created_at ON user_notifications(created_at DESC)",
+                # insights
+                "CREATE INDEX IF NOT EXISTS idx_insights_is_active ON insights(is_active)",
+                "CREATE INDEX IF NOT EXISTS idx_insights_created_at ON insights(created_at DESC)",
+                # user_insights
+                "CREATE INDEX IF NOT EXISTS idx_ui_user_id ON user_insights(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_ui_insight_id ON user_insights(insight_id)",
+                # user_pinned_insights
+                "CREATE INDEX IF NOT EXISTS idx_upi_user_id ON user_pinned_insights(user_id)",
+                # reviews
+                "CREATE INDEX IF NOT EXISTS idx_reviews_user_id ON reviews(user_id)",
+                # conversations
+                "CREATE INDEX IF NOT EXISTS idx_conv_review_id ON conversations(review_id)",
+                "CREATE INDEX IF NOT EXISTS idx_conv_is_read ON conversations(is_read)",
+                # users — filter/sort columns
+                "CREATE INDEX IF NOT EXISTS idx_users_sub_status ON users(subscription_status)",
+                "CREATE INDEX IF NOT EXISTS idx_users_is_active ON users(is_active)",
+                "CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC)",
+                # community
+                "CREATE INDEX IF NOT EXISTS idx_cm_user_id ON channel_members(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_cm_channel_id ON channel_members(channel_id)",
+                "CREATE INDEX IF NOT EXISTS idx_cd_channel_id ON community_discussions(channel_id)",
+                "CREATE INDEX IF NOT EXISTS idx_cd_user_id ON community_discussions(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_dr_discussion_id ON discussion_replies(discussion_id)",
+                "CREATE INDEX IF NOT EXISTS idx_dl_user_id ON discussion_likes(user_id)",
+                # marketplace
+                "CREATE INDEX IF NOT EXISTS idx_mp_user_id ON marketplace_purchases(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_mp_tool_id ON marketplace_purchases(tool_id)",
+                "CREATE INDEX IF NOT EXISTS idx_mp_status ON marketplace_purchases(status)",
+                # saved items
+                "CREATE INDEX IF NOT EXISTS idx_si_user_id ON saved_items(user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_si_composite ON saved_items(user_id, item_type)",
+                # missions
+                "CREATE INDEX IF NOT EXISTS idx_um_user_id ON user_missions(user_id)",
+                # commission_summaries
+                "CREATE INDEX IF NOT EXISTS idx_cs_user_id ON commission_summaries(user_id)",
+            ]
+            for stmt in index_statements:
+                try:
+                    db2.execute(text(stmt))
+                except Exception:
+                    pass  # Index already exists or table missing — skip silently
+            db2.commit()
+            logger.info(f"✓ Performance indexes verified ({len(index_statements)} statements)")
+        except Exception as idx_err:
+            logger.warning(f"Index creation batch failed: {idx_err}")
+        finally:
+            try: db2.close()
+            except Exception: pass
 
         # Initialize Redis/in-memory cache
         await init_cache()

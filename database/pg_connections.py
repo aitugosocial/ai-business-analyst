@@ -68,19 +68,24 @@ try:
     # idle connections after 5 minutes. Recycling sooner prevents "SSL SYSCALL error: EOF detected".
     engine = create_engine(
         DATABASE_URL,
-        pool_pre_ping=True,  # Verify connections before using
-        pool_recycle=120,    # Recycle every 2 minutes (lower than 300 to beat server timeout)
-        pool_timeout=30,     # Prevent infinite hangs if the server is unresponsive
-        pool_size=10,        # Standard pool size
-        max_overflow=20,     # Additional connections when needed
-        echo=False,          # Set to True for SQL query logging (debugging)
+        pool_pre_ping=True,       # Health-check connection before each use
+        pool_recycle=90,          # Recycle before Neon's 300s idle timeout
+        pool_timeout=20,          # Fail fast — don't block the request for 30 s
+        pool_size=15,             # Raised from 10: supports more concurrent requests
+        max_overflow=30,          # Raised from 20: burst headroom for heavy pages
+        echo=False,
+        # execution_options for statement-level timeout — prevents runaway queries
+        # from holding a connection and starving other requests.
+        execution_options={"options": "-c statement_timeout=15000"},  # 15 s hard cap
         connect_args={
             "sslmode": "require",
+            "channel_binding": "require",
             "keepalives": 1,
-            "keepalives_idle": 30,
-            "keepalives_interval": 10,
-            "keepalives_count": 5
-        }, # Ensure SSL is enforced and keep connection alive
+            "keepalives_idle": 20,   # Reduced from 30: detect drops faster
+            "keepalives_interval": 5,
+            "keepalives_count": 3,
+            "connect_timeout": 10,   # Fail connection attempt after 10 s
+        },
     )
 
     # Test the connection
