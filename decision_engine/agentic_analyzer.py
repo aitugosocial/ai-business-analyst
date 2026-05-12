@@ -127,6 +127,7 @@ class AgenticAnalyzer:
             logger.info("Stage 1: Identifying primary bottleneck...")
             await _emit(10, "Identifying your primary bottleneck...")
             primary_result = await self._stage1_primary_bottleneck(user_query)
+            recommendation_mode = primary_result.get("recommendation_mode", "automation_stack")
             await _emit(25, f"Found: {primary_result.get('primary_bottleneck', {}).get('title', 'bottleneck identified')}")
 
             logger.info("Stage 2: Finding secondary constraints...")
@@ -150,6 +151,7 @@ class AgenticAnalyzer:
                 action_plans_result=action_plans_result,
                 primary_result=primary_result,
                 secondary_result=secondary_result,
+                recommendation_mode=recommendation_mode,
             )
             await _emit(80, "Tool stacks selected")
 
@@ -180,6 +182,7 @@ class AgenticAnalyzer:
                 roadmap_result=roadmap_result,
                 duration=duration_seconds,
                 confidence_score=confidence_score,
+                recommendation_mode=recommendation_mode,
             )
 
             response = self._format_for_frontend(
@@ -190,6 +193,7 @@ class AgenticAnalyzer:
                 action_plans_result=action_plans_result,
                 automation_stack_result=automation_stack_result,
                 roadmap_result=roadmap_result,
+                recommendation_mode=recommendation_mode,
             )
 
             await _emit(100, "Analysis complete!")
@@ -619,6 +623,7 @@ OUTPUT FORMAT (JSON only, no markdown fences):
         action_plans_result: Dict[str, Any],
         primary_result: Dict[str, Any],
         secondary_result: Dict[str, Any],
+        recommendation_mode: str = "automation_stack",
     ) -> Dict[str, Any]:
         """
         Stage 3B: Compose up to 3 automation stacks (algorithmic only).
@@ -807,6 +812,7 @@ Be practical and encouraging."""
         roadmap_result: Dict,
         duration: float,
         confidence_score: int,
+        recommendation_mode: str = "automation_stack",
     ) -> int:
         """Persist analysis results to the database."""
         from database.pg_models import BusinessAnalysis
@@ -862,6 +868,7 @@ Be practical and encouraging."""
         action_plans_result: Dict,
         automation_stack_result: Dict,
         roadmap_result: Dict,
+        recommendation_mode: str = "automation_stack",
     ) -> Dict[str, Any]:
         """Format analysis results for the frontend result page."""
         return {
