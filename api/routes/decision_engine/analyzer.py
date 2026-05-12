@@ -130,6 +130,7 @@ def format_analysis_for_frontend(analysis: BusinessAnalysis) -> Dict[str, Any]:
     action_plans = parse_json_field(analysis.action_plans, [])
     recommended_tool_stacks = parse_json_field(analysis.recommended_tool_stacks, [])
     execution_roadmap = parse_json_field(analysis.execution_roadmap, [])
+    single_tool_recommendation = parse_json_field(analysis.single_tool_recommendation, None)
 
     return {
         "analysis_id": analysis.id,
@@ -152,6 +153,9 @@ def format_analysis_for_frontend(analysis: BusinessAnalysis) -> Dict[str, Any]:
         # Additional context
         "exclusions_note": analysis.exclusions_note,
         "motivational_quote": analysis.motivational_quote,
+        # Recommendation mode (single tool vs automation stack)
+        "recommendation_mode": analysis.recommendation_mode or "automation_stack",
+        "single_tool_recommendation": single_tool_recommendation,
         # Metadata
         "created_at": analysis.created_at.isoformat() if analysis.created_at else "",
         "ai_model_used": analysis.ai_model_used,
