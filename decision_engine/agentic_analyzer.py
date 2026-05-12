@@ -850,6 +850,8 @@ Be practical and encouraging."""
         from database.pg_models import BusinessAnalysis
 
         try:
+            single_tool_recommendation = automation_stack_result.get("single_tool_recommendation")
+
             analysis = BusinessAnalysis(
                 user_id=user_id,
                 business_goal=user_query,
@@ -873,6 +875,8 @@ Be practical and encouraging."""
                 recommendations_count=len(
                     [ap for ap in action_plans_result["action_plans"] if ap.get("toolkit")]
                 ),
+                recommendation_mode=recommendation_mode,
+                single_tool_recommendation=json.dumps(single_tool_recommendation) if single_tool_recommendation else None,
             )
 
             self.db.add(analysis)
@@ -916,6 +920,8 @@ Be practical and encouraging."""
                 "recommended_tool_stacks": automation_stack_result.get(
                     "recommended_tool_stacks", []
                 ),
+                "recommendation_mode": recommendation_mode,
+                "single_tool_recommendation": automation_stack_result.get("single_tool_recommendation"),
                 "total_phases": roadmap_result["total_phases"],
                 "estimated_days": roadmap_result["estimated_days"],
                 "execution_roadmap": roadmap_result["execution_roadmap"],
