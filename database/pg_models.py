@@ -215,6 +215,7 @@ class ShowUser(BaseModel):
 class SaveCardRequest(BaseModel):
     payment_method_id: str
     currency: Optional[str] = "USD"
+    plan_type: Optional[str] = "monthly"   # monthly | quarterly | yearly
 
 
 class UserResponse(BaseModel):

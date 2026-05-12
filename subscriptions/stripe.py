@@ -786,11 +786,14 @@ async def save_card_for_beta(
         user.card_exp_year = payment_method.card.exp_year
         user.card_saved_at = datetime.now(timezone.utc)
 
-        requested_plan = (
-            getattr(request, 'plan_type', None)
-            or getattr(user, 'subscription_plan', None)
-            or "monthly"
-        )
+        _valid_plans = {"monthly", "quarterly", "yearly"}
+        requested_plan = (getattr(request, 'plan_type', None) or "").lower().strip()
+        if requested_plan not in _valid_plans:
+            # Log the bad value so it's visible in Railway logs, then fall back.
+            if requested_plan:
+                logger.warning(f"⚠️ Unknown plan_type '{requested_plan}' from request — defaulting to monthly")
+            requested_plan = getattr(user, 'subscription_plan', None) or "monthly"
+        logger.info(f"[save-card] plan_type={requested_plan} currency={currency} user={user.id}")
         if hasattr(user, 'subscription_plan'):
             user.subscription_plan = requested_plan
 
