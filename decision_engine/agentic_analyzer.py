@@ -876,7 +876,7 @@ Be practical and encouraging."""
                     [ap for ap in action_plans_result["action_plans"] if ap.get("toolkit")]
                 ),
                 recommendation_mode=recommendation_mode,
-                single_tool_recommendation=json.dumps(single_tool_recommendation) if single_tool_recommendation else None,
+                single_tool_recommendation=single_tool_recommendation,
             )
 
             self.db.add(analysis)
