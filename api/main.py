@@ -286,6 +286,13 @@ async def startup_event():
                 except Exception as e:
                     logger.warning(f"Failed to add recommended_tool_stacks to business_analyses: {e}")
 
+                # Add recommendation_mode and single_tool_recommendation to business_analyses
+                try:
+                    db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS recommendation_mode VARCHAR"))
+                    db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS single_tool_recommendation JSONB"))
+                except Exception as e:
+                    logger.warning(f"Failed to add recommendation mode columns to business_analyses: {e}")
+
                 # Security table fixes
                 try:
                     # Rename attempt_time to created_at if it exists
