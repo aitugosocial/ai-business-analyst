@@ -657,18 +657,21 @@ async def mark_page_alerts_read(
         return {"status": "ok", "marked": 0}
 
     user_id = current_user.id
-    # Only look up which alert_ids already have ANY record for this user.
-    already_tracked = {
-        row[0]
-        for row in db.query(UserAlert.alert_id).filter(
+    # Fetch ALL existing rows in one query so we can branch per alert.
+    existing_map = {
+        ua.alert_id: ua
+        for ua in db.query(UserAlert).filter(
             UserAlert.user_id == user_id,
             UserAlert.alert_id.in_(body.alert_ids),
         ).all()
     }
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     newly_marked = 0
     for alert_id in body.alert_ids:
-        if alert_id not in already_tracked:
+        existing = existing_map.get(alert_id)
+        if not existing:
+            # No record at all — create one. chops_earned_from_view stays 0;
+            # chops are only granted when the user opens an alert individually.
             db.add(UserAlert(
                 user_id=user_id,
                 alert_id=alert_id,
@@ -677,9 +680,14 @@ async def mark_page_alerts_read(
                 chops_earned_from_view=0,
             ))
             newly_marked += 1
-        # Any existing row — regardless of its current state — is left
-        # completely untouched so no previously earned chops or actions
-        # are overwritten.
+        elif not existing.has_viewed:
+            # Row exists (e.g. from a share) but not yet marked viewed.
+            # Set has_viewed only — preserve chops, shares, and all other
+            # previously recorded actions so nothing earned is overwritten.
+            existing.has_viewed = True
+            existing.viewed_at = now
+            newly_marked += 1
+        # has_viewed already True → leave completely untouched.
     db.commit()
     return {"status": "ok", "marked": newly_marked}
 
