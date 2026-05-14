@@ -32,22 +32,28 @@ FLUTTERWAVE_PUBLIC_KEY = os.getenv("NEXT_PUBLIC_FLUTTERWAVE_PUBLIC_KEY")
 FLUTTERWAVE_ENCRYPTION_KEY = os.getenv("FLUTTERWAVE_ENCRYPTION_KEY")
 FLUTTERWAVE_BASE_URL = "https://api.flutterwave.com/v3"
 
-Subscription_plans = {
-    "monthly": {
-        "amount": Decimal("29.95"),
-        "currency": "USD",
-        "duration_of_days": 30
-    },
-    "yearly": {
-        "amount": Decimal("290.00"),
-        "currency": "USD",
-        "duration_of_days": 365
-    }
+# Duration in days per plan — used when plan_type is passed explicitly
+PLAN_DURATION: dict[str, int] = {
+    "monthly":   30,
+    "quarterly": 90,
+    "yearly":    365,
 }
+
+# Amount-based fallback matching (for legacy or non-NGN transactions)
+Subscription_plans = {
+    "monthly_usd":   {"amount": Decimal("29.95"),  "currency": "USD", "plan": "monthly",   "duration_of_days": 30},
+    "quarterly_usd": {"amount": Decimal("88.68"),  "currency": "USD", "plan": "quarterly", "duration_of_days": 90},
+    "yearly_usd":    {"amount": Decimal("310.38"), "currency": "USD", "plan": "yearly",    "duration_of_days": 365},
+    "monthly_gbp":   {"amount": Decimal("23.66"),  "currency": "GBP", "plan": "monthly",   "duration_of_days": 30},
+    "quarterly_gbp": {"amount": Decimal("63.18"),  "currency": "GBP", "plan": "quarterly", "duration_of_days": 90},
+    "yearly_gbp":    {"amount": Decimal("248.47"), "currency": "GBP", "plan": "yearly",    "duration_of_days": 365},
+}
+
 
 class PaymentVerifyRequest(BaseModel):
     transaction_id: str
     user_email: str
+    plan_type: str | None = None  # monthly | quarterly | yearly — explicit plan from frontend
 
 class BankVerifyRequest(BaseModel):
     account_number: str
@@ -124,21 +130,32 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                         detail="Invalid amount received from Flutterwave API."
                     )
                 
-                # Match to subscription plan
+                # Determine subscription plan — prefer explicit plan_type from the
+                # frontend request (required for NGN/Flutterwave where we don't
+                # maintain price-ID tables). Fall back to amount-based matching
+                # for legacy USD/GBP payments.
                 current_plan = None
                 plan_duration_days = None
-                
-                for name, plan_details in Subscription_plans.items():
-                    if plan_details["currency"] == currency and plan_details["amount"] == verified_amount:
-                        current_plan = name
-                        plan_duration_days = plan_details["duration_of_days"]
-                        break
-        
+
+                if verify_data.plan_type and verify_data.plan_type in PLAN_DURATION:
+                    current_plan = verify_data.plan_type
+                    plan_duration_days = PLAN_DURATION[current_plan]
+                else:
+                    for _, plan_details in Subscription_plans.items():
+                        if (plan_details["currency"] == currency
+                                and plan_details["amount"] == verified_amount):
+                            current_plan = plan_details["plan"]
+                            plan_duration_days = plan_details["duration_of_days"]
+                            break
+
                 if not current_plan:
                     db.rollback()
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Verified amount {verified_amount} {currency} does not match any known subscription plan."
+                        detail=(
+                            f"Could not determine subscription plan for amount "
+                            f"{verified_amount} {currency}. Please include plan_type."
+                        )
                     )
                 
                 # Check for duplicate transaction
@@ -492,6 +509,17 @@ async def flutterwave_payout_callback(
         traceback.print_exc()
         # Return 200 to prevent Flutterwave from retrying
         return {"status": "error", "message": str(e)}
+
+
+@router.get("/flutterwave/config")
+async def get_flutterwave_config():
+    """
+    Return the Flutterwave public key so the frontend never hardcodes it.
+    Safe to expose — it is the publishable/public key only.
+    """
+    if not FLUTTERWAVE_PUBLIC_KEY:
+        raise HTTPException(status_code=500, detail="Flutterwave public key not configured")
+    return {"publicKey": FLUTTERWAVE_PUBLIC_KEY}
 
 
 @router.get("/health")
