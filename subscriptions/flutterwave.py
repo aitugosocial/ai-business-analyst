@@ -4,6 +4,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Depends, status, Request
 from pydantic import BaseModel
 import requests
+import logging
 from datetime import datetime, timedelta, timezone
 
 from decimal import Decimal, InvalidOperation
@@ -20,7 +21,9 @@ from emailing.email_service import email_service
 import os
 from dotenv import load_dotenv
 load_dotenv()
-print('Flutterwave environment variables loaded.')
+
+logger = logging.getLogger(__name__)
+logger.info("Flutterwave module loaded.")
 
 
 # Change prefix to match your frontend URL
@@ -68,48 +71,50 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
     try:
         transaction_id = verify_data.transaction_id
         user_email = verify_data.user_email
-        
-        print(f"=== FLUTTERWAVE VERIFICATION ===")
-        print(f"Transaction ID: {transaction_id}")
-        print(f"User Email: {user_email}")
-        
+
+        logger.info(
+            "[FLW verify] request | tx_id=%s email=%s plan=%s",
+            transaction_id, user_email, verify_data.plan_type
+        )
+
         if not FLUTTERWAVE_SECRET_KEY:
-            raise HTTPException(
-                status_code=500,
-                detail="Flutterwave secret key not configured"
-            )
-        
-        # Verify user exists
+            logger.error("[FLW verify] NEXT_PUBLIC_FLUTTERWAVE_SECRET_KEY is not set")
+            raise HTTPException(status_code=500, detail="Flutterwave secret key not configured")
+
         user = db.query(User).filter(User.email == user_email).first()
-        
         if not user:
+            logger.warning("[FLW verify] user not found: %s", user_email)
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"User with email {user_email} not found in database."
             )
-        
-        print(f"✅ User found: {user.email} (ID: {user.id})")
-        
-        # Verify with Flutterwave
-        # Support both numeric transaction ID and transaction reference (tx_ref)
+
+        logger.info("[FLW verify] user found: id=%s", user.id)
+
         if transaction_id.startswith("TX-") or not transaction_id.isdigit():
-            print(f"ℹ️  Verifying by reference: {transaction_id}")
             url = f"{FLUTTERWAVE_BASE_URL}/transactions/verify_by_reference?tx_ref={transaction_id}"
+            logger.info("[FLW verify] verifying by tx_ref → %s", url)
         else:
-            print(f"ℹ️  Verifying by ID: {transaction_id}")
             url = f"{FLUTTERWAVE_BASE_URL}/transactions/{transaction_id}/verify"
-            
+            logger.info("[FLW verify] verifying by id → %s", url)
+
         headers = {
             "Authorization": f"Bearer {FLUTTERWAVE_SECRET_KEY}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
-        
-        response = requests.get(url, headers=headers)
-        
+
+        response = requests.get(url, headers=headers, timeout=15)
+
+        # Always log the raw Flutterwave response so Railway shows the detail
+        logger.info(
+            "[FLW verify] Flutterwave API response | status=%s body=%s",
+            response.status_code, response.text[:500]
+        )
+
         if response.status_code != 200:
             raise HTTPException(
                 status_code=response.status_code,
-                detail=f"Flutterwave API error: {response.text}"
+                detail=f"Flutterwave API returned {response.status_code}: {response.text}"
             )
         
         data = response.json()
@@ -165,7 +170,7 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                 ).first()
 
                 if existing_sub:
-                    print(f"⚠️  Transaction {tx_ref} already processed.")
+                    logger.warning("[FLW verify] duplicate tx_ref=%s — already processed", tx_ref)
                     return {
                         "status": "success",
                         "message": "Payment verified successfully (already processed).",
@@ -220,9 +225,9 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                         "commission_status": commission.status,
                         "referrer_id": commission.user_id
                     }
-                    print(f"✅ Commission created: ${commission.amount} for referrer {commission.user_id}")
+                    logger.info("[FLW verify] commission amount=%s referrer=%s", commission.amount, commission.user_id)
                 else:
-                    print(f"ℹ️  No commission created (user not referred)")
+                    logger.info("[FLW verify] no commission — user has no referrer")
                 
                 db.commit()
                 db.refresh(user)
@@ -237,7 +242,7 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                     current_plan,
                     end_date.strftime("%B %d, %Y")
                 )
-                print(f"✅ Subscription created for {user_email}")
+                logger.info("[FLW verify] subscription created user=%s plan=%s", user_email, current_plan)
                 
                 return {
                     "status": "success",
@@ -293,7 +298,7 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
         raise
     except Exception as e:
         db.rollback()
-        print(f"❌ Verification error: {str(e)}")
+        logger.error("[FLW verify] unexpected error: %s", str(e), exc_info=True)
         import traceback
         traceback.print_exc()
         raise HTTPException(
@@ -315,22 +320,14 @@ async def verify_bank_account(
     user_email = current_user.email
     user_id = current_user.id
     
-    print(f"=== BANK ACCOUNT VERIFICATION ===")
-    print(f"Account Number: {account_data.account_number}")
-    print(f"Bank Code: {account_data.bank_code}")
-    print(f"User: {user_email} (ID: {user_id})")
-    
+    logger.info("[FLW bank] account=%s bank_code=%s user=%s id=%s",
+                account_data.account_number, account_data.bank_code, user_email, user_id)
+
     if not FLUTTERWAVE_SECRET_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Flutterwave secret key not configured"
-        )
-    
-    # Check if using test credentials
+        raise HTTPException(status_code=500, detail="Flutterwave secret key not configured")
+
     is_test_mode = FLUTTERWAVE_SECRET_KEY.startswith("FLWSECK_TEST")
-    
-    print(f"Test Mode: {is_test_mode}")
-    print(f"Secret Key Prefix: {FLUTTERWAVE_SECRET_KEY[:20]}...")
+    logger.info("[FLW bank] mode=%s", "TEST" if is_test_mode else "LIVE")
     
     url = "https://api.flutterwave.com/v3/accounts/resolve"
     headers = {
@@ -346,8 +343,8 @@ async def verify_bank_account(
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=10)
         
-        print(f"Flutterwave Response Status: {response.status_code}")
-        print(f"Flutterwave Response: {response.text}")
+        logger.info("[FLW bank] response status=%s", response.status_code)
+        logger.info("[FLW bank] response body=%s", response.text[:300])
         
         if response.status_code == 200:
             data = response.json()
@@ -361,7 +358,7 @@ async def verify_bank_account(
                         detail="Account name not found in response"
                     )
                 
-                print(f"✅ Account verified: {account_name} for user {user_email}")
+                logger.info("[FLW bank] verified name=%s user=%s", account_name, user_email)
                 
                 return {
                     "status": "success",
@@ -371,69 +368,39 @@ async def verify_bank_account(
                 }
             else:
                 error_message = data.get("message", "Account verification failed")
-                print(f"❌ Verification failed: {error_message}")
-                raise HTTPException(
-                    status_code=400,
-                    detail=error_message
-                )
-        
+                logger.warning("[FLW bank] verification failed: %s", error_message)
+                raise HTTPException(status_code=400, detail=error_message)
+
         elif response.status_code == 401:
-            print("❌ Authentication failed - Invalid API key")
-            raise HTTPException(
-                status_code=500,
-                detail="Invalid Flutterwave API credentials. Please contact support."
-            )
-        
+            logger.error("[FLW bank] invalid API key")
+            raise HTTPException(status_code=500, detail="Invalid Flutterwave API credentials. Please contact support.")
+
         elif response.status_code == 429:
-            print("❌ Rate limit exceeded")
-            raise HTTPException(
-                status_code=429,
-                detail="Too many requests. Please try again in a few minutes."
-            )
-        
+            logger.warning("[FLW bank] rate limit exceeded")
+            raise HTTPException(status_code=429, detail="Too many requests. Please try again in a few minutes.")
+
         else:
             error_data = response.json() if response.text else {}
             error_message = error_data.get("message", "Account verification failed")
-            
-            print(f"❌ API Error: {error_message}")
-            
-            # Provide helpful error messages
+            logger.error("[FLW bank] API error status=%s msg=%s", response.status_code, error_message)
             if "invalid" in error_message.lower() or "not found" in error_message.lower():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid account details: {error_message}"
-                )
-            
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Flutterwave error: {error_message}"
-            )
-    
+                raise HTTPException(status_code=400, detail=f"Invalid account details: {error_message}")
+            raise HTTPException(status_code=response.status_code, detail=f"Flutterwave error: {error_message}")
+
     except requests.Timeout:
-        print("❌ Request timeout")
-        raise HTTPException(
-            status_code=504,
-            detail="Request timeout. Please try again."
-        )
-    
+        logger.error("[FLW bank] request timeout")
+        raise HTTPException(status_code=504, detail="Request timeout. Please try again.")
+
     except requests.RequestException as e:
-        print(f"❌ Request error: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to connect to Flutterwave: {str(e)}"
-        )
-    
+        logger.error("[FLW bank] request error: %s", str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to connect to Flutterwave: {str(e)}")
+
     except HTTPException:
         raise
-    
+
     except Exception as e:
-        print(f"❌ Unexpected error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Verification failed: {str(e)}"
-        )
+        logger.error("[FLW bank] unexpected error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)}")
 
 
 # Note: The /flutterwave/callback endpoint below handles transfer webhooks
@@ -462,52 +429,45 @@ async def flutterwave_payout_callback(
         if webhook_secret:
             signature = request.headers.get("verif-hash")
             if signature != webhook_secret:
-                print(f"[Webhook] Invalid signature: {signature}")
+                logger.warning("[FLW webhook] invalid signature: %s", signature)
                 raise HTTPException(status_code=401, detail="Invalid webhook signature")
         else:
-            print("[Webhook] WARNING: FLUTTERWAVE_WEBHOOK_SECRET not set - skipping signature verification")
-        
-        # Extract event details
-        event_type = payload.get("event", "")  # "transfer.completed" or "transfer.failed"
+            logger.warning("[FLW webhook] FLUTTERWAVE_WEBHOOK_SECRET not set — signature check skipped")
+
+        event_type = payload.get("event", "")
         transfer_data = payload.get("data", {})
-        reference = transfer_data.get("reference", "")  # "PAYOUT-123-1234567890"
+        reference = transfer_data.get("reference", "")
         transfer_status = transfer_data.get("status", "").lower()
-        
-        print(f"[Webhook] Event: {event_type}, Reference: {reference}, Status: {transfer_status}")
-        
-        # Extract payout_id from reference (format: PAYOUT-{id}-{timestamp})
+
+        logger.info("[FLW webhook] event=%s ref=%s status=%s", event_type, reference, transfer_status)
+
         if reference and reference.startswith("PAYOUT-"):
             try:
                 payout_id = int(reference.split("-")[1])
             except (IndexError, ValueError):
-                print(f"[Webhook] Could not extract payout_id from reference: {reference}")
+                logger.error("[FLW webhook] cannot parse payout_id from ref: %s", reference)
                 return {"status": "error", "message": "Invalid reference format"}
-            
-            # Import and use PayoutService
+
             from subscriptions.payout_service import PayoutService
             from database.pg_models import Payout, Commission
-            
+
             if event_type == "transfer.completed" or transfer_status == "successful":
                 PayoutService.complete_flutterwave_payout(payout_id, background_tasks, "successful", db)
-                print(f"[Webhook] ✅ Payout {payout_id} marked as completed")
-                
+                logger.info("[FLW webhook] payout %s completed", payout_id)
             elif event_type == "transfer.failed" or transfer_status == "failed":
                 PayoutService.complete_flutterwave_payout(payout_id, background_tasks, "failed", db)
-                print(f"[Webhook] ❌ Payout {payout_id} marked as failed")
+                logger.warning("[FLW webhook] payout %s failed", payout_id)
             else:
-                print(f"[Webhook] Unknown event/status: {event_type}/{transfer_status}")
+                logger.warning("[FLW webhook] unknown event=%s status=%s", event_type, transfer_status)
         else:
-            print(f"[Webhook] Reference not related to payouts: {reference}")
-        
+            logger.info("[FLW webhook] non-payout ref: %s", reference)
+
         return {"status": "success"}
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[Webhook] Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        # Return 200 to prevent Flutterwave from retrying
+        logger.error("[FLW webhook] error: %s", str(e), exc_info=True)
         return {"status": "error", "message": str(e)}
 
 
