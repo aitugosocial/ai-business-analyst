@@ -62,6 +62,39 @@ class BankVerifyRequest(BaseModel):
     account_number: str
     bank_code: str
 
+class PaymentEventRequest(BaseModel):
+    event: str          # e.g. checkout_opened | callback | error | closed
+    tx_ref: str | None = None
+    status: str | None = None   # successful | failed | cancelled | timeout
+    error: str | None = None    # raw error message from Flutterwave
+    user_email: str | None = None
+    plan_type: str | None = None
+    amount: float | None = None
+    currency: str | None = None
+
+
+@router.post("/flutterwave/event")
+async def log_flutterwave_event(body: PaymentEventRequest):
+    """
+    Called by the frontend at every stage of the Flutterwave checkout flow.
+    Produces Railway log lines for all payment events — including failures
+    that occur inside Flutterwave's iframe before our verify endpoint is hit.
+    No authentication required; event data is logged only, not persisted.
+    """
+    if body.event == "error" or body.status in ("failed", "cancelled", "timeout"):
+        logger.error(
+            "[FLW event] %s | tx_ref=%s status=%s error=%s user=%s plan=%s amount=%s %s",
+            body.event, body.tx_ref, body.status, body.error,
+            body.user_email, body.plan_type, body.amount, body.currency or ""
+        )
+    else:
+        logger.info(
+            "[FLW event] %s | tx_ref=%s status=%s user=%s plan=%s amount=%s %s",
+            body.event, body.tx_ref, body.status,
+            body.user_email, body.plan_type, body.amount, body.currency or ""
+        )
+    return {"status": "logged"}
+
 
 @router.post("/flutterwave/verify")
 async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, background_tasks: BackgroundTasks, db: Annotated[Session, Depends(get_db)]):
