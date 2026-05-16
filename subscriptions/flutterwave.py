@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 # import the database
+from sqlalchemy.orm import Session
 from database.pg_connections import get_db
 from database.pg_models import User, Subscriptions
 from api.routes.auth.login import get_current_user
