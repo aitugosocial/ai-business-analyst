@@ -217,6 +217,20 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                         }
                     }
                 
+                # Capture Flutterwave card token from data.card.token.
+                # This token can be used to charge the card off-session for
+                # automatic renewals — no user action required at renewal time.
+                card_info = transaction_data.get("card", {}) or {}
+                flw_token = card_info.get("token")
+                if flw_token and hasattr(user, "flutterwave_card_token"):
+                    user.flutterwave_card_token = flw_token
+                    # Also update card display metadata so the UI shows the card
+                    if card_info.get("last_4digits"):
+                        user.card_last4 = card_info["last_4digits"]
+                    if card_info.get("type"):
+                        user.card_brand = card_info["type"].title()
+                    logger.info("[FLW verify] card token saved for user %s", user.id)
+
                 # Update user subscription
                 user.subscription_status = "active"
                 user.subscription_plan = current_plan

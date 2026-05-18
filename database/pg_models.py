@@ -81,6 +81,9 @@ class User(Base):
     card_exp_year = Column(Integer, nullable=True)
     card_saved_at = Column(DateTime(timezone=True), nullable=True)
     subscription_expires_at = Column(DateTime(timezone=True), nullable=True)
+    # Flutterwave card token — captured from data.card.token in the verify
+    # response so the card can be charged off-session for renewals.
+    flutterwave_card_token = Column(String(500), nullable=True)
 
     # Business profile fields
     company_name = Column(String(255), nullable=True)

@@ -230,6 +230,89 @@ async def create_admin_user(db: Session=Depends(get_db)):
 
 
 # Initialize database on startup
+def _attempt_flutterwave_renewal(user_id: int, plan: str, amount: float, currency: str) -> bool:
+    """
+    Charge a Flutterwave subscriber off-session using the card token saved
+    during their last payment (data.card.token from the verify response).
+    Uses POST /v3/charges?type=token — no user interaction required.
+    """
+    try:
+        import requests as _req
+        import secrets
+        from database.pg_connections import SessionLocal
+        from database.pg_models import User, Subscriptions
+        from decimal import Decimal
+
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.id == user_id).first()
+            if not user or not getattr(user, "flutterwave_card_token", None):
+                logger.info("[flw-renewal] no token for user %s — skipped", user_id)
+                return False
+
+            secret_key = os.getenv("NEXT_PUBLIC_FLUTTERWAVE_SECRET_KEY", "")
+            if not secret_key:
+                logger.error("[flw-renewal] FLUTTERWAVE_SECRET_KEY not set")
+                return False
+
+            tx_ref = f"LAVOO-RENEW-{plan.upper()}-{int(datetime.now(timezone.utc).timestamp())}-{secrets.token_hex(3).upper()}"
+            parts = (user.name or "Customer Name").split()
+            payload = {
+                "token": user.flutterwave_card_token,
+                "currency": currency,
+                "country": "NG",
+                "amount": amount,
+                "email": user.email,
+                "first_name": parts[0],
+                "last_name": parts[-1] if len(parts) > 1 else ".",
+                "tx_ref": tx_ref,
+                "narration": f"Lavoo {plan.title()} Subscription Renewal",
+            }
+            headers = {
+                "Authorization": f"Bearer {secret_key}",
+                "Content-Type": "application/json",
+            }
+            resp = _req.post(
+                "https://api.flutterwave.com/v3/charges?type=token",
+                json=payload, headers=headers, timeout=30
+            )
+            logger.info("[flw-renewal] charge response status=%s body=%s",
+                        resp.status_code, resp.text[:300])
+
+            if resp.status_code == 200:
+                data = resp.json()
+                charge = data.get("data", {})
+                if data.get("status") == "success" and charge.get("status") in ("successful", "completed"):
+                    start = datetime.now(timezone.utc)
+                    end = start + timedelta(days=PLAN_DURATION_MAP.get(plan, 30))
+                    new_sub = Subscriptions(
+                        user_id=user_id,
+                        tx_ref=tx_ref,
+                        transaction_id=str(charge.get("id", "")),
+                        amount=Decimal(str(amount)),
+                        payment_provider="Flutterwave",
+                        currency=currency,
+                        subscription_plan=plan,
+                        status="successful",
+                        subscription_status="active",
+                        start_date=start,
+                        end_date=end,
+                    )
+                    db.add(new_sub)
+                    user.subscription_status = "active"
+                    user.subscription_plan = plan
+                    db.commit()
+                    logger.info("[flw-renewal] ✅ renewed user %s plan=%s tx=%s", user_id, plan, tx_ref)
+                    return True
+                logger.warning("[flw-renewal] charge not successful: %s", data.get("message"))
+    except Exception as exc:
+        logger.error("[flw-renewal] error for user %s: %s", user_id, exc, exc_info=True)
+    return False
+
+
+# Plan duration map reused by both renewal functions
+PLAN_DURATION_MAP = {"monthly": 30, "quarterly": 90, "yearly": 365}
+
+
 def _attempt_stripe_renewal(user_id: int, plan_type: str) -> bool:
     """
     Try to renew a Stripe subscription off-session using the user's saved card.
@@ -310,13 +393,24 @@ async def run_subscription_expiry_job():
                     plan = sub.subscription_plan or "monthly"
                     payment_provider = (sub.payment_provider or "").lower()
 
-                    # Try Stripe off-session renewal for Stripe subscribers with saved cards
+                    # Try Stripe off-session renewal
                     if (payment_provider == "stripe" and user and
                             user.stripe_customer_id and user.stripe_payment_method_id):
                         success = _attempt_stripe_renewal(sub.user_id, plan)
                         if success:
                             renewed += 1
-                            continue   # new sub record written; old one stays expired-ish
+                            continue
+
+                    # Try Flutterwave token-based renewal
+                    if (payment_provider == "flutterwave" and user and
+                            getattr(user, "flutterwave_card_token", None)):
+                        flw_amount = float(sub.amount or 0)
+                        flw_currency = sub.currency or "NGN"
+                        if flw_amount > 0:
+                            success = _attempt_flutterwave_renewal(sub.user_id, plan, flw_amount, flw_currency)
+                            if success:
+                                renewed += 1
+                                continue
 
                     # No renewal path — mark expired
                     sub.status = 'expired'
@@ -410,6 +504,12 @@ async def startup_event():
                     db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS single_tool_recommendation JSON"))
                 except Exception as e:
                     logger.warning(f"Failed to add recommendation mode columns to business_analyses: {e}")
+
+                try:
+                    db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS flutterwave_card_token VARCHAR(500)"))
+                    db.commit()
+                except Exception as e:
+                    logger.warning(f"Failed to add flutterwave_card_token to users: {e}")
 
                 # Security table fixes
                 try:
