@@ -1,15 +1,19 @@
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_, desc
-from database.pg_connections import get_db
+from database.pg_connections import get_db, SessionLocal
 from database.pg_models import (
-    User, Insight, Alert, BusinessAnalysis,
+    User, Insight, Alert, BusinessAnalysis, Subscriptions,
     InsightCreate, AlertCreate
 )
 from api.routes.dependencies import admin_required
 from typing import Optional, List
 from datetime import datetime, date, timedelta, timezone
+import logging
+import os
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin",
                    tags=["admin"])
@@ -905,5 +909,127 @@ async def update_user_status(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# SUBSCRIPTION ADMIN ENDPOINTS
+# =============================================================================
+
+@router.post("/fix-expired-subscriptions")
+async def fix_expired_subscriptions(
+    _admin=Depends(admin_required),
+    db: Session = Depends(get_db),
+):
+    """
+    Immediately expire all Subscription rows whose end_date has passed and
+    downgrade the linked user to Free.  Run once to fix stale 'active' records
+    from before the nightly background job was added.
+    """
+    now = datetime.now(timezone.utc)
+    expired = db.query(Subscriptions).filter(
+        Subscriptions.end_date < now,
+        Subscriptions.status.in_(('active', 'completed', 'paid', 'successful', 'succeeded')),
+    ).all()
+
+    user_ids = set()
+    for sub in expired:
+        sub.status = 'expired'
+        sub.subscription_status = 'Free'
+        user_ids.add(sub.user_id)
+
+    if user_ids:
+        db.query(User).filter(User.id.in_(user_ids)).update(
+            {"subscription_status": "Free", "subscription_plan": None},
+            synchronize_session=False,
+        )
+
+    db.commit()
+    logger.info("[admin] fix-expired-subscriptions: expired %d subs, %d users", len(expired), len(user_ids))
+    return {"status": "ok", "expired_subscriptions": len(expired), "affected_users": len(user_ids)}
+
+
+def _charge_beta_user_stripe(user_id: int):
+    """
+    Background task: charge a single beta user who has a saved Stripe card
+    but was never billed.  Creates a Stripe subscription off-session using
+    the payment method attached during the beta save-card flow.
+    """
+    import stripe as _stripe
+    _stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
+    with SessionLocal() as bg_db:
+        try:
+            user = bg_db.query(User).filter(User.id == user_id).first()
+            if not user:
+                return
+            if not user.stripe_customer_id or not user.stripe_payment_method_id:
+                logger.warning("[beta-charge] user %s has no saved Stripe card — skipped", user_id)
+                return
+
+            plan_type = user.subscription_plan or "monthly"
+            from subscriptions.stripe import get_stripe_price_id
+            price_id = get_stripe_price_id(plan_type, "GBP") or get_stripe_price_id(plan_type, "USD")
+            if not price_id:
+                logger.error("[beta-charge] no price ID for plan=%s user=%s", plan_type, user_id)
+                return
+
+            # Attach payment method to customer (idempotent if already attached)
+            try:
+                _stripe.PaymentMethod.attach(
+                    user.stripe_payment_method_id,
+                    customer=user.stripe_customer_id,
+                )
+            except _stripe.error.InvalidRequestError:
+                pass  # already attached
+
+            sub = _stripe.Subscription.create(
+                customer=user.stripe_customer_id,
+                items=[{"price": price_id}],
+                default_payment_method=user.stripe_payment_method_id,
+                expand=["latest_invoice.payment_intent"],
+                metadata={"user_id": str(user_id), "plan_type": plan_type, "source": "beta_charge"},
+            )
+
+            status = sub.get("status")
+            if status in ("active", "trialing"):
+                from subscriptions.stripe import _create_active_subscription_record, get_amount_from_stripe_price
+                amount = get_amount_from_stripe_price(price_id)
+                _create_active_subscription_record(bg_db, user, sub, plan_type, amount, tx_ref_prefix="BETA-CHARGE")
+                logger.info("[beta-charge] ✅ charged user %s plan=%s status=%s", user_id, plan_type, status)
+            else:
+                logger.warning("[beta-charge] Stripe sub status=%s for user %s — not activating", status, user_id)
+
+        except Exception as exc:
+            logger.error("[beta-charge] failed for user %s: %s", user_id, exc, exc_info=True)
+            bg_db.rollback()
+
+
+@router.post("/charge-beta-users")
+async def charge_beta_users(
+    background_tasks: BackgroundTasks,
+    _admin=Depends(admin_required),
+    db: Session = Depends(get_db),
+):
+    """
+    Charge all beta users who saved a Stripe card during the beta period but
+    were never billed (is_beta_user=True, has stripe_payment_method_id,
+    subscription_status != 'active').
+
+    Each charge runs as a background task so the API responds immediately.
+    Check Railway logs for [beta-charge] lines to monitor results.
+    """
+    candidates = db.query(User).filter(
+        User.is_beta_user == True,
+        User.stripe_payment_method_id.isnot(None),
+        User.stripe_customer_id.isnot(None),
+        User.subscription_status != "active",
+    ).all()
+
+    for user in candidates:
+        background_tasks.add_task(_charge_beta_user_stripe, user.id)
+
+    logger.info("[admin] charge-beta-users queued %d charges", len(candidates))
+    return {"status": "queued", "users_queued": len(candidates),
+            "message": "Check Railway logs for [beta-charge] lines."}
 
 

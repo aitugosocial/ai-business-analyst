@@ -230,11 +230,125 @@ async def create_admin_user(db: Session=Depends(get_db)):
 
 
 # Initialize database on startup
+def _attempt_stripe_renewal(user_id: int, plan_type: str) -> bool:
+    """
+    Try to renew a Stripe subscription off-session using the user's saved card.
+    Returns True on success, False if the charge fails or no card is saved.
+    """
+    try:
+        import stripe as _stripe
+        import os
+        from database.pg_connections import SessionLocal
+        from database.pg_models import User
+
+        _stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.id == user_id).first()
+            if not user or not user.stripe_customer_id or not user.stripe_payment_method_id:
+                return False
+
+            from subscriptions.stripe import get_stripe_price_id, get_amount_from_stripe_price, _create_active_subscription_record
+            price_id = get_stripe_price_id(plan_type, "GBP") or get_stripe_price_id(plan_type, "USD")
+            if not price_id:
+                logger.warning("[renewal] no price_id for plan=%s user=%s", plan_type, user_id)
+                return False
+
+            try:
+                _stripe.PaymentMethod.attach(user.stripe_payment_method_id, customer=user.stripe_customer_id)
+            except Exception:
+                pass  # already attached
+
+            sub = _stripe.Subscription.create(
+                customer=user.stripe_customer_id,
+                items=[{"price": price_id}],
+                default_payment_method=user.stripe_payment_method_id,
+                expand=["latest_invoice.payment_intent"],
+                metadata={"user_id": str(user_id), "plan_type": plan_type, "source": "auto_renewal"},
+            )
+            if sub.get("status") in ("active", "trialing"):
+                amount = get_amount_from_stripe_price(price_id)
+                _create_active_subscription_record(db, user, sub, plan_type, amount, tx_ref_prefix="RENEW")
+                logger.info("[renewal] ✅ renewed user %s plan=%s", user_id, plan_type)
+                return True
+            logger.warning("[renewal] Stripe status=%s for user %s", sub.get("status"), user_id)
+    except Exception as exc:
+        logger.error("[renewal] failed for user %s: %s", user_id, exc, exc_info=True)
+    return False
+
+
+async def run_subscription_expiry_job():
+    """
+    Background job — runs once at startup then every 24 h.
+
+    For each expired Stripe subscription that has a saved payment method,
+    attempts an automatic renewal off-session.  If renewal succeeds the sub
+    stays active.  If renewal fails (or no Stripe card), the sub is expired
+    and the user's status is set to Free.
+
+    Covers users who haven't logged in — complementing the lazy per-request
+    sync in sync_user_subscription().
+    """
+    while True:
+        try:
+            from database.pg_connections import SessionLocal
+            from database.pg_models import User, Subscriptions
+            from datetime import timezone as _tz
+            db = SessionLocal()
+            try:
+                now = datetime.now(_tz.utc)
+                expired_subs = db.query(Subscriptions).filter(
+                    Subscriptions.end_date < now,
+                    Subscriptions.status.in_(('active', 'completed', 'paid', 'successful', 'succeeded')),
+                ).all()
+
+                renewed = 0
+                expired_count = 0
+                affected_users = set()
+
+                for sub in expired_subs:
+                    user = db.query(User).filter(User.id == sub.user_id).first()
+                    plan = sub.subscription_plan or "monthly"
+                    payment_provider = (sub.payment_provider or "").lower()
+
+                    # Try Stripe off-session renewal for Stripe subscribers with saved cards
+                    if (payment_provider == "stripe" and user and
+                            user.stripe_customer_id and user.stripe_payment_method_id):
+                        success = _attempt_stripe_renewal(sub.user_id, plan)
+                        if success:
+                            renewed += 1
+                            continue   # new sub record written; old one stays expired-ish
+
+                    # No renewal path — mark expired
+                    sub.status = 'expired'
+                    sub.subscription_status = 'Free'
+                    affected_users.add(sub.user_id)
+                    expired_count += 1
+
+                if affected_users:
+                    db.query(User).filter(User.id.in_(affected_users)).update(
+                        {"subscription_status": "Free", "subscription_plan": None},
+                        synchronize_session=False,
+                    )
+                db.commit()
+                logger.info(
+                    "[subscription-expiry-job] renewed=%d expired=%d users_downgraded=%d",
+                    renewed, expired_count, len(affected_users)
+                )
+            except Exception as exc:
+                logger.error("[subscription-expiry-job] error: %s", exc, exc_info=True)
+                db.rollback()
+            finally:
+                db.close()
+        except Exception as outer:
+            logger.error("[subscription-expiry-job] outer error: %s", outer)
+        await asyncio.sleep(24 * 60 * 60)   # run again in 24 hours
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize database tables and caching on application startup"""
-    # Start scheduled scans task
     asyncio.create_task(run_scheduled_scans())
+    asyncio.create_task(run_subscription_expiry_job())
     try:
         init_db()
         db_info = get_db_info()
