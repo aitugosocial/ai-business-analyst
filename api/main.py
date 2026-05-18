@@ -229,7 +229,19 @@ async def create_admin_user(db: Session=Depends(get_db)):
         logger.error(f"❌ Failed to create admin user: {e}")
 
 
-# Initialize database on startup
+# =============================================================================
+# SUBSCRIPTION RENEWAL HELPERS
+#
+# Design rules enforced here:
+#   1. Per user, only the MOST RECENT expired subscription is processed.
+#      Older expired rows (already superseded) are just marked expired.
+#   2. The payment method used for THAT subscription is tried FIRST.
+#      The other method is the fallback ONLY if the primary fails.
+#   3. Bank transfer subscriptions: cannot auto-renew (no stored token).
+#      User is notified and subscription expires.
+#   4. A user is NEVER charged by both methods for the same renewal cycle.
+# =============================================================================
+
 def _attempt_flutterwave_renewal(user_id: int, plan: str, amount: float, currency: str) -> bool:
     """
     Charge a Flutterwave subscriber off-session using the card token saved
@@ -370,53 +382,122 @@ async def run_subscription_expiry_job():
 
     Covers users who haven't logged in — complementing the lazy per-request
     sync in sync_user_subscription().
+
+    Per-user deduplication: only the MOST RECENT expired sub per user drives
+    the renewal decision.  Older superseded rows are silently marked expired.
     """
     while True:
         try:
             from database.pg_connections import SessionLocal
             from database.pg_models import User, Subscriptions
             from datetime import timezone as _tz
+            from api.services.notification_service import NotificationService
             db = SessionLocal()
             try:
                 now = datetime.now(_tz.utc)
-                expired_subs = db.query(Subscriptions).filter(
+                active_statuses = ('active', 'completed', 'paid', 'successful', 'succeeded')
+                all_expired = db.query(Subscriptions).filter(
                     Subscriptions.end_date < now,
-                    Subscriptions.status.in_(('active', 'completed', 'paid', 'successful', 'succeeded')),
-                ).all()
+                    Subscriptions.status.in_(active_statuses),
+                ).order_by(Subscriptions.user_id, Subscriptions.end_date.desc()).all()
+
+                # Deduplicate: keep only the most-recent expired sub per user.
+                # Older rows for the same user are already superseded — just mark
+                # them expired without attempting another charge.
+                latest_per_user: dict[int, Subscriptions] = {}
+                older_subs: list[Subscriptions] = []
+                for sub in all_expired:
+                    if sub.user_id not in latest_per_user:
+                        latest_per_user[sub.user_id] = sub
+                    else:
+                        older_subs.append(sub)
+
+                # Silently expire older superseded rows
+                for sub in older_subs:
+                    sub.status = 'expired'
+                    sub.subscription_status = 'Free'
 
                 renewed = 0
                 expired_count = 0
-                affected_users = set()
+                affected_users: set[int] = set()
 
-                for sub in expired_subs:
-                    user = db.query(User).filter(User.id == sub.user_id).first()
+                for user_id, sub in latest_per_user.items():
+                    user = db.query(User).filter(User.id == user_id).first()
                     plan = sub.subscription_plan or "monthly"
-                    payment_provider = (sub.payment_provider or "").lower()
+                    provider = (sub.payment_provider or "").lower()
+                    amount = float(sub.amount or 0)
+                    currency = sub.currency or "NGN"
 
-                    # Try Stripe off-session renewal
-                    if (payment_provider == "stripe" and user and
-                            user.stripe_customer_id and user.stripe_payment_method_id):
-                        success = _attempt_stripe_renewal(sub.user_id, plan)
+                    has_stripe = bool(user and user.stripe_customer_id and user.stripe_payment_method_id)
+                    has_flw_token = bool(user and getattr(user, "flutterwave_card_token", None))
+                    is_bank_transfer = (provider == "flutterwave" and not has_flw_token)
+
+                    # ── Bank transfer: no token stored, cannot auto-renew ─────────────
+                    if is_bank_transfer:
+                        logger.info(
+                            "[expiry-job] user %s paid via bank transfer — "
+                            "no auto-renewal possible; notifying", user_id
+                        )
+                        if user:
+                            NotificationService.create_notification(
+                                db=db, user_id=user_id,
+                                type="subscription_expired",
+                                title="Your subscription has expired",
+                                message=(
+                                    "Your subscription period has ended. "
+                                    "Please make a new payment to continue using Lavoo."
+                                ),
+                                link="/dashboard/upgrade",
+                            )
+                        sub.status = 'expired'
+                        sub.subscription_status = 'Free'
+                        affected_users.add(user_id)
+                        expired_count += 1
+                        continue
+
+                    # ── Build ordered renewal strategy from the original provider ────
+                    # Primary = the method the user originally paid with.
+                    # Fallback = the other method, only if both tokens are on file.
+                    # This guarantees ONE charge attempt per cycle.
+                    if provider == "stripe":
+                        strategy = (
+                            [("stripe", {})] +
+                            ([("flutterwave", {"amount": amount, "currency": currency})] if has_flw_token and amount > 0 else [])
+                        )
+                    else:  # flutterwave card
+                        strategy = (
+                            ([("flutterwave", {"amount": amount, "currency": currency})] if has_flw_token and amount > 0 else []) +
+                            ([("stripe", {})] if has_stripe else [])
+                        )
+
+                    success = False
+                    for method, kwargs in strategy:
+                        if method == "stripe":
+                            success = _attempt_stripe_renewal(user_id, plan)
+                        elif method == "flutterwave":
+                            success = _attempt_flutterwave_renewal(user_id, plan, kwargs["amount"], kwargs["currency"])
                         if success:
+                            logger.info("[expiry-job] ✅ renewed user %s via %s plan=%s", user_id, method, plan)
                             renewed += 1
-                            continue
+                            break
+                        logger.warning("[expiry-job] %s renewal failed for user %s — trying fallback", method, user_id)
 
-                    # Try Flutterwave token-based renewal
-                    if (payment_provider == "flutterwave" and user and
-                            getattr(user, "flutterwave_card_token", None)):
-                        flw_amount = float(sub.amount or 0)
-                        flw_currency = sub.currency or "NGN"
-                        if flw_amount > 0:
-                            success = _attempt_flutterwave_renewal(sub.user_id, plan, flw_amount, flw_currency)
-                            if success:
-                                renewed += 1
-                                continue
-
-                    # No renewal path — mark expired
-                    sub.status = 'expired'
-                    sub.subscription_status = 'Free'
-                    affected_users.add(sub.user_id)
-                    expired_count += 1
+                    if not success:
+                        sub.status = 'expired'
+                        sub.subscription_status = 'Free'
+                        affected_users.add(user_id)
+                        expired_count += 1
+                        if user:
+                            NotificationService.create_notification(
+                                db=db, user_id=user_id,
+                                type="subscription_expired",
+                                title="Subscription renewal failed",
+                                message=(
+                                    "We were unable to renew your subscription automatically. "
+                                    "Please update your payment method to continue."
+                                ),
+                                link="/dashboard/upgrade",
+                            )
 
                 if affected_users:
                     db.query(User).filter(User.id.in_(affected_users)).update(
@@ -425,8 +506,10 @@ async def run_subscription_expiry_job():
                     )
                 db.commit()
                 logger.info(
-                    "[subscription-expiry-job] renewed=%d expired=%d users_downgraded=%d",
-                    renewed, expired_count, len(affected_users)
+                    "[subscription-expiry-job] processed=%d renewed=%d expired=%d "
+                    "users_downgraded=%d older_cleaned=%d",
+                    len(latest_per_user), renewed, expired_count,
+                    len(affected_users), len(older_subs),
                 )
             except Exception as exc:
                 logger.error("[subscription-expiry-job] error: %s", exc, exc_info=True)
@@ -435,7 +518,7 @@ async def run_subscription_expiry_job():
                 db.close()
         except Exception as outer:
             logger.error("[subscription-expiry-job] outer error: %s", outer)
-        await asyncio.sleep(24 * 60 * 60)   # run again in 24 hours
+        await asyncio.sleep(24 * 60 * 60)
 
 
 @app.on_event("startup")
