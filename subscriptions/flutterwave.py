@@ -276,6 +276,35 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                 else:
                     logger.info("[FLW verify] no commission — user has no referrer")
                 
+                # In-app payment success notification (real-time via WebSocket)
+                from api.services.notification_service import NotificationService
+                NotificationService.create_notification(
+                    db=db,
+                    user_id=user.id,
+                    type="payment_success",
+                    title="✅ Payment Successful",
+                    message=(
+                        f"Your {current_plan.title()} plan is now active until "
+                        f"{end_date.strftime('%B %d, %Y')}. "
+                        f"Amount: {currency} {verified_amount}."
+                    ),
+                    link="/dashboard/opportunity-alerts",
+                )
+
+                # Referrer builder-bonus notification (real-time)
+                if commission:
+                    NotificationService.create_notification(
+                        db=db,
+                        user_id=commission["referrer_id"],
+                        type="commission_earned",
+                        title="🎉 Builder Bonus Earned!",
+                        message=(
+                            f"You earned a builder bonus of {commission['commission_amount']:.2f} "
+                            f"{currency} from a referral subscription."
+                        ),
+                        link="/dashboard/earnings",
+                    )
+
                 db.commit()
                 db.refresh(user)
                 db.refresh(new_subscription)
@@ -307,32 +336,36 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                     }
                 }
             else:
-                # Send failed email
+                from api.services.notification_service import NotificationService
+                NotificationService.create_notification(
+                    db=db, user_id=user.id, type="payment_failed",
+                    title="❌ Payment Failed",
+                    message="We could not process your payment. Please try again or use a different payment method.",
+                    link="/dashboard/upgrade",
+                )
                 background_tasks.add_task(
                     email_service.send_payment_failed_email,
-                    user.email,
-                    user.name,
-                    float(verified_amount),
+                    user.email, user.name, float(verified_amount),
                     f"Transaction status: {transaction_data.get('status')}"
                 )
-                
                 raise HTTPException(
                     status_code=400,
                     detail=f"Payment not successful. Status: {transaction_data.get('status')}"
                 )
         else:
-            # Send failed email for generic failure
+            from api.services.notification_service import NotificationService
+            NotificationService.create_notification(
+                db=db, user_id=user.id, type="payment_failed",
+                title="❌ Payment Failed",
+                message="We could not verify your payment. Please contact support if you were charged.",
+                link="/dashboard/upgrade",
+            )
             background_tasks.add_task(
                 email_service.send_payment_failed_email,
-                user.email,
-                user.name,
-                0.0, # Unknown amount if verification failed completely
+                user.email, user.name, 0.0,
                 "Flutterwave verification failed to confirm success"
             )
-            raise HTTPException(
-                status_code=400,
-                detail="Verification failed"
-            )
+            raise HTTPException(status_code=400, detail="Verification failed")
             
     except requests.RequestException as e:
         db.rollback()

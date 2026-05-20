@@ -71,14 +71,18 @@ class CommissionService:
                 f"✅ Commission created: ${commission_amount} for user {referral.referrer_id}"
             )
             
-            # Notify referrer about commission
+            # Notify referrer about builder bonus in real time
+            cur = getattr(subscription, "currency", "USD") or "USD"
             NotificationService.create_notification(
                 db=db,
                 user_id=referral.referrer_id,
                 type=NotificationType.COMMISSION_EARNED.value,
-                title="Commission Earned!",
-                message=f"You've earned ${commission_amount} commission from a referral's subscription.",
-                link="/dashboard/earnings"
+                title="🎉 Builder Bonus Earned!",
+                message=(
+                    f"You earned a {cur} {commission_amount:.2f} builder bonus "
+                    f"from a referral's subscription payment."
+                ),
+                link="/dashboard/earnings",
             )
             
             return commission

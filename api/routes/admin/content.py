@@ -113,9 +113,15 @@ def _fan_out_alert_notifications(alert_id: int, alert_title: str, alert_message:
     """
     with SessionLocal() as bg_db:
         try:
+            # Only paying subscribers receive new-alert notifications.
+            # is_active=True covers account status; subscription_status='active'
+            # ensures we don't spam free/grace-period users.
             user_ids = [
                 row[0]
-                for row in bg_db.query(User.id).filter(User.is_active == True).all()
+                for row in bg_db.query(User.id).filter(
+                    User.is_active == True,
+                    User.subscription_status == "active",
+                ).all()
             ]
             short_msg = (alert_message[:97] + "…") if len(alert_message) > 100 else alert_message
             for uid in user_ids:
