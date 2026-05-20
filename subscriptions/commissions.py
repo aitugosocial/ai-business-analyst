@@ -299,6 +299,16 @@ async def remove_bank_payout_account(
         payout_account.updated_at = datetime.now(timezone.utc)
         db.commit()
 
+        from api.services.notification_service import NotificationService
+        NotificationService.create_notification(
+            db=db,
+            user_id=user_id,
+            type="payout_account_removed",
+            title="🏦 Bank Account Removed",
+            message="Your bank payout account has been removed. Add a new one to keep receiving referral earnings.",
+            link="/dashboard/upgrade",
+        )
+        logger.info("[payout-account] bank removed for user=%s", user_id)
         return {"status": "success", "message": "Bank account removed successfully"}
 
     except HTTPException:
