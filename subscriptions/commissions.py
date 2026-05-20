@@ -105,8 +105,8 @@ async def setup_payout_account(
     try:
         user_id = extract_user_id(current_user)
         
-        print(f"[Payout Account] Setting up for user {user_id}")
-        print(f"[Payout Account] Method: {account_data.payment_method}")
+        logger.info("[payout-account] POST setup user=%s", user_id)
+        logger.info("[payout-account] method=%s", account_data.payment_method)
         
         # Validate payment method
         if account_data.payment_method not in ['stripe', 'flutterwave', 'paypal']:
@@ -142,7 +142,7 @@ async def setup_payout_account(
         
         if payout_account:
             # Update existing
-            print(f"[Payout Account] Updating existing account")
+            logger.info("[payout-account] updating existing row")
             
             if account_data.stripe_account_id:
                 payout_account.stripe_account_id = account_data.stripe_account_id
@@ -161,7 +161,7 @@ async def setup_payout_account(
             payout_account.updated_at = datetime.now(timezone.utc)
         else:
             # Create new
-            print(f"[Payout Account] Creating new account")
+            logger.info("[payout-account] creating new row")
             
             payout_account = PayoutAccount(
                 user_id=user_id,
@@ -210,7 +210,7 @@ async def setup_payout_account(
         raise
     except Exception as e:
         db.rollback()
-        print(f"[Payout Account ERROR] {str(e)}")
+        logger.error("[payout-account] POST failed: %s", str(e), exc_info=True)
         import traceback
         traceback.print_exc()
         raise HTTPException(
@@ -242,28 +242,31 @@ async def get_payout_account(
                 "message": "No payout account configured"
             }
         
-        # Ensure account_number is treated as string for slicing
         account_num = str(payout_account.account_number) if payout_account.account_number else ""
-        
-        return {
-            "status": "success",
-            "data": {
-                "payment_method": getattr(payout_account, "payment_method", "stripe"),
-                "is_verified": bool(getattr(payout_account, "is_verified", False)),
-                "has_stripe": bool(getattr(payout_account, "stripe_account_id", None)),
-                "has_bank_details": bool(getattr(payout_account, "bank_name", None) and account_num),
-                "has_paypal": bool(getattr(payout_account, "paypal_email", None)),
-                # Don't expose sensitive data
-                "bank_name": getattr(payout_account, "bank_name", None),
-                "account_last_4": account_num[-4:] if len(account_num) >= 4 else account_num,
-                "paypal_email": getattr(payout_account, "paypal_email", None)
-            }
+        has_bank = bool(getattr(payout_account, "bank_name", None) and account_num)
+        payload = {
+            "payment_method":  getattr(payout_account, "payment_method", "stripe"),
+            "is_verified":     bool(getattr(payout_account, "is_verified", False)),
+            "has_stripe":      bool(getattr(payout_account, "stripe_account_id", None)),
+            "has_bank_details": has_bank,
+            "has_paypal":      bool(getattr(payout_account, "paypal_email", None)),
+            # Full details for the user's own account view
+            "bank_name":       getattr(payout_account, "bank_name", None),
+            "bank_code":       getattr(payout_account, "bank_code", None),
+            "account_name":    getattr(payout_account, "account_name", None),
+            "account_number":  account_num,   # full number — user is viewing their own data
+            "account_last_4":  account_num[-4:] if len(account_num) >= 4 else account_num,
+            "paypal_email":    getattr(payout_account, "paypal_email", None),
         }
-        
+        logger.info(
+            "[payout-account] GET user=%s method=%s has_bank=%s bank_name=%s account_name=%s",
+            user_id, payload["payment_method"], has_bank,
+            payload["bank_name"], payload["account_name"],
+        )
+        return {"status": "success", "data": payload}
+
     except Exception as e:
-        print(f"[Payout Account ERROR] {str(e)}")
-        import traceback
-        traceback.print_exc()
+        logger.error("[payout-account] GET failed user=%s: %s", user_id if 'user_id' in dir() else '?', str(e), exc_info=True)
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(
