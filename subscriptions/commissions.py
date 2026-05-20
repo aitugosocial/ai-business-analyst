@@ -4,6 +4,8 @@
 API endpoints for commission and payout management
 """
 from fastapi import APIRouter, HTTPException, Depends, status, Request, Header, BackgroundTasks
+import logging
+logger = logging.getLogger(__name__)
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -175,9 +177,23 @@ async def setup_payout_account(
         
         db.commit()
         db.refresh(payout_account)
-        
-        print(f"[Payout Account] ✅ Saved successfully")
-        
+
+        # Real-time notification so the bell badge increments immediately
+        from api.services.notification_service import NotificationService
+        method_label = account_data.payment_method.replace('_', ' ').title()
+        NotificationService.create_notification(
+            db=db,
+            user_id=user_id,
+            type="payout_account_setup",
+            title="✅ Payout Account Configured",
+            message=(
+                f"Your payout account ({method_label}) has been set up. "
+                f"You will now receive referral earnings automatically."
+            ),
+            link="/dashboard/earnings",
+        )
+
+        logger.info("[payout-account] configured for user=%s method=%s", user_id, account_data.payment_method)
         return {
             "status": "success",
             "message": "Payout account configured successfully",

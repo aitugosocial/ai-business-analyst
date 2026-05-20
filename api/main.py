@@ -521,11 +521,64 @@ async def run_subscription_expiry_job():
         await asyncio.sleep(24 * 60 * 60)
 
 
+async def run_new_alert_notifications_job():
+    """
+    Runs every 5 minutes. Finds alerts inserted by the crawler cron job
+    since the last check and fans out in-app notifications to all active
+    subscribers. The admin-endpoint path already fires fan-out immediately;
+    this job covers the cron-job insertion path where no HTTP handler runs.
+    """
+    from datetime import timezone as _tz
+    _last_checked = datetime.now(_tz.utc)  # start from now; don't re-notify old alerts
+    while True:
+        await asyncio.sleep(5 * 60)  # wait 5 minutes before first poll
+        try:
+            from database.pg_connections import SessionLocal
+            from database.pg_models import Alert, User
+            from api.services.notification_service import NotificationService
+
+            now = datetime.now(_tz.utc)
+            with SessionLocal() as db:
+                new_alerts = db.query(Alert).filter(
+                    Alert.is_active == True,
+                    Alert.created_at >= _last_checked,
+                    Alert.created_at < now,
+                ).all()
+
+                if new_alerts:
+                    subscriber_ids = [
+                        row[0]
+                        for row in db.query(User.id).filter(
+                            User.is_active == True,
+                            User.subscription_status == "active",
+                        ).all()
+                    ]
+                    for alert in new_alerts:
+                        short = (alert.why_act_now[:97] + "…") if len(alert.why_act_now or "") > 100 else (alert.why_act_now or "")
+                        for uid in subscriber_ids:
+                            NotificationService.create_notification(
+                                db=db,
+                                user_id=uid,
+                                type="new_alert",
+                                title=f"🆕 {alert.title}",
+                                message=short,
+                                link="/dashboard/opportunity-alerts",
+                            )
+                    logger.info(
+                        "[alert-notify-job] fanned out %d new alerts to %d subscribers",
+                        len(new_alerts), len(subscriber_ids)
+                    )
+            _last_checked = now
+        except Exception as exc:
+            logger.error("[alert-notify-job] error: %s", exc, exc_info=True)
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize database tables and caching on application startup"""
     asyncio.create_task(run_scheduled_scans())
     asyncio.create_task(run_subscription_expiry_job())
+    asyncio.create_task(run_new_alert_notifications_job())
     try:
         init_db()
         db_info = get_db_info()
