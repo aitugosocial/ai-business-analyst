@@ -190,7 +190,7 @@ async def setup_payout_account(
                 f"Your payout account ({method_label}) has been set up. "
                 f"You will now receive referral earnings automatically."
             ),
-            link="/dashboard/earnings",
+            link="/dashboard/upgrade",
         )
 
         logger.info("[payout-account] configured for user=%s method=%s", user_id, account_data.payment_method)
