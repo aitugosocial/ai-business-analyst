@@ -135,45 +135,54 @@ async def setup_payout_account(
                     detail="PayPal email is required for PayPal payouts"
                 )
         
-        # Check if account exists
-        payout_account = db.query(PayoutAccount).filter(
-            PayoutAccount.user_id == user_id
-        ).first()
-        
-        if payout_account:
-            # Update existing
-            logger.info("[payout-account] updating existing row")
-            
-            if account_data.stripe_account_id:
-                payout_account.stripe_account_id = account_data.stripe_account_id
-            if account_data.bank_name:
-                payout_account.bank_name = account_data.bank_name
-            if account_data.account_number:
-                payout_account.account_number = account_data.account_number
-            if account_data.account_name:
-                payout_account.account_name = account_data.account_name
-            if account_data.bank_code:
-                payout_account.bank_code = account_data.bank_code
-            if account_data.paypal_email:
-                payout_account.paypal_email = account_data.paypal_email
-            
-            payout_account.payment_method = account_data.payment_method
-            payout_account.updated_at = datetime.now(timezone.utc)
-        else:
-            # Create new
-            logger.info("[payout-account] creating new row")
-            
+        # For bank accounts: check if this exact account is already stored.
+        # If yes, reject so users never have duplicate entries.
+        # If no (different account number / bank code), always INSERT a new row
+        # so users can store multiple bank accounts.
+        # For Stripe/PayPal: keep the upsert behaviour (only one per user).
+        if account_data.payment_method == 'flutterwave':
+            existing = db.query(PayoutAccount).filter(
+                PayoutAccount.user_id == user_id,
+                PayoutAccount.account_number == account_data.account_number,
+                PayoutAccount.bank_code == account_data.bank_code,
+            ).first()
+            if existing:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This bank account is already saved. Please add a different account.",
+                )
+            logger.info("[payout-account] inserting new bank account for user=%s", user_id)
             payout_account = PayoutAccount(
                 user_id=user_id,
-                stripe_account_id=account_data.stripe_account_id,
                 bank_name=account_data.bank_name,
                 account_number=account_data.account_number,
                 account_name=account_data.account_name,
                 bank_code=account_data.bank_code,
-                paypal_email=account_data.paypal_email,
-                payment_method=account_data.payment_method
+                payment_method=account_data.payment_method,
             )
             db.add(payout_account)
+        else:
+            # Stripe / PayPal — upsert (one row per user for these methods)
+            payout_account = db.query(PayoutAccount).filter(
+                PayoutAccount.user_id == user_id,
+                PayoutAccount.payment_method == account_data.payment_method,
+            ).first()
+            if payout_account:
+                logger.info("[payout-account] updating existing %s row", account_data.payment_method)
+                if account_data.stripe_account_id:
+                    payout_account.stripe_account_id = account_data.stripe_account_id
+                if account_data.paypal_email:
+                    payout_account.paypal_email = account_data.paypal_email
+                payout_account.updated_at = datetime.now(timezone.utc)
+            else:
+                logger.info("[payout-account] creating new %s row", account_data.payment_method)
+                payout_account = PayoutAccount(
+                    user_id=user_id,
+                    stripe_account_id=account_data.stripe_account_id,
+                    paypal_email=account_data.paypal_email,
+                    payment_method=account_data.payment_method,
+                )
+                db.add(payout_account)
         
         db.commit()
         db.refresh(payout_account)
@@ -273,6 +282,62 @@ async def get_payout_account(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch payout account: {str(e)}"
         )
+
+
+@router.get("/payout-accounts")
+async def get_all_payout_accounts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return every payout account row for the authenticated user."""
+    user_id = extract_user_id(current_user)
+    rows = db.query(PayoutAccount).filter(
+        PayoutAccount.user_id == user_id
+    ).order_by(PayoutAccount.id.desc()).all()
+
+    def _serialise(acc):
+        num = str(acc.account_number) if acc.account_number else ""
+        return {
+            "id": acc.id,
+            "payment_method": acc.payment_method,
+            "bank_name": acc.bank_name,
+            "bank_code": acc.bank_code,
+            "account_name": acc.account_name,
+            "account_number": num,
+            "account_last_4": num[-4:] if len(num) >= 4 else num,
+            "has_stripe": bool(acc.stripe_account_id),
+            "is_verified": bool(acc.is_verified),
+        }
+
+    return {"status": "success", "data": [_serialise(r) for r in rows]}
+
+
+@router.delete("/payout-account/{account_id}")
+async def delete_payout_account_by_id(
+    account_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a specific payout account row by its primary key."""
+    user_id = extract_user_id(current_user)
+    account = db.query(PayoutAccount).filter(
+        PayoutAccount.id == account_id,
+        PayoutAccount.user_id == user_id,
+    ).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    db.delete(account)
+    db.commit()
+    from api.services.notification_service import NotificationService
+    NotificationService.create_notification(
+        db=db, user_id=user_id,
+        type="payout_account_removed",
+        title="🏦 Bank Account Removed",
+        message="A bank account has been removed from your payout accounts.",
+        link="/dashboard/upgrade",
+    )
+    logger.info("[payout-account] deleted id=%s user=%s", account_id, user_id)
+    return {"status": "success", "message": "Account removed"}
 
 
 @router.delete("/payout-account/bank")

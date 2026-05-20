@@ -608,6 +608,14 @@ async def startup_event():
 
                 db.execute(text("ALTER TABLE reviews ADD COLUMN IF NOT EXISTS is_attended BOOLEAN DEFAULT FALSE"))
 
+                # Allow multiple bank accounts per user — drop the unique constraint
+                # on payout_accounts.user_id so each user can store several accounts.
+                # IF EXISTS makes this idempotent (safe to run on every startup).
+                db.execute(text("""
+                    ALTER TABLE payout_accounts
+                    DROP CONSTRAINT IF EXISTS payout_accounts_user_id_key;
+                """))
+
                 # Subscription table updates
                 db.execute(text("""
                     ALTER TABLE subscriptions
