@@ -447,7 +447,7 @@ async def analyze_business_goal_stream(
                 (85, "Compiling execution roadmap…"),
             ]
             for pct, msg in hb_steps:
-                done, _ = await asyncio.wait([analysis_task], timeout=8)
+                done, _ = await asyncio.wait([analysis_task], timeout=4)
                 if done:
                     break
                 yield _send("progress", {"step": "thinking", "pct": pct, "msg": msg})
