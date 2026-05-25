@@ -46,6 +46,47 @@ except ImportError as exc:
 logger = logging.getLogger(__name__)
 
 
+def _repair_json(text: str) -> str:
+    """
+    Attempt to repair JSON that was truncated mid-stream by the LLM.
+    Closes any open strings and unclosed brackets/braces so json.loads can parse it.
+    """
+    in_string = False
+    escape_next = False
+    stack: list[str] = []
+
+    for ch in text:
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if ch in "{[":
+                stack.append("}" if ch == "{" else "]")
+            elif ch in "}]" and stack and stack[-1] == ch:
+                stack.pop()
+
+    result = text
+    if in_string:
+        result += '"'          # close the open string literal
+    result += "".join(reversed(stack))   # close open objects/arrays
+    return result
+
+
+def _safe_json_loads(text: str) -> Any:
+    """json.loads with automatic repair on truncated output."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        repaired = _repair_json(text)
+        return json.loads(repaired)
+
+
 class AgenticAnalyzer:
     """
     Agentic business analyzer with 4 specialized agents + automation stack composer.
@@ -259,7 +300,7 @@ Think like a consultant who charges $500/hour. Be brutally honest, specific, and
             elif "```" in result_text:
                 result_text = result_text.split("```")[1].split("```")[0].strip()
 
-            result = json.loads(result_text)
+            result = _safe_json_loads(result_text)
             logger.info(f"Primary bottleneck: {result['primary_bottleneck']['title']}")
             return result
 
@@ -329,7 +370,7 @@ Be specific and practical."""
             elif "```" in result_text:
                 result_text = result_text.split("```")[1].split("```")[0].strip()
 
-            result = json.loads(result_text)
+            result = _safe_json_loads(result_text)
             logger.info(f"Identified {len(result['secondary_constraints'])} secondary constraints")
             return result
 
@@ -390,7 +431,7 @@ Only recommend if it genuinely adds value."""
                 tool_text = tool_text.split("```json")[1].split("```")[0].strip()
             elif "```" in tool_text:
                 tool_text = tool_text.split("```")[1].split("```")[0].strip()
-            tool_selection = json.loads(tool_text)
+            tool_selection = _safe_json_loads(tool_text)
             plan["toolkit"] = tool_selection.get("toolkit")
         except Exception as e:
             logger.warning(f"Toolkit selection failed for plan '{plan['title']}': {e}")
@@ -471,7 +512,7 @@ Be practical and specific."""
                 model=self.fast_model,
                 messages=[{"role": "user", "content": prompt_actions}],
                 temperature=0.7,
-                max_tokens=1500,
+                max_tokens=2500,
             )
             result_text = response.choices[0].message.content.strip()
 
@@ -480,7 +521,7 @@ Be practical and specific."""
             elif "```" in result_text:
                 result_text = result_text.split("```")[1].split("```")[0].strip()
 
-            result = json.loads(result_text)
+            result = _safe_json_loads(result_text)
             action_plans = result["action_plans"]
 
             # Attach toolkits to all plans in parallel
@@ -574,7 +615,7 @@ OUTPUT FORMAT (JSON only, no markdown fences):
             elif "```" in result_text:
                 result_text = result_text.split("```")[1].split("```")[0].strip()
 
-            llm_data = json.loads(result_text)
+            llm_data = _safe_json_loads(result_text)
 
             validated_tool_roles = [
                 tr for tr in llm_data.get("tool_roles", [])
@@ -765,7 +806,7 @@ Be practical and encouraging."""
             elif "```" in result_text:
                 result_text = result_text.split("```")[1].split("```")[0].strip()
 
-            result = json.loads(result_text)
+            result = _safe_json_loads(result_text)
 
             # Deduplicate tasks within each phase at the source so the frontend
             # doesn't have to deal with LLM repetitions.
