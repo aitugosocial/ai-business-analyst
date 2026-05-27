@@ -328,6 +328,28 @@ async def analyze_business_goal(
         }
 
     except Exception as e:
+        err_str = str(e)
+        if err_str.startswith("UNSAFE_QUERY::"):
+            parts = err_str.split("::", 2)
+            reason = parts[1] if len(parts) > 1 else "This query cannot be processed."
+            try:
+                import ast as _ast
+                suggestions = _ast.literal_eval(parts[2]) if len(parts) > 2 else []
+            except Exception:
+                suggestions = []
+            logger.warning(f"Unsafe query blocked for user {user_id}: {reason}")
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "blocked": True,
+                    "reason": reason,
+                    "suggestions": suggestions,
+                    "message": (
+                        "Our engine can't process this request as described. "
+                        "We're built to help with legitimate business challenges."
+                    ),
+                },
+            )
         logger.error(f"❌ Analysis failed: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
@@ -457,8 +479,29 @@ async def analyze_business_goal_stream(
             yield _send("result", {"success": True, "data": result["data"]})
 
         except Exception as e:
-            logger.error(f"❌ Streaming analysis failed for user {user_id}: {e}", exc_info=True)
-            yield _send("error", {"message": str(e)})
+            err_str = str(e)
+            if err_str.startswith("UNSAFE_QUERY::"):
+                # Format: UNSAFE_QUERY::<reason>::<suggestions_json>
+                parts = err_str.split("::", 2)
+                reason = parts[1] if len(parts) > 1 else "This query cannot be processed."
+                try:
+                    import ast
+                    suggestions = ast.literal_eval(parts[2]) if len(parts) > 2 else []
+                except Exception:
+                    suggestions = []
+                logger.warning(f"Unsafe query blocked for user {user_id}: {reason}")
+                yield _send("unsafe", {
+                    "blocked": True,
+                    "reason": reason,
+                    "suggestions": suggestions,
+                    "message": (
+                        "Our engine can't process this request as described. "
+                        "We're built to help with legitimate business challenges."
+                    ),
+                })
+            else:
+                logger.error(f"❌ Streaming analysis failed for user {user_id}: {e}", exc_info=True)
+                yield _send("error", {"message": err_str})
 
     return StreamingResponse(
         event_stream(),

@@ -9,39 +9,60 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-COMMISSION_RATE = Decimal("0.50")  # 50%
+COMMISSION_RATE_STANDARD = Decimal("0.40")   # 40% — shown on screen, paid to regular users
+COMMISSION_RATE_PARTNER  = Decimal("0.50")   # 50% — paid internally to partners/staff (screen still shows 40%)
+
+# Keep legacy alias so any other callsite referencing COMMISSION_RATE still works
+COMMISSION_RATE = COMMISSION_RATE_STANDARD
+
 
 class CommissionService:
-    
+
+    @staticmethod
+    def _get_rate_for_referrer(referrer_id: int, db: Session) -> Decimal:
+        """Return the actual payout rate for a referrer.
+        Partners/staff earn 50%; all other users earn 40%.
+        The displayed rate on the earnings dashboard is always 40%.
+        """
+        referrer = db.query(User).filter(User.id == referrer_id).first()
+        if referrer and getattr(referrer, "is_partner", False):
+            return COMMISSION_RATE_PARTNER
+        return COMMISSION_RATE_STANDARD
+
     @staticmethod
     def calculate_commission(subscription, db: Session):
         """
-        Calculate and create commission when a referred user makes a payment
+        Calculate and create commission when a referred user makes a payment.
+        Regular users receive 40% of the subscription amount.
+        Partners/staff receive 50% (screen always shows 40%).
         """
         try:
             # Check if user was referred
             referral = db.query(Referral).filter(
                 Referral.referred_user_id == subscription.user_id
             ).first()
-            
+
             if not referral:
                 logger.info(f"No referral found for user {subscription.user_id}")
                 return None
-            
+
             # Check if commission already exists
             existing = db.query(Commission).filter(
                 Commission.subscription_id == subscription.id
             ).first()
-            
+
             if existing:
                 logger.info(f"Commission already exists for subscription {subscription.id}")
                 return existing
-            
+
+            # Determine rate: partners get 50%, everyone else 40%
+            actual_rate = CommissionService._get_rate_for_referrer(referral.referrer_id, db)
+
             # Calculate commission amount
             original_amount = Decimal(str(subscription.amount))
-            commission_amount = original_amount * COMMISSION_RATE
-            
-            # Create commission
+            commission_amount = original_amount * actual_rate
+
+            # Create commission — always store the actual rate used
             commission = Commission(
                 user_id=referral.referrer_id,
                 referred_user_id=subscription.user_id,
@@ -49,7 +70,7 @@ class CommissionService:
                 amount=commission_amount,
                 original_amount=original_amount,
                 currency=subscription.currency,
-                commission_rate=COMMISSION_RATE * 100,
+                commission_rate=actual_rate * 100,
                 status='pending',  # Starts as pending
                 created_at=datetime.now(timezone.utc)
             )

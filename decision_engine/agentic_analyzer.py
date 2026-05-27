@@ -165,6 +165,15 @@ class AgenticAnalyzer:
         try:
             await _emit(5, "Starting analysis...")
 
+            # Pre-flight: block harmful or malicious queries before touching LLM stages
+            logger.info("Pre-flight: checking query safety...")
+            await _emit(8, "Reviewing your query...")
+            safety_result = await self._check_query_safety(user_query)
+            if not safety_result["is_safe"]:
+                raise ValueError(
+                    f"UNSAFE_QUERY::{safety_result['reason']}::{safety_result['suggestions']}"
+                )
+
             logger.info("Stage 1: Identifying primary bottleneck...")
             await _emit(10, "Identifying your primary bottleneck...")
             primary_result = await self._stage1_primary_bottleneck(user_query)
@@ -243,6 +252,71 @@ class AgenticAnalyzer:
             raise
 
     # =========================================================================
+    # PRE-FLIGHT: SAFETY GUARD
+    # =========================================================================
+
+    async def _check_query_safety(self, user_query: str) -> Dict[str, Any]:
+        """
+        Fast safety check using the non-reasoning model.
+        Returns {"is_safe": bool, "reason": str, "suggestions": list[str]}.
+        A query is UNSAFE if it asks for help with: illegal activity, fraud, hacking,
+        money laundering, harm to people, weapons, counterfeit goods, exploitation,
+        or any other clearly unethical or criminal purpose.
+        Legitimate business challenges — even edgy ones — are SAFE.
+        """
+        prompt = f"""You are a safety filter for a business analysis engine.
+Your job: determine whether the following user query is a legitimate business challenge.
+
+USER QUERY: "{user_query}"
+
+A query is UNSAFE if it is asking for help with:
+- Illegal activity (fraud, tax evasion, money laundering, bribery, counterfeiting)
+- Hacking, data theft, or system intrusion
+- Harm to individuals, groups, or competitors
+- Weapons, drugs, or controlled substance trade
+- Exploitation of workers, children, or vulnerable people
+- Any clearly criminal or unethical purpose
+
+A query is SAFE if it is:
+- A real business challenge, even if the business is struggling
+- Questions about marketing, operations, growth, hiring, finance, tech
+- Questions about competitive strategy, pivoting, or recovery
+- Questions that sound edgy but have a legitimate business interpretation
+
+OUTPUT FORMAT (JSON, no markdown):
+{{
+    "is_safe": true or false,
+    "reason": "One sentence explaining why it is or isn't safe",
+    "suggestions": ["Alternative framing 1", "Alternative framing 2"]
+}}
+
+Only return is_safe: false if you are CERTAIN the query is harmful or illegal.
+When in doubt, return is_safe: true."""
+
+        try:
+            response = await self._llm(
+                model=self.fast_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=300,
+            )
+            result_text = response.choices[0].message.content.strip()
+            if "```json" in result_text:
+                result_text = result_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in result_text:
+                result_text = result_text.split("```")[1].split("```")[0].strip()
+            result = _safe_json_loads(result_text)
+            return {
+                "is_safe": bool(result.get("is_safe", True)),
+                "reason": result.get("reason", ""),
+                "suggestions": result.get("suggestions", []),
+            }
+        except Exception as e:
+            # On error, default to safe so we don't block legitimate users
+            logger.warning(f"Safety check failed (defaulting to safe): {e}")
+            return {"is_safe": True, "reason": "", "suggestions": []}
+
+    # =========================================================================
     # STAGE 1: PRIMARY BOTTLENECK AGENT
     # =========================================================================
 
@@ -257,34 +331,42 @@ class AgenticAnalyzer:
                 "what_to_stop": str
             }
         """
-        prompt = f"""You are an elite business consultant analyzing a user's business challenge.
+        prompt = f"""You are a senior business strategist with deep expertise across industries — retail, SaaS, services, manufacturing, healthcare, e-commerce, fintech, hospitality, agriculture, and more.
 
-USER QUERY: "{user_query}"
+USER CHALLENGE: "{user_query}"
 
-Your task: Identify THE SINGLE most critical bottleneck blocking their success.
+Your task: Diagnose THE SINGLE root-cause bottleneck that, if fixed, would unlock the most progress for this person.
 
-CRITICAL RULES:
-1. Identify ONLY ONE primary bottleneck (not 3-5, just ONE)
-2. The bottleneck must be the ROOT CAUSE, not a symptom
-3. Describe what's ACTUALLY broken in simple terms
-4. Explain the consequence if they ignore this (be specific and impactful)
-5. Identify the strategic priority (what they should focus on)
-6. Identify ONE critical action they must STOP doing (wastes time/resources)
-7. RECOMMENDATION MODE: Set "recommendation_mode" to "single_tool" if the bottleneck can be directly addressed by adopting ONE focused AI tool (writing assistant, scheduling tool, analytics dashboard) — the workflow does NOT require tools to hand off to each other. Set "automation_stack" if the bottleneck requires MULTIPLE tools working in sequence (triggers, data flow between apps, cross-platform automation). One tool alone cannot solve it.
+DIAGNOSIS FRAMEWORK (apply in order):
+1. What is the user actually trying to achieve? What result do they want?
+2. What is the REAL constraint — not the symptom they described, but the underlying cause behind it?
+3. What hard evidence or pattern in their description points to this root cause?
+4. What are the measurable consequences of leaving this bottleneck unaddressed for 90 days?
+5. What is the ONE high-leverage action that addresses the root cause directly?
+6. What is one common but wasteful behavior this person should immediately stop?
 
-OUTPUT FORMAT (JSON):
+CRITICAL OUTPUT RULES:
+- ONE bottleneck only. Not a list, not "it could be X or Y". Commit to the single most important one.
+- The bottleneck title must name the specific business problem (e.g. "No Repeatable Lead Generation System", not "Marketing Issues")
+- Description must identify the gap between current state and required state. Be concrete.
+- Consequence must quantify the business impact (lost revenue, churn, missed opportunities) in specific terms.
+- strategic_priority must name a specific, actionable focus area — not a platitude.
+- what_to_stop must name a specific behavior or activity to eliminate — not a vague instruction.
+- RECOMMENDATION MODE RULE:
+  - "single_tool" = bottleneck can be directly solved by ONE AI/SaaS tool being adopted (e.g. a CRM, writing assistant, analytics tool). Tools do NOT need to pass data between each other.
+  - "automation_stack" = bottleneck requires MULTIPLE tools working in sequence with data handoffs (e.g. CRM → email automation → analytics). One tool alone is insufficient.
+
+OUTPUT FORMAT (JSON only, no markdown):
 {{
     "primary_bottleneck": {{
-        "title": "Clear, concise title (5-10 words)",
-        "description": "What's actually broken (2-3 sentences, be direct)",
-        "consequence": "Specific consequence if ignored (1-2 sentences, make it real)"
+        "title": "Specific problem title (5-10 words)",
+        "description": "What is broken and why — be specific about the gap (2-3 sentences)",
+        "consequence": "What happens in 90 days if this isn't fixed — name the business cost (1-2 sentences)"
     }},
-    "strategic_priority": "The ONE thing they should focus on (1 sentence)",
-    "what_to_stop": "The ONE action they must stop immediately (1 sentence, be direct)",
+    "strategic_priority": "The single most important thing to focus on this month (1 specific sentence)",
+    "what_to_stop": "The specific wasteful action to eliminate immediately (1 direct sentence)",
     "recommendation_mode": "single_tool or automation_stack"
-}}
-
-Think like a consultant who charges $500/hour. Be brutally honest, specific, and actionable."""
+}}"""
 
         try:
             response = await self._llm(
@@ -323,38 +405,31 @@ Think like a consultant who charges $500/hour. Be brutally honest, specific, and
         """
         primary_title = primary_result["primary_bottleneck"]["title"]
 
-        prompt = f"""You are an elite business consultant analyzing secondary issues.
+        prompt = f"""You are a senior business strategist mapping the constraint landscape around a diagnosed bottleneck.
 
-USER QUERY: "{user_query}"
+USER CHALLENGE: "{user_query}"
 PRIMARY BOTTLENECK: "{primary_title}"
 
-Your task: Identify 2-4 SECONDARY constraints that compound the primary issue.
+Your task: Identify the 2-4 secondary constraints that make the primary bottleneck WORSE or prevent the user from fixing it.
 
-CRITICAL RULES:
-1. These are NOT as critical as the primary bottleneck
-2. They should be related but distinct issues
-3. Keep descriptions brief and actionable
-4. Order by impact (most impactful first)
-5. If the user's situation is simple, return only 2 constraints
-6. Maximum 4 constraints
+CONSTRAINT IDENTIFICATION RULES:
+1. Secondary constraints COMPOUND the primary — they either feed into it or reduce the user's capacity to solve it
+2. Each constraint must be DISTINCT — no overlaps with each other or with the primary bottleneck
+3. Each constraint must be grounded in something the user described or that is a predictable consequence of their situation
+4. Order by impact severity (most damaging to least)
+5. If the situation is straightforward, return exactly 2. If complex, return 3-4.
+6. Each description must explain: (a) what the constraint IS, and (b) how it makes the primary bottleneck harder to solve
 
-OUTPUT FORMAT (JSON):
+OUTPUT FORMAT (JSON only, no markdown):
 {{
     "secondary_constraints": [
         {{
             "id": 1,
-            "title": "Brief title (5-8 words)",
-            "description": "What's the issue (1-2 sentences)"
-        }},
-        {{
-            "id": 2,
-            "title": "Brief title (5-8 words)",
-            "description": "What's the issue (1-2 sentences)"
+            "title": "Specific constraint name (5-8 words)",
+            "description": "What the constraint is and how it compounds the primary bottleneck (2 sentences)"
         }}
     ]
-}}
-
-Be specific and practical."""
+}}"""
 
         try:
             response = await self._llm(
@@ -396,28 +471,44 @@ Be specific and practical."""
             plan.pop("needs_ai_tool", None)
             return plan
 
-        tool_names = [f"{t['tool_name']}: {t['description'][:100]}" for t in tools]
-        prompt_tool_selection = f"""You are selecting the best AI tool for a specific action.
+        what_to_do_text = (
+            " ".join(plan.get("what_to_do", []))
+            if isinstance(plan.get("what_to_do"), list)
+            else str(plan.get("what_to_do", ""))
+        )
+        tool_summaries = [
+            f"{i+1}. {t['tool_name']}: {t['description'][:120]}"
+            for i, t in enumerate(tools)
+        ]
+        prompt_tool_selection = f"""You are a tool selection specialist. You must pick the AI/SaaS tool that best accelerates a SPECIFIC action plan step.
 
-ACTION: {plan['title']}
-WHAT TO DO: {plan.get('what_to_do', '')}
+ACTION PLAN: {plan['title']}
+STEPS IN THIS ACTION:
+{what_to_do_text}
 
-AVAILABLE TOOLS (from semantic search):
-{chr(10).join([f"{i+1}. {t}" for i, t in enumerate(tool_names)])}
+CANDIDATE TOOLS (retrieved by semantic search):
+{chr(10).join(tool_summaries)}
 
-Your task: Pick the BEST tool for this action, or return null if none are good fits.
+YOUR TASK:
+1. Read the action steps carefully
+2. Identify which step(s) could be automated or significantly accelerated by one of these tools
+3. Select the ONE tool that fits best, or return null if none genuinely help
 
-OUTPUT FORMAT (JSON):
+SELECTION CRITERIA:
+- The tool must automate or accelerate at least one named step in the action plan
+- Prefer tools that reduce manual effort on the highest-leverage step
+- Do NOT recommend a tool just because it's in the same category — it must fit these specific steps
+- If no tool adds real value to this specific action, return null
+
+OUTPUT FORMAT (JSON only, no markdown):
 {{
     "selected_tool_index": 0 or null,
     "toolkit": {{
-        "tool_name": "Selected tool name",
-        "what_it_helps": "What it specifically helps with for this action (1 sentence)",
-        "why_this_tool": "Why this tool is best for this action (1 sentence)"
+        "tool_name": "Exact tool name from the list",
+        "what_it_helps": "Name the specific step(s) this tool helps with and exactly how (1 specific sentence)",
+        "why_this_tool": "Name the specific capability that makes this tool better than manual work for this action (1 sentence)"
     }} or null
-}}
-
-Only recommend if it genuinely adds value."""
+}}"""
 
         try:
             tool_response = await self._llm(
@@ -472,40 +563,44 @@ Only recommend if it genuinely adds value."""
         primary_title = primary_result["primary_bottleneck"]["title"]
         constraints = json.dumps([c["title"] for c in secondary_result["secondary_constraints"]])
 
-        prompt_actions = f"""You are an elite business strategist creating an action plan.
+        prompt_actions = f"""You are a senior business strategist building a ranked action plan. You think in first principles and prioritize leverage over effort.
 
-USER QUERY: "{user_query}"
+USER CHALLENGE: "{user_query}"
 PRIMARY BOTTLENECK: "{primary_title}"
 SECONDARY CONSTRAINTS: {constraints}
 
-Your task: Create 3-5 RANKED action plans that solve the primary bottleneck.
+Your task: Create 3-5 action plans that directly dismantle the primary bottleneck. Rank them by leverage — the plan that will produce the fastest measurable result goes first.
 
-CRITICAL RULES:
-1. Order by LEVERAGE (highest impact first, not chronological)
-2. Each action must directly address the primary bottleneck
-3. "what_to_do" = a LIST of clear, executable steps (complete, meaningful sentences)
-4. "why_it_matters" = a LIST of business impact/reasoning points (complete, meaningful sentences)
-5. "effort_level" = Low, Medium, or High
-6. "needs_ai_tool" = true if AI automation could significantly help, false otherwise
-7. Maximum 5 action plans
-8. Include an "exclusions_note" explaining what you intentionally excluded
+ACTION PLAN RULES:
+1. RANK by leverage, not by chronological order or alphabetical order
+2. Every action must address the PRIMARY BOTTLENECK directly — not a secondary constraint
+3. "what_to_do" must be a LIST of 3-5 specific, executable steps the user can act on today. Each step is a complete sentence. Do NOT be vague (no "research options" or "consider doing X"). Name the exact action.
+4. "why_it_matters" must be a LIST of 2-3 business impact statements. Each statement names a specific outcome: revenue gained, cost saved, churn reduced, speed increased, risk eliminated. Complete sentences.
+5. "effort_level" = one of: Low (days), Medium (1-2 weeks), or High (weeks to months)
+6. "needs_ai_tool" = true ONLY if an AI or SaaS tool would meaningfully accelerate or automate a specific step in what_to_do. false if this is purely a human/process action.
+7. Keep action titles specific (e.g. "Build a Weekly Referral Outreach System" not "Improve Marketing")
+8. Maximum 5 action plans. Minimum 3.
+9. "exclusions_note" must name the strategies you considered but excluded, and give a concrete reason for each exclusion
 
-OUTPUT FORMAT (JSON):
+OUTPUT FORMAT (JSON only, no markdown):
 {{
     "action_plans": [
         {{
             "id": 1,
-            "title": "Action title (5-10 words)",
-            "what_to_do": ["Step 1", "Step 2"],
-            "why_it_matters": ["Impact 1"],
+            "title": "Specific action title (5-10 words)",
+            "what_to_do": [
+                "Step 1 — specific, actionable, named",
+                "Step 2 — specific, actionable, named"
+            ],
+            "why_it_matters": [
+                "Specific business impact with a named outcome"
+            ],
             "effort_level": "Low",
             "needs_ai_tool": false
         }}
     ],
-    "exclusions_note": "What strategies you excluded and why (2-3 sentences)"
-}}
-
-Be practical and specific."""
+    "exclusions_note": "Name 2-3 strategies you excluded and exactly why each was deprioritized"
+}}"""
 
         try:
             response = await self._llm(
@@ -709,20 +804,58 @@ OUTPUT FORMAT (JSON only, no markdown fences):
         """
         from database.pg_models import AITool
         try:
-            tools = recommend_tools(user_query, top_k=1, db_session=self.db)
+            tools = recommend_tools(user_query, top_k=3, db_session=self.db)
             if not tools:
                 return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
-            top = tools[0]
+
+            # Use LLM to select the best of the top-3 matches and generate
+            # a specific, action-relevant reason — not a generic fallback.
+            tool_summaries = [
+                f"{i+1}. {t['tool_name']}: {t['description'][:150]}"
+                for i, t in enumerate(tools)
+            ]
+            selection_prompt = f"""You are selecting the single best AI tool for a user's business challenge.
+
+USER CHALLENGE: "{user_query}"
+
+CANDIDATE TOOLS (from semantic search):
+{chr(10).join(tool_summaries)}
+
+Select the ONE tool that most directly helps solve this specific challenge.
+
+OUTPUT FORMAT (JSON only, no markdown):
+{{
+    "selected_index": 0,
+    "what_it_helps": "Explain what specific part of the user's challenge this tool addresses (1 concrete sentence — name the actual task or problem it solves)",
+    "why_this_tool": "Name the specific capability that makes this tool the right choice for this user's situation (1 sentence — be specific, not generic)"
+}}"""
+
+            sel_response = await self._llm(
+                model=self.fast_model,
+                messages=[{"role": "user", "content": selection_prompt}],
+                temperature=0.3,
+                max_tokens=250,
+            )
+            sel_text = sel_response.choices[0].message.content.strip()
+            if "```json" in sel_text:
+                sel_text = sel_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in sel_text:
+                sel_text = sel_text.split("```")[1].split("```")[0].strip()
+
+            sel = _safe_json_loads(sel_text)
+            idx = int(sel.get("selected_index", 0))
+            idx = max(0, min(idx, len(tools) - 1))
+            top = tools[idx]
             tool_name = top.get("tool_name", "")
-            if not tool_name:
-                return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
+
             db_row = self.db.query(AITool).filter(AITool.name == tool_name).first()
             website = db_row.url if db_row else None
             price = db_row.pricing if db_row else None
+
             single_tool = {
                 "tool_name": tool_name,
-                "description": top.get("description", ""),
-                "why_this_tool": "Directly addresses your bottleneck with focused AI assistance",
+                "description": sel.get("what_it_helps") or top.get("description", ""),
+                "why_this_tool": sel.get("why_this_tool") or top.get("description", ""),
                 "website": website,
                 "price": price,
             }
@@ -750,47 +883,53 @@ OUTPUT FORMAT (JSON only, no markdown fences):
             }
         """
         action_titles = [ap["title"] for ap in action_plans_result["action_plans"]]
+        action_steps = {
+            ap["title"]: ap.get("what_to_do", [])[:2]
+            for ap in action_plans_result["action_plans"]
+        }
         action_list = json.dumps(action_titles)
+        action_steps_json = json.dumps(action_steps)
 
-        prompt = f"""You are an execution strategist creating a realistic timeline.
+        prompt = f"""You are an execution sprint planner who turns strategy into a concrete 7-day action schedule.
 
-USER QUERY: "{user_query}"
-ACTION PLANS: {action_list}
+USER CHALLENGE: "{user_query}"
+ACTION PLANS (in priority order): {action_list}
+FIRST STEPS PER ACTION: {action_steps_json}
 
-Your task: Create a strict 7-Day Sprint execution roadmap AND generate a motivational quote.
+Your task: Build a 7-Day Sprint roadmap that walks the user through the highest-priority actions in a logical, achievable sequence. Then write a motivational quote.
 
-CRITICAL RULES FOR ROADMAP:
-1. Break into 2-4 phases (not more than 4)
-2. Each phase = specific day range (e.g., "Days 1-3", "Days 4-7")
-3. Each phase has 2-4 concrete tasks
-4. Total timeline must be exactly 7 days (a 7-Day Sprint)
-5. Order phases logically (setup → execute → optimize)
+ROADMAP RULES:
+1. Break the 7 days into 2-4 phases — no more than 4
+2. Phase names must describe what the user is DOING (e.g. "Days 1-2: Diagnose and Decide", not "Phase 1")
+3. Each phase must contain 2-4 tasks drawn directly from the action plan steps above
+4. Tasks must be specific and actioned ("Set up your CRM pipeline with 3 stages" not "Do CRM work")
+5. The total span must equal exactly 7 days
+6. Order: foundation/diagnosis first, execution second, review/optimize last
+7. Do NOT repeat the same task across phases
 
-CRITICAL RULES FOR QUOTE:
-1. Generate a UNIQUE motivational quote based on their specific challenge
-2. Should be encouraging but realistic
-3. 1-2 sentences maximum
-4. Reference their specific situation (not generic)
+QUOTE RULES:
+1. Write a quote that speaks directly to the user's specific challenge — not a generic business platitude
+2. It must be encouraging AND grounded in reality (acknowledge the difficulty)
+3. Maximum 2 sentences
+4. Sound like a mentor who has seen this situation before and knows they can get through it
 
-OUTPUT FORMAT (JSON):
+OUTPUT FORMAT (JSON only, no markdown):
 {{
     "total_phases": 3,
     "estimated_days": 7,
     "execution_roadmap": [
         {{
-            "phase": "Days 1-3: The Fix",
-            "days": 3,
-            "title": "Research & Planning",
+            "phase": "Days 1-2: Specific phase name",
+            "days": 2,
+            "title": "What the user achieves this phase",
             "tasks": [
-                "Task 1 description",
-                "Task 2 description"
+                "Specific task drawn from action plans",
+                "Another specific task"
             ]
         }}
     ],
-    "motivational_quote": "You're not behind - you're just early in the sequence. Focus on the bottleneck, and everything else becomes noise."
-}}
-
-Be practical and encouraging."""
+    "motivational_quote": "A quote that speaks directly to this user's situation"
+}}"""
 
         try:
             response = await self._llm(

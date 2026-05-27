@@ -14,7 +14,8 @@ from api.routes.auth.login import get_current_user
 
 router = APIRouter(prefix="", tags=["earnings"])
 
-COMMISSION_RATE = 0.5  # 50% commission on referral subscriptions
+COMMISSION_RATE = 0.4           # 40% — displayed rate for all users
+COMMISSION_RATE_PARTNER = 0.5   # 50% — actual payout for partners/staff (not shown)
 
 
 # Remove local get_user_id_from_request and risky SECRET_KEY fallback
@@ -144,7 +145,7 @@ async def get_earnings_summary(
             "totalRevenue": total_commissions,
             "transactions": total_referrals,
             "avgOrderValue": round(total_commissions / paid_referrals, 2) if paid_referrals > 0 else 0,
-            "commissionRate": int(COMMISSION_RATE * 100)  # Return as percentage
+            "commissionRate": 40  # Always display 40% regardless of actual partner payout rate
         }
         print(f"[/earnings/summary] RETURNING PAYLOAD: {result_payload}")
         return result_payload
@@ -456,7 +457,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "Earnings API",
-        "commission_rate": f"{int(COMMISSION_RATE * 100)}%",
+        "commission_rate": "40%",
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 

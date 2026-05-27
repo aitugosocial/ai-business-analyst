@@ -52,6 +52,7 @@ class User(Base):
 
     # Admin and subscription
     is_admin = Column(Boolean, default=False)
+    is_partner = Column(Boolean, default=False)   # partners/staff receive 50% payout; display shows 40%
     is_active = Column(Boolean, default=True)
     user_status = Column(String(20), server_default="active", nullable=False)
     last_login = Column(DateTime(timezone=True), nullable=True)

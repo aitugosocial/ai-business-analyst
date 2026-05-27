@@ -179,6 +179,7 @@ class AIToolRecommender:
                         "cons": tool.cons,
                         "who_should_use": tool.who_should_use,
                         "compatibility_integration": tool.compatibility_integration,
+                        "url": tool.url or "",
                     }
                 )
 
@@ -257,6 +258,7 @@ class AIToolRecommender:
                         "tool_name": tool["name"],
                         "similarity_score": top_scores[idx],
                         "description": tool["description"],
+                        "url": tool.get("url", ""),
                     }
                 )
 
@@ -481,6 +483,7 @@ def recommend_automation_stacks(
                 "key_features": tool_row.get("key_features"),
                 "compatibility_integration": tool_row.get("compatibility_integration"),
                 "who_should_use": tool_row.get("who_should_use"),
+                "url": str(tool_row.get("url") or ""),
                 "query_similarity": float(global_similarities[index]),
             }
         )
@@ -576,6 +579,7 @@ def recommend_automation_stacks(
                         "sub_category": tool.get("sub_category"),
                         "pricing": tool.get("pricing"),
                         "ratings": tool.get("ratings"),
+                        "url": tool.get("url", ""),
                         "similarity_score": round(tool["query_similarity"], 4),
                         "position": position + 1,
                     }
