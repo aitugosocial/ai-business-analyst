@@ -77,8 +77,17 @@ class AIToolRecommender:
         Returns:
             MD5 hash of the data
         """
-        # Create a stable string representation of the data
-        data_str = str(sorted([(t["id"], t["name"], t["description"][:50]) for t in tools_data]))
+        # Include composite fields in hash so embedding strategy changes invalidate cache
+        data_str = str(sorted([
+            (
+                t["id"],
+                t["name"],
+                (t.get("description") or "")[:50],
+                (str(t.get("key_features") or ""))[:30],
+                (str(t.get("who_should_use") or ""))[:30],
+            )
+            for t in tools_data
+        ])) + ":v2"  # version tag — bump when embedding strategy changes
         return hashlib.md5(data_str.encode()).hexdigest()
 
     def _is_cache_valid(self) -> bool:
@@ -207,8 +216,21 @@ class AIToolRecommender:
 
             # Generate new embeddings (cache miss or disabled)
             logger.info("Generating embeddings... (this may take a moment)")
-            descriptions = tools_df["description"].tolist()
-            embeddings = model.encode(descriptions, convert_to_tensor=False, show_progress_bar=True)
+            # Composite text gives the semantic search more signal:
+            # tool description alone is too generic when action plans are
+            # semantically similar — adding key_features and who_should_use
+            # steers the embedding toward the tool's actual use-case niche.
+            composite_texts: list[str] = []
+            for _, row in tools_df.iterrows():
+                parts = [str(row.get("description") or "").strip()]
+                features = str(row.get("key_features") or "").strip()
+                who = str(row.get("who_should_use") or "").strip()
+                if features and features not in ("[", "[]"):
+                    parts.append(features[:250])
+                if who and who not in ("[", "[]"):
+                    parts.append(who[:150])
+                composite_texts.append(" ".join(parts))
+            embeddings = model.encode(composite_texts, convert_to_tensor=False, show_progress_bar=True)
 
             self.tools_df = tools_df
             self.embeddings = embeddings
@@ -551,23 +573,20 @@ def recommend_automation_stacks(
         stack_score = (0.65 * relevance_avg) + (0.25 * compatibility_avg) + coverage_bonus - complexity_penalty
         confidence = round(max(0.0, min(stack_score, 1.0)) * 100, 1)
 
-        stack_name = f"Automation Stack: {chosen[0]['name']}"
-        summary = (
-            f"Uses {', '.join(tool['name'] for tool in chosen)} to automate high-impact parts of the user's goal."
-        )
+        stack_name = f"{' + '.join(tool['name'] for tool in chosen)}"
+        # summary and automation_logic are intentionally left empty here;
+        # _enrich_single_stack will fill them with LLM-generated, action-specific text.
         effort = "Low" if len(chosen) == 1 else "Medium" if len(chosen) <= 3 else "High"
 
         stack_candidates.append(
             {
                 "stack_name": stack_name,
-                "summary": summary,
+                "summary": "",
                 "score": round(stack_score, 4),
                 "confidence": confidence,
                 "estimated_effort": effort,
                 "coverage_actions": action_coverage,
-                "automation_logic": (
-                    "Set up tools in sequence so data/events flow between them, then automate repeated manual tasks."
-                ),
+                "automation_logic": "",
                 "tools": [
                     {
                         "tool_id": tool["id"],
@@ -585,18 +604,9 @@ def recommend_automation_stacks(
                     }
                     for position, tool in enumerate(chosen)
                 ],
-                "setup_order": [
-                    {
-                        "position": position + 1,
-                        "tool_name": tool["name"],
-                        "why": (
-                            "Primary execution tool"
-                            if position == 0
-                            else "Connects and automates subsequent workflow steps"
-                        ),
-                    }
-                    for position, tool in enumerate(chosen)
-                ],
+                # setup_order also left empty — LLM enrichment fills this with
+                # specific "why set up X first" reasoning per user context.
+                "setup_order": [],
             }
         )
 
