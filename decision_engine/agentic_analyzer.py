@@ -453,17 +453,47 @@ OUTPUT FORMAT (JSON only, no markdown):
             logger.error(f"Stage 2 failed: {e}")
             raise
 
-    async def _attach_toolkit(self, plan: dict, user_query: str) -> dict:
-        """Fetch and attach the best AI tool for a single action plan (runs in parallel)."""
+    async def _attach_toolkit(
+        self,
+        plan: dict,
+        user_query: str,
+        used_tool_names: set | None = None,
+    ) -> dict:
+        """Fetch and attach the best AI tool(s) for a single action plan.
+
+        Changes vs original:
+        - `used_tool_names` is a shared set across all plans so the same tool
+          is never recommended to two different action cards.
+        - The search query uses the joined what_to_do steps (not the raw list)
+          for better semantic matching.
+        - The LLM may return up to 2 tools when the action steps clearly
+          require different capabilities; each selected tool is added to
+          `used_tool_names` so subsequent plans cannot reuse it.
+        - `what_it_helps` and `why_this_tool` must reference the specific
+          steps of THIS plan — no generic sentences allowed.
+        """
+        if used_tool_names is None:
+            used_tool_names = set()
+
         if not plan.get("needs_ai_tool", False):
             plan["toolkit"] = None
             plan.pop("needs_ai_tool", None)
             return plan
 
+        # Build a clean, joined step string for semantic search
+        what_to_do_list: list[str] = (
+            plan.get("what_to_do", [])
+            if isinstance(plan.get("what_to_do"), list)
+            else []
+        )
+        steps_text = " ".join(what_to_do_list)
+        action_description = f"{plan['title']}: {steps_text}"
+
+        # Fetch more candidates so we can filter already-used tools
         tools = await self._search_ai_tools(
             user_query=user_query,
-            action_description=f"{plan['title']} - {plan.get('what_to_do', '')}",
-            top_k=3,
+            action_description=action_description,
+            top_k=8,
         )
 
         if not tools:
@@ -471,51 +501,58 @@ OUTPUT FORMAT (JSON only, no markdown):
             plan.pop("needs_ai_tool", None)
             return plan
 
-        what_to_do_text = (
-            " ".join(plan.get("what_to_do", []))
-            if isinstance(plan.get("what_to_do"), list)
-            else str(plan.get("what_to_do", ""))
+        # Exclude tools already assigned to another action plan
+        available_tools = [t for t in tools if t["tool_name"] not in used_tool_names]
+        if not available_tools:
+            available_tools = tools  # fallback: allow reuse only if pool is exhausted
+
+        numbered_steps = "\n".join(
+            f"{i+1}. {step}" for i, step in enumerate(what_to_do_list)
         )
-        tool_summaries = [
-            f"{i+1}. {t['tool_name']}: {t['description'][:120]}"
-            for i, t in enumerate(tools)
-        ]
-        prompt_tool_selection = f"""You are a tool selection specialist. You must pick the AI/SaaS tool that best accelerates a SPECIFIC action plan step.
+        tool_summaries = "\n".join(
+            f"{i+1}. {t['tool_name']} (website: {t.get('website') or t.get('url') or 'unknown'}): {t['description'][:150]}"
+            for i, t in enumerate(available_tools)
+        )
 
-ACTION PLAN: {plan['title']}
-STEPS IN THIS ACTION:
-{what_to_do_text}
+        prompt_tool_selection = f"""You are a tool selection specialist. Your job is to pick the AI/SaaS tool(s) that directly cover the steps of a specific action plan.
 
-CANDIDATE TOOLS (retrieved by semantic search):
-{chr(10).join(tool_summaries)}
+ACTION PLAN TITLE: {plan['title']}
+
+STEPS THE USER MUST COMPLETE:
+{numbered_steps}
+
+CANDIDATE TOOLS (from semantic database search — use ONLY these):
+{tool_summaries}
 
 YOUR TASK:
-1. Read the action steps carefully
-2. Identify which step(s) could be automated or significantly accelerated by one of these tools
-3. Select the ONE tool that fits best, or return null if none genuinely help
+1. Read every step carefully.
+2. Identify which step(s) can be automated or significantly accelerated by a tool.
+3. Select UP TO 2 tools if the steps clearly require different capabilities (e.g. step 1 needs a spreadsheet tool, step 3 needs an email tool). Select only 1 if one tool covers most steps. Return null if no tool genuinely fits.
+4. NEVER select a tool just because it is in the same broad category. It must directly address a named step.
+5. "what_it_helps" must name the EXACT step number(s) it covers and how — one concrete sentence specific to this action plan, not a general description of the tool.
+6. "why_this_tool" must name the specific capability (feature or function) that makes this tool the right fit for these steps — one sentence, no generic claims.
+7. Include the tool's website URL exactly as shown in the candidate list.
 
-SELECTION CRITERIA:
-- The tool must automate or accelerate at least one named step in the action plan
-- Prefer tools that reduce manual effort on the highest-leverage step
-- Do NOT recommend a tool just because it's in the same category — it must fit these specific steps
-- If no tool adds real value to this specific action, return null
-
-OUTPUT FORMAT (JSON only, no markdown):
+OUTPUT FORMAT (JSON only, no markdown, no dashes in text values):
 {{
-    "selected_tool_index": 0 or null,
-    "toolkit": {{
-        "tool_name": "Exact tool name from the list",
-        "what_it_helps": "Name the specific step(s) this tool helps with and exactly how (1 specific sentence)",
-        "why_this_tool": "Name the specific capability that makes this tool better than manual work for this action (1 sentence)"
-    }} or null
-}}"""
+    "toolkits": [
+        {{
+            "tool_name": "Exact tool name from the list above",
+            "website": "Exact website URL from the candidate list, or null if not shown",
+            "what_it_helps": "References step N and explains exactly what the tool does for it (1 sentence)",
+            "why_this_tool": "Names the specific feature that makes this tool right for these steps (1 sentence)"
+        }}
+    ]
+}}
+
+Return an empty array for "toolkits" if no tool genuinely fits."""
 
         try:
             tool_response = await self._llm(
                 model=self.fast_model,
                 messages=[{"role": "user", "content": prompt_tool_selection}],
-                temperature=0.6,
-                max_tokens=300,
+                temperature=0.4,
+                max_tokens=500,
             )
             tool_text = tool_response.choices[0].message.content.strip()
             if "```json" in tool_text:
@@ -523,7 +560,29 @@ OUTPUT FORMAT (JSON only, no markdown):
             elif "```" in tool_text:
                 tool_text = tool_text.split("```")[1].split("```")[0].strip()
             tool_selection = _safe_json_loads(tool_text)
-            plan["toolkit"] = tool_selection.get("toolkit")
+
+            toolkits: list[dict] = tool_selection.get("toolkits", []) or []
+
+            # Filter to tools that are actually in our available pool and not already used
+            valid_names = {t["tool_name"] for t in available_tools}
+            toolkits = [
+                tk for tk in toolkits
+                if tk.get("tool_name") in valid_names and tk.get("tool_name") not in used_tool_names
+            ][:2]  # cap at 2
+
+            # Register selected tools so other plans cannot reuse them
+            for tk in toolkits:
+                used_tool_names.add(tk["tool_name"])
+
+            if len(toolkits) == 0:
+                plan["toolkit"] = None
+            elif len(toolkits) == 1:
+                plan["toolkit"] = toolkits[0]
+            else:
+                # Multiple tools — store as list; frontend automation stack handles rendering
+                plan["toolkit"] = toolkits[0]
+                plan["additional_toolkits"] = toolkits[1:]
+
         except Exception as e:
             logger.warning(f"Toolkit selection failed for plan '{plan['title']}': {e}")
             plan["toolkit"] = None
@@ -581,6 +640,7 @@ ACTION PLAN RULES:
 7. Keep action titles specific (e.g. "Build a Weekly Referral Outreach System" not "Improve Marketing")
 8. Maximum 5 action plans. Minimum 3.
 9. "exclusions_note" must name the strategies you considered but excluded, and give a concrete reason for each exclusion
+10. FORMATTING: Do NOT start any list item with a dash (-), bullet, or em dash. Write plain complete sentences only.
 
 OUTPUT FORMAT (JSON only, no markdown):
 {{
@@ -589,8 +649,8 @@ OUTPUT FORMAT (JSON only, no markdown):
             "id": 1,
             "title": "Specific action title (5-10 words)",
             "what_to_do": [
-                "Step 1 — specific, actionable, named",
-                "Step 2 — specific, actionable, named"
+                "Step 1: specific, actionable, named action (no dashes, no bullet prefixes)",
+                "Step 2: specific, actionable, named action (no dashes, no bullet prefixes)"
             ],
             "why_it_matters": [
                 "Specific business impact with a named outcome"
@@ -619,11 +679,15 @@ OUTPUT FORMAT (JSON only, no markdown):
             result = _safe_json_loads(result_text)
             action_plans = result["action_plans"]
 
-            # Attach toolkits to all plans in parallel
-            action_plans_with_toolkits = await asyncio.gather(*[
-                self._attach_toolkit(plan, user_query) for plan in action_plans
-            ])
-            result["action_plans"] = list(action_plans_with_toolkits)
+            # Attach toolkits sequentially (not parallel) so the shared
+            # `used_tool_names` set correctly prevents the same tool being
+            # recommended to two different action plans.
+            used_tool_names: set = set()
+            action_plans_with_toolkits = []
+            for plan in action_plans:
+                enriched = await self._attach_toolkit(plan, user_query, used_tool_names)
+                action_plans_with_toolkits.append(enriched)
+            result["action_plans"] = action_plans_with_toolkits
 
             logger.info(f"Generated {len(result['action_plans'])} action plans with semantic tool matching")
             return result
@@ -906,6 +970,7 @@ ROADMAP RULES:
 5. The total span must equal exactly 7 days
 6. Order: foundation/diagnosis first, execution second, review/optimize last
 7. Do NOT repeat the same task across phases
+8. FORMATTING: Do NOT start any task with a dash (-), bullet, or em dash. Write plain complete sentences only.
 
 QUOTE RULES:
 1. Write a quote that speaks directly to the user's specific challenge — not a generic business platitude
