@@ -124,12 +124,17 @@ class AgenticAnalyzer:
     async def _search_ai_tools(
         self, user_query: str, action_description: str, top_k: int = 3
     ) -> list[dict]:
-        """Semantic search for relevant AI tools from the database."""
+        """Semantic search for relevant AI tools from the database.
+
+        Searches using ONLY the action-specific description so each plan's
+        embedding is unique. Prepending the user_query (which is identical for
+        all plans) dilutes the per-plan signal and makes every plan return the
+        same top tools from the database.
+        """
         try:
-            search_query = f"{user_query} {action_description}"
-            tools = recommend_tools(search_query, top_k=top_k, db_session=self.db)
+            tools = recommend_tools(action_description, top_k=top_k, db_session=self.db)
             logger.info(
-                f"Found {len(tools)} tools via semantic search for: {action_description[:50]}..."
+                f"Found {len(tools)} tools via semantic search for: {action_description[:60]}..."
             )
             return tools
         except Exception as e:
@@ -458,19 +463,20 @@ OUTPUT FORMAT (JSON only, no markdown):
         plan: dict,
         user_query: str,
         used_tool_names: set | None = None,
+        plan_index: int = 0,
+        total_plans: int = 1,
     ) -> dict:
         """Fetch and attach the best AI tool(s) for a single action plan.
 
-        Changes vs original:
-        - `used_tool_names` is a shared set across all plans so the same tool
-          is never recommended to two different action cards.
-        - The search query uses the joined what_to_do steps (not the raw list)
-          for better semantic matching.
-        - The LLM may return up to 2 tools when the action steps clearly
-          require different capabilities; each selected tool is added to
-          `used_tool_names` so subsequent plans cannot reuse it.
-        - `what_it_helps` and `why_this_tool` must reference the specific
-          steps of THIS plan — no generic sentences allowed.
+        Design decisions:
+        - Semantic search uses ONLY this plan's steps (not the shared user_query)
+          so each plan's embedding is genuinely unique and returns different candidates.
+        - `used_tool_names` is a shared mutable set — every plan adds its chosen
+          tools so no tool can appear in two action cards.
+        - The LLM prompt lists already-assigned tools explicitly so the model
+          understands the constraint and picks something different.
+        - Name matching uses a normalised lookup (case-insensitive, stripped) to
+          tolerate minor casing differences between the LLM's output and the DB name.
         """
         if used_tool_names is None:
             used_tool_names = set()
@@ -489,11 +495,12 @@ OUTPUT FORMAT (JSON only, no markdown):
         steps_text = " ".join(what_to_do_list)
         action_description = f"{plan['title']}: {steps_text}"
 
-        # Fetch more candidates so we can filter already-used tools
+        # top_k=15: wider candidate pool per plan so different plans can pull
+        # genuinely different tools from the database
         tools = await self._search_ai_tools(
             user_query=user_query,
             action_description=action_description,
-            top_k=8,
+            top_k=15,
         )
 
         if not tools:
@@ -501,58 +508,82 @@ OUTPUT FORMAT (JSON only, no markdown):
             plan.pop("needs_ai_tool", None)
             return plan
 
-        # Exclude tools already assigned to another action plan
-        available_tools = [t for t in tools if t["tool_name"] not in used_tool_names]
+        # Build a normalised name map for case-insensitive matching
+        # DB name → normalised key
+        name_to_canonical: dict[str, str] = {
+            t["tool_name"].strip().lower(): t["tool_name"] for t in tools
+        }
+
+        # Exclude tools already assigned to another action plan (case-insensitive)
+        used_normalised = {n.strip().lower() for n in used_tool_names}
+        available_tools = [
+            t for t in tools
+            if t["tool_name"].strip().lower() not in used_normalised
+        ]
         if not available_tools:
-            available_tools = tools  # fallback: allow reuse only if pool is exhausted
+            # All candidates already used — allow reuse as last resort
+            available_tools = tools
+            logger.warning(
+                f"All {len(tools)} candidates already used for plan '{plan['title']}' — allowing reuse"
+            )
 
         numbered_steps = "\n".join(
             f"{i+1}. {step}" for i, step in enumerate(what_to_do_list)
         )
         tool_summaries = "\n".join(
-            f"{i+1}. {t['tool_name']} (website: {t.get('website') or t.get('url') or 'unknown'}): {t['description'][:150]}"
+            f"{i+1}. {t['tool_name']} (website: {t.get('website') or t.get('url') or 'unknown'}): {t['description'][:180]}"
             for i, t in enumerate(available_tools)
         )
 
-        prompt_tool_selection = f"""You are a tool selection specialist. Your job is to pick the AI/SaaS tool(s) that directly cover the steps of a specific action plan.
+        # Tell the LLM which tools are already taken so it doesn't even try to pick them
+        already_used_note = ""
+        if used_tool_names:
+            already_used_note = (
+                f"\nTOOLS ALREADY ASSIGNED TO OTHER ACTION PLANS (do NOT select these):\n"
+                + "\n".join(f"  - {n}" for n in sorted(used_tool_names))
+                + "\n"
+            )
 
+        prompt_tool_selection = f"""You are a specialist in matching AI/SaaS tools to specific business action plans. Each action plan in an analysis is DIFFERENT — your tool selection must reflect that difference.
+
+CONTEXT: This is action plan {plan_index + 1} of {total_plans} in the analysis.
+USER BUSINESS CHALLENGE: {user_query}
+{already_used_note}
 ACTION PLAN TITLE: {plan['title']}
 
-STEPS THE USER MUST COMPLETE:
+STEPS THE USER MUST COMPLETE FOR THIS PLAN:
 {numbered_steps}
 
-CANDIDATE TOOLS (from semantic database search — use ONLY these):
+CANDIDATE TOOLS (from semantic search — use ONLY names from this list):
 {tool_summaries}
 
 YOUR TASK:
-1. Read every step carefully.
-2. Identify which step(s) can be automated or significantly accelerated by a tool.
-3. Select UP TO 2 tools if the steps clearly require different capabilities (e.g. step 1 needs a spreadsheet tool, step 3 needs an email tool). Select only 1 if one tool covers most steps. Return null if no tool genuinely fits.
-4. NEVER select a tool just because it is in the same broad category. It must directly address a named step.
-5. "what_it_helps" must name the EXACT step number(s) it covers and how — one concrete sentence specific to this action plan, not a general description of the tool.
-6. "why_this_tool" must name the specific capability (feature or function) that makes this tool the right fit for these steps — one sentence, no generic claims.
-7. Include the tool's website URL exactly as shown in the candidate list.
+1. Read every step of THIS specific action plan carefully.
+2. Select the tool(s) whose documented features directly automate or accelerate a named step above.
+3. Select UP TO 2 tools ONLY if the steps clearly need two different capabilities (e.g. step 1 needs analytics, step 3 needs email automation). Otherwise select 1.
+4. Return an empty array if no tool genuinely addresses a specific step.
+5. CRITICAL — "what_it_helps": name the exact step number(s) and describe what the tool does for that step in one concrete sentence. This text will appear on a card next to THIS specific action plan — it must be unique to these steps, not a generic description of the tool.
+6. CRITICAL — "why_this_tool": name the specific feature or function that makes this the right choice for these steps. One sentence, no generic claims.
+7. Return the tool's website URL from the candidate list exactly as shown.
 
-OUTPUT FORMAT (JSON only, no markdown, no dashes in text values):
+OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
 {{
     "toolkits": [
         {{
-            "tool_name": "Exact tool name from the list above",
-            "website": "Exact website URL from the candidate list, or null if not shown",
-            "what_it_helps": "References step N and explains exactly what the tool does for it (1 sentence)",
-            "why_this_tool": "Names the specific feature that makes this tool right for these steps (1 sentence)"
+            "tool_name": "Exact name from the candidate list",
+            "website": "Exact URL from the candidate list, or null",
+            "what_it_helps": "Step N: one concrete sentence describing what the tool does for that specific step",
+            "why_this_tool": "One sentence naming the specific feature that makes this tool the right fit"
         }}
     ]
-}}
-
-Return an empty array for "toolkits" if no tool genuinely fits."""
+}}"""
 
         try:
             tool_response = await self._llm(
                 model=self.fast_model,
                 messages=[{"role": "user", "content": prompt_tool_selection}],
-                temperature=0.4,
-                max_tokens=500,
+                temperature=0.3,
+                max_tokens=600,
             )
             tool_text = tool_response.choices[0].message.content.strip()
             if "```json" in tool_text:
@@ -563,25 +594,42 @@ Return an empty array for "toolkits" if no tool genuinely fits."""
 
             toolkits: list[dict] = tool_selection.get("toolkits", []) or []
 
-            # Filter to tools that are actually in our available pool and not already used
-            valid_names = {t["tool_name"] for t in available_tools}
-            toolkits = [
-                tk for tk in toolkits
-                if tk.get("tool_name") in valid_names and tk.get("tool_name") not in used_tool_names
-            ][:2]  # cap at 2
+            # Normalised lookup: accept LLM output that differs in casing/whitespace
+            available_normalised: dict[str, str] = {
+                t["tool_name"].strip().lower(): t["tool_name"] for t in available_tools
+            }
 
-            # Register selected tools so other plans cannot reuse them
+            validated: list[dict] = []
             for tk in toolkits:
-                used_tool_names.add(tk["tool_name"])
+                llm_name = (tk.get("tool_name") or "").strip()
+                llm_name_lower = llm_name.lower()
+                # Resolve to canonical DB name (case-insensitive)
+                canonical = available_normalised.get(llm_name_lower)
+                if canonical and canonical.strip().lower() not in used_normalised:
+                    # Overwrite with the canonical DB name so storage is consistent
+                    tk["tool_name"] = canonical
+                    validated.append(tk)
+                    if len(validated) == 2:
+                        break
 
-            if len(toolkits) == 0:
+            # Register all selected tools before returning
+            for tk in validated:
+                used_tool_names.add(tk["tool_name"])
+                used_normalised.add(tk["tool_name"].strip().lower())
+
+            logger.info(
+                f"Plan {plan_index+1}/{total_plans} '{plan['title'][:40]}' → "
+                f"toolkit: {[tk['tool_name'] for tk in validated] or 'none'} | "
+                f"used pool: {used_tool_names}"
+            )
+
+            if len(validated) == 0:
                 plan["toolkit"] = None
-            elif len(toolkits) == 1:
-                plan["toolkit"] = toolkits[0]
+            elif len(validated) == 1:
+                plan["toolkit"] = validated[0]
             else:
-                # Multiple tools — store as list; frontend automation stack handles rendering
-                plan["toolkit"] = toolkits[0]
-                plan["additional_toolkits"] = toolkits[1:]
+                plan["toolkit"] = validated[0]
+                plan["additional_toolkits"] = validated[1:]
 
         except Exception as e:
             logger.warning(f"Toolkit selection failed for plan '{plan['title']}': {e}")
@@ -679,13 +727,19 @@ OUTPUT FORMAT (JSON only, no markdown):
             result = _safe_json_loads(result_text)
             action_plans = result["action_plans"]
 
-            # Attach toolkits sequentially (not parallel) so the shared
-            # `used_tool_names` set correctly prevents the same tool being
-            # recommended to two different action plans.
+            # Attach toolkits sequentially so the shared `used_tool_names` set
+            # correctly prevents any tool from appearing in two action cards.
+            # plan_index and total_plans are passed so the LLM prompt can
+            # reference its position in the analysis ("plan 2 of 3") and reason
+            # about what has already been assigned.
             used_tool_names: set = set()
             action_plans_with_toolkits = []
-            for plan in action_plans:
-                enriched = await self._attach_toolkit(plan, user_query, used_tool_names)
+            total_plans = len(action_plans)
+            for plan_index, plan in enumerate(action_plans):
+                enriched = await self._attach_toolkit(
+                    plan, user_query, used_tool_names,
+                    plan_index=plan_index, total_plans=total_plans,
+                )
                 action_plans_with_toolkits.append(enriched)
             result["action_plans"] = action_plans_with_toolkits
 
