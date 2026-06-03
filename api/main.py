@@ -617,6 +617,15 @@ async def run_heavy_schema_migrations():
     """
     logger.info("Starting background schema migrations & index builds...")
 
+    # Ensure admin exists (moved here from startup_event to prevent blocking the event loop)
+    admin_db = SessionLocal()
+    try:
+        await create_admin_user(admin_db)
+    except Exception as e:
+        logger.error(f"Failed to create admin user in background: {e}")
+    finally:
+        admin_db.close()
+
     # --- Auto-migration for users/reviews/payouts/subscriptions columns (was first big block) ---
     db = SessionLocal()
     try:
@@ -1048,15 +1057,17 @@ async def startup_event():
         db_info = get_db_info()
         logger.info(f"✓ Database initialized: {db_info['type']} at {db_info['host']}")
 
-        # Ensure admin exists (quick operation)
-        admin_db = SessionLocal()
-        try:
-            await create_admin_user(admin_db)
-        finally:
-            admin_db.close()
+        # Ensure admin exists (moved to a background task so synchronous DB queries don't block the event loop)
+        # It is now called at the beginning of run_heavy_schema_migrations()
 
-        # Our fixed cache init (no blocking Redis attempt when REDIS_URL absent)
-        await init_cache()
+        # Init cache wrapped in a strict timeout to prevent network black-hole hangs
+        try:
+            await asyncio.wait_for(init_cache(), timeout=4.0)
+        except Exception as e:
+            logger.error(f"⚠️ Cache init timed out or failed: {e}. Forcing in-memory fallback.")
+            from fastapi_cache.backends.inmemory import InMemoryBackend
+            from fastapi_cache import FastAPICache
+            FastAPICache.init(InMemoryBackend(), prefix="aianalyst:")
 
         # Fire the *expensive* schema work (community tables, marketplace tables,
         # security_setup.sql, 30+ indexes, subscription backfills, etc.) in the
