@@ -407,6 +407,9 @@ async def run_subscription_expiry_job():
     Per-user deduplication: only the MOST RECENT expired sub per user drives
     the renewal decision.  Older superseded rows are silently marked expired.
     """
+    # Wait before the first run so we don't block the startup event handler
+    await asyncio.sleep(60)
+
     while True:
         try:
             from database.pg_connections import SessionLocal
@@ -443,6 +446,9 @@ async def run_subscription_expiry_job():
                 affected_users: set[int] = set()
 
                 for user_id, sub in latest_per_user.items():
+                    # Yield to the event loop between users to prevent blocking health checks
+                    await asyncio.sleep(0.1)
+
                     user = db.query(User).filter(User.id == user_id).first()
                     plan = sub.subscription_plan or "monthly"
                     provider = (sub.payment_provider or "").lower()
