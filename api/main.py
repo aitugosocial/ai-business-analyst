@@ -217,7 +217,7 @@ async def run_scheduled_scans():
 
 
 # try creating an admin user if not exists
-async def create_admin_user(db: Session):
+def create_admin_user(db: Session):
     """
     Idempotent helper that ensures a default administrative user exists.
 
@@ -600,7 +600,7 @@ async def run_new_alert_notifications_job():
             logger.error("[alert-notify-job] error: %s", exc, exc_info=True)
 
 
-async def run_heavy_schema_migrations():
+def run_heavy_schema_migrations():
     """
     Background task that performs all non-critical, potentially slow schema
     evolution, table creation, index creation, and data back-filling.
@@ -620,7 +620,7 @@ async def run_heavy_schema_migrations():
     # Ensure admin exists (moved here from startup_event to prevent blocking the event loop)
     admin_db = SessionLocal()
     try:
-        await create_admin_user(admin_db)
+        create_admin_user(admin_db)
     except Exception as e:
         logger.error(f"Failed to create admin user in background: {e}")
     finally:
@@ -1073,7 +1073,7 @@ async def startup_event():
         # security_setup.sql, 30+ indexes, subscription backfills, etc.) in the
         # background. This is the key change that prevents the startup handler
         # from hanging after init_db().
-        asyncio.create_task(run_heavy_schema_migrations())
+        asyncio.create_task(asyncio.to_thread(run_heavy_schema_migrations))
 
         logger.info("✓ Fast-path startup finished. Heavy migrations & index builds are running in the background.")
         # Returning from here lets uvicorn log "Application startup complete"
