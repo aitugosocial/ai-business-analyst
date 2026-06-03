@@ -33,13 +33,15 @@ import time
 
 async def init_cache():
     """
-    Initialize caching backend (Redis or fallback to in-memory)
-    Call this during FastAPI startup event.
+    Initialize the caching backend (Redis if REDIS_URL is set, otherwise in-memory).
 
-    IMPORTANT: Only connects to Redis if REDIS_URL is explicitly set.
-    This prevents startup hangs on platforms like Railway when no Redis
-    service is provisioned (would otherwise block on localhost:6379).
-    In-memory fallback is always available and sufficient for most use cases.
+    This must be called during FastAPI startup. When no REDIS_URL is provided
+    (typical for Railway deploys without a Redis service), we skip any connection
+    attempt entirely and use the fast in-memory backend. This prevents the
+    startup event from hanging on localhost:6379 during "Waiting for application
+    startup".
+
+    Side effects: sets the global redis_client and initializes FastAPICache.
     """
     global redis_client
 
@@ -82,8 +84,10 @@ async def init_cache():
 
 async def close_cache():
     """
-    Close Redis connection gracefully
-    Call this during FastAPI shutdown event
+    Gracefully close the Redis client connection if one exists.
+
+    Called from the FastAPI shutdown event handler. Safe to call even if
+    we are using the in-memory fallback (in which case redis_client is None).
     """
     global redis_client
 
@@ -104,10 +108,12 @@ def cache_key_builder(
     **kwargs,
 ):
     """
-    Custom cache key builder for fastapi-cache2
-    Builds hierarchical cache keys with request parameters
+    Build a hierarchical cache key for fastapi-cache2 that incorporates the
+    function name, module, namespace, and (if provided) sorted query parameters.
 
-    Example key: "aianalyst:admin:users:page=1:limit=10:status=all"
+    This ensures different query strings produce different cache entries while
+    keeping keys readable. Example:
+        "aianalyst:admin:users:page=1:limit=10:status=all"
     """
     from fastapi_cache import FastAPICache
 
@@ -126,13 +132,12 @@ def cache_key_builder(
 
 async def invalidate_cache_pattern(pattern: str):
     """
-    Invalidate all cache keys matching a pattern
+    Delete all keys in the active cache backend (Redis or in-memory) that match
+    the given glob-style pattern.
 
-    Args:
-        pattern: Redis pattern (e.g., "aianalyst:admin:users:*")
-
-    Example:
-        await invalidate_cache_pattern("aianalyst:admin:users:*")
+    Only works for the Redis backend; for in-memory it is currently a no-op
+    (the in-memory implementation is a simple dict without scan support).
+    Use with caution in production as it can be expensive on large key spaces.
     """
     global redis_client
 
@@ -159,13 +164,9 @@ async def invalidate_cache_pattern(pattern: str):
 
 async def invalidate_user_cache(user_id: int):
     """
-    Invalidate all caches for a specific user
-
-    Args:
-        user_id: User ID to invalidate caches for
-
-    Example:
-        await invalidate_user_cache(123)
+    Convenience wrapper that invalidates cache entries containing the given
+    user_id by using a broad pattern. Useful after profile updates, subscription
+    changes, etc.
     """
     pattern = f"aianalyst:*user*{user_id}*"
     await invalidate_cache_pattern(pattern)
@@ -173,8 +174,10 @@ async def invalidate_user_cache(user_id: int):
 
 async def clear_all_caches():
     """
-    Clear all application caches
-    Use with caution - only for admin operations
+    Remove every key that starts with our cache prefix from the active backend.
+
+    Intended for admin/debug use only. Very dangerous in production as it
+    will flush all cached query results, user data, etc.
     """
     global redis_client
 
@@ -221,19 +224,12 @@ __all__ = [
 
 async def get_cached(key: str) -> Optional[Any]:
     """
-    Get a value from cache by key.
-    Works with both Redis and in-memory fallback.
+    Retrieve a previously stored value for the given logical key.
 
-    Args:
-        key: Cache key (automatically prefixed with 'aianalyst:')
-
-    Returns:
-        Cached value or None if not found/expired
-
-    Example:
-        cached = await get_cached(f"alerts:user:{user_id}")
-        if cached:
-            return cached
+    The key is automatically namespaced with the 'aianalyst:' prefix.
+    Works transparently for both the Redis backend and the pure-Python
+    in-memory fallback (with TTL expiry).
+    Returns None on miss, error, or expiry.
     """
     global redis_client, _memory_cache
 
@@ -262,16 +258,10 @@ async def get_cached(key: str) -> Optional[Any]:
 
 async def set_cached(key: str, value: Any, ttl_seconds: int = 300):
     """
-    Set a value in cache with TTL (time to live).
-    Works with both Redis and in-memory fallback.
+    Store a JSON-serializable value under the given key with an expiry.
 
-    Args:
-        key: Cache key (automatically prefixed with 'aianalyst:')
-        value: Value to cache (must be JSON serializable)
-        ttl_seconds: Time to live in seconds (default: 5 minutes)
-
-    Example:
-        await set_cached(f"alerts:user:{user_id}", alerts_data, ttl_seconds=120)
+    The actual storage uses the active backend (Redis SETEX or in-memory dict
+    with timestamp). ttl_seconds defaults to 5 minutes.
     """
     global redis_client, _memory_cache
 
@@ -296,13 +286,9 @@ async def set_cached(key: str, value: Any, ttl_seconds: int = 300):
 
 async def delete_cached(key: str):
     """
-    Delete a specific cache key.
+    Remove a single key from the active cache backend (idempotent).
 
-    Args:
-        key: Cache key (automatically prefixed with 'aianalyst:')
-
-    Example:
-        await delete_cached(f"alerts:user:{user_id}")
+    Safe to call regardless of whether Redis or in-memory is active.
     """
     global redis_client, _memory_cache
 

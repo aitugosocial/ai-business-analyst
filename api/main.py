@@ -99,6 +99,11 @@ pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 # DEBUG: Global Request Logger to confirm traffic
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    """
+    HTTP middleware that logs every incoming request path/method and the
+    corresponding response status code. Useful for debugging traffic and
+    verifying that the app is receiving requests in cloud environments.
+    """
     logger.info(f"INCOMING REQUEST: {request.method} {request.url.path}")
     response = await call_next(request)
     logger.info(f"RESPONSE STATUS: {request.method} {request.url.path} -> {response.status_code}")
@@ -142,8 +147,12 @@ app.add_middleware(
 @app.api_route("/api/health", methods=["GET", "HEAD"]) # Alias for consistency
 async def health_check():
     """
-    Health check endpoint for cloud platform monitoring.
-    Returns 200 OK if app is running and database is connected.
+    Liveness / readiness probe for Railway, Docker HEALTHCHECK, load balancers, etc.
+
+    Returns a small JSON payload containing database type and a "healthy" status
+    as long as get_db_info() succeeds. Because this is defined before the heavy
+    startup work, once the startup coroutine finishes this endpoint becomes
+    reachable.
     """
     try:
         db_info = get_db_info()
@@ -163,8 +172,9 @@ async def get_beta_status(
     db: Session = Depends(get_db)
 ):
     """
-    Beta status endpoint for the frontend.
-    Directly exposed at /api/beta-status as expected by the React-based components.
+    Return the current beta / subscription status for the logged-in user,
+    augmented with card info when appropriate. Used by the frontend to decide
+    which UI elements (paywall, grace period banners, etc.) to show.
     """
     try:
         status = BetaService.get_user_status(current_user)
@@ -186,7 +196,11 @@ async def get_beta_status(
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
 async def run_scheduled_scans():
-    """Background task to run vulnerability scans every 15 minutes"""
+    """
+    Infinite background loop (started via create_task at startup) that sleeps
+    15 minutes then runs a full vulnerability/firewall scan using the
+    vulnerability_scanner service. Failures are logged but do not crash the loop.
+    """
     while True:
         try:
             # Wait 15 minutes between scans
@@ -203,11 +217,17 @@ async def run_scheduled_scans():
 
 
 # try creating an admin user if not exists
-async def create_admin_user(db: Session=Depends(get_db)):
-    admin_email = os.getenv("admin_email","admin@gmail.com")
-    admin_password = os.getenv("admin_password","admin123")
+async def create_admin_user(db: Session):
+    """
+    Idempotent helper that ensures a default administrative user exists.
+
+    Credentials come from environment variables (admin_email, admin_password,
+    admin_name) with safe development defaults. The function is called during
+    startup; the passed Session is committed and should be closed by the caller.
+    """
+    admin_email = os.getenv("admin_email", "admin@gmail.com")
+    admin_password = os.getenv("admin_password", "admin123")
     password = pwd_context.hash(admin_password)
-    admin_name = os.getenv("admin_name","Admin")
 
     try:
         existing_admin = db.query(User).filter(User.email == admin_email).first()
@@ -216,15 +236,15 @@ async def create_admin_user(db: Session=Depends(get_db)):
             return
 
         new_admin = User(
-                name="Admin",
-                email=admin_email,
-                password= password,
-                confirm_password = password,
-                is_admin=True
+            name=os.getenv("admin_name", "Admin"),
+            email=admin_email,
+            password=password,
+            confirm_password=password,
+            is_admin=True
         )
         db.add(new_admin)
         db.commit()
-        logger.info("✓ Admin user created",admin_email)
+        logger.info(f"✓ Admin user created: {admin_email}")
     except Exception as e:
         logger.error(f"❌ Failed to create admin user: {e}")
 
@@ -244,9 +264,9 @@ async def create_admin_user(db: Session=Depends(get_db)):
 
 def _attempt_flutterwave_renewal(user_id: int, plan: str, amount: float, currency: str) -> bool:
     """
-    Charge a Flutterwave subscriber off-session using the card token saved
-    during their last payment (data.card.token from the verify response).
-    Uses POST /v3/charges?type=token — no user interaction required.
+    Attempt an off-session renewal charge via Flutterwave using a previously
+    stored card token. Returns True only on a confirmed successful charge.
+    Creates a fresh Subscriptions row on success and updates the user's status.
     """
     try:
         import requests as _req
@@ -327,8 +347,9 @@ PLAN_DURATION_MAP = {"monthly": 30, "quarterly": 90, "yearly": 365}
 
 def _attempt_stripe_renewal(user_id: int, plan_type: str) -> bool:
     """
-    Try to renew a Stripe subscription off-session using the user's saved card.
-    Returns True on success, False if the charge fails or no card is saved.
+    Attempt an off-session Stripe Subscription.create using the customer's
+    saved payment method. On success a local Subscriptions record is also
+    written via the shared _create_active_subscription_record helper.
     """
     try:
         import stripe as _stripe
@@ -573,474 +594,485 @@ async def run_new_alert_notifications_job():
             logger.error("[alert-notify-job] error: %s", exc, exc_info=True)
 
 
+async def run_heavy_schema_migrations():
+    """
+    Background task that performs all non-critical, potentially slow schema
+    evolution, table creation, index creation, and data back-filling.
+
+    Executed via asyncio.create_task() from startup_event *after* the fast-path
+    init (init_db + admin + cache) has completed. This guarantees that uvicorn
+    reaches "Application startup complete" and the /health endpoint responds
+    quickly even when there are many ALTER/CREATE/UPDATE statements or a large
+    security_setup.sql file.
+
+    All statements are written to be idempotent (CREATE TABLE IF NOT EXISTS,
+    ALTER ... ADD COLUMN IF NOT EXISTS, etc.) so it is safe to run while the
+    rest of the application is already serving traffic.
+    """
+    logger.info("Starting background schema migrations & index builds...")
+
+    # --- Auto-migration for users/reviews/payouts/subscriptions columns (was first big block) ---
+    db = SessionLocal()
+    try:
+        try:
+            db.execute(text("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE,
+                ADD COLUMN IF NOT EXISTS department VARCHAR(100),
+                ADD COLUMN IF NOT EXISTS location VARCHAR(100) DEFAULT 'Nigeria',
+                ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT 'IT Operations',
+                ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS email_notifications BOOLEAN DEFAULT TRUE,
+                ADD COLUMN IF NOT EXISTS company_name VARCHAR(255),
+                ADD COLUMN IF NOT EXISTS industry VARCHAR(100),
+                ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+            """))
+
+            db.execute(text("ALTER TABLE reviews ADD COLUMN IF NOT EXISTS is_attended BOOLEAN DEFAULT FALSE"))
+
+            db.execute(text("""
+                ALTER TABLE payout_accounts
+                DROP CONSTRAINT IF EXISTS payout_accounts_user_id_key;
+            """))
+
+            db.execute(text("""
+                ALTER TABLE subscriptions
+                ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(20);
+            """))
+
+            db.execute(text("""
+                UPDATE subscriptions
+                SET subscription_status = CASE
+                    WHEN end_date < NOW() THEN 'expired'
+                    WHEN status NOT IN ('completed', 'active', 'paid', 'successful') THEN 'Payment failed'
+                    ELSE 'active'
+                END
+                WHERE subscription_status IS NULL;
+            """))
+
+            try:
+                db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS recommended_tool_stacks JSON"))
+            except Exception as e:
+                logger.warning(f"Failed to add recommended_tool_stacks: {e}")
+
+            try:
+                db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS recommendation_mode VARCHAR"))
+                db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS single_tool_recommendation JSON"))
+            except Exception as e:
+                logger.warning(f"Failed to add recommendation mode columns: {e}")
+
+            try:
+                db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS flutterwave_card_token VARCHAR(500)"))
+                db.commit()
+            except Exception as e:
+                logger.warning(f"Failed to add flutterwave_card_token: {e}")
+
+            # Security table fixes
+            try:
+                db.execute(text("""
+                    DO $$
+                    BEGIN
+                        IF EXISTS (SELECT 1 FROM information_schema.columns
+                                   WHERE table_name='failed_login_attempts' AND column_name='attempt_time') THEN
+                            ALTER TABLE failed_login_attempts RENAME COLUMN attempt_time TO created_at;
+                        END IF;
+                    END $$;
+                """))
+            except Exception as e:
+                logger.warning(f"Failed to rename attempt_time: {e}")
+
+            try:
+                db.execute(text("ALTER TABLE firewall_rules ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
+            except Exception as e:
+                logger.warning(f"Failed to add is_active to firewall_rules: {e}")
+
+            try:
+                db.execute(text("""
+                    ALTER TABLE system_settings
+                    ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+                """))
+            except Exception as e:
+                logger.warning(f"Failed to add columns to system_settings: {e}")
+
+            try:
+                db.execute(text("""
+                    CREATE TABLE IF NOT EXISTS user_notifications (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        type VARCHAR(50) NOT NULL,
+                        title VARCHAR(255) NOT NULL,
+                        message TEXT NOT NULL,
+                        link VARCHAR(255),
+                        is_read BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_user_notifications_user_unread ON user_notifications(user_id, is_read);
+                """))
+            except Exception as e:
+                logger.warning(f"Failed to create user_notifications table: {e}")
+
+        except Exception as e:
+            logger.warning(f"Batch migration warning: {e}")
+
+        db.commit()
+        logger.info("✓ User/reviews/subscription column migrations checked")
+    except Exception as e:
+        logger.warning(f"Migration block warning: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+    # --- Email column on ip_blacklist ---
+    db = SessionLocal()
+    try:
+        db.execute(text("ALTER TABLE ip_blacklist ADD COLUMN IF NOT EXISTS email VARCHAR(255);"))
+        db.commit()
+        logger.info("✓ Added email column to ip_blacklist table")
+    except Exception as e:
+        logger.warning(f"Email column migration: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+    # --- Execute security_setup.sql (views, functions, triggers, firewall init) ---
+    try:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        sql_file = os.path.join(project_root, "database", "security_setup.sql")
+        if os.path.exists(sql_file):
+            with open(sql_file, "r") as f:
+                sql_content = f.read()
+
+            db = SessionLocal()
+            try:
+                try:
+                    db.execute(text("DROP TABLE IF EXISTS security_metrics_summary CASCADE"))
+                    db.commit()
+                    logger.info("Dropped existing security_metrics_summary table if present")
+                except Exception as drop_error:
+                    logger.debug(f"No table to drop: {drop_error}")
+                    db.rollback()
+
+                db.execute(text(sql_content))
+                db.commit()
+                logger.info("✓ Security views and triggers initialized from security_setup.sql")
+
+                try:
+                    initialize_default_firewall_rules(db)
+                    firewall_manager.load_rules(db)
+                    logger.info("✓ Firewall rules initialized")
+                except Exception as fw_error:
+                    logger.warning(f"Firewall initialization: {fw_error}")
+
+            except Exception as e:
+                logger.error(f"Failed to execute security setup SQL: {e}")
+                db.rollback()
+            finally:
+                db.close()
+        else:
+            logger.warning(f"security_setup.sql not found at {sql_file}")
+    except Exception as e:
+        logger.error(f"Error during security SQL initialization: {e}")
+
+    # --- Community tables (large block of CREATEs) ---
+    db = SessionLocal()
+    try:
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS community_channels (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                slug VARCHAR(100) UNIQUE NOT NULL,
+                description TEXT,
+                category VARCHAR(50) NOT NULL DEFAULT 'General',
+                member_count INTEGER DEFAULT 0,
+                post_count INTEGER DEFAULT 0,
+                icon VARCHAR(10),
+                is_public BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS channel_members (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                channel_id INTEGER NOT NULL REFERENCES community_channels(id) ON DELETE CASCADE,
+                is_moderator BOOLEAN DEFAULT FALSE,
+                joined_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, channel_id)
+            );
+            CREATE TABLE IF NOT EXISTS community_discussions (
+                id SERIAL PRIMARY KEY,
+                channel_id INTEGER NOT NULL REFERENCES community_channels(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title VARCHAR(255) NOT NULL,
+                content TEXT NOT NULL,
+                tags JSONB,
+                like_count INTEGER DEFAULT 0,
+                reply_count INTEGER DEFAULT 0,
+                view_count INTEGER DEFAULT 0,
+                is_pinned BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS discussion_replies (
+                id SERIAL PRIMARY KEY,
+                discussion_id INTEGER NOT NULL REFERENCES community_discussions(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                content TEXT NOT NULL,
+                like_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS discussion_likes (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                discussion_id INTEGER NOT NULL REFERENCES community_discussions(id) ON DELETE CASCADE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, discussion_id)
+            );
+            CREATE TABLE IF NOT EXISTS community_events (
+                id SERIAL PRIMARY KEY,
+                title VARCHAR(255) NOT NULL,
+                description TEXT,
+                event_type VARCHAR(50) NOT NULL DEFAULT 'Webinar',
+                scheduled_at TIMESTAMP WITH TIME ZONE,
+                duration_minutes INTEGER DEFAULT 60,
+                max_attendees INTEGER,
+                attendee_count INTEGER DEFAULT 0,
+                host_name VARCHAR(100),
+                meeting_link VARCHAR(500),
+                is_published BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS event_registrations (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                event_id INTEGER NOT NULL REFERENCES community_events(id) ON DELETE CASCADE,
+                registered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, event_id)
+            );
+            CREATE TABLE IF NOT EXISTS community_activities (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                action_type VARCHAR(50) NOT NULL,
+                target_id INTEGER,
+                target_type VARCHAR(50),
+                target_name VARCHAR(255),
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS saved_items (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                item_id INTEGER NOT NULL,
+                item_type VARCHAR(50) NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, item_id, item_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_members_user ON channel_members(user_id);
+            CREATE INDEX IF NOT EXISTS idx_channel_members_channel ON channel_members(channel_id);
+            CREATE INDEX IF NOT EXISTS idx_discussions_channel ON community_discussions(channel_id);
+            CREATE INDEX IF NOT EXISTS idx_discussions_user ON community_discussions(user_id);
+            CREATE INDEX IF NOT EXISTS idx_community_activities_user ON community_activities(user_id);
+            CREATE INDEX IF NOT EXISTS idx_saved_items_user ON saved_items(user_id);
+        """))
+        db.commit()
+        logger.info("✓ Community tables created/verified (background)")
+    except Exception as e:
+        logger.warning(f"Community table migration: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+    # --- Marketplace tables ---
+    db = SessionLocal()
+    try:
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS marketplace_tools (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                author VARCHAR(100) NOT NULL,
+                description TEXT NOT NULL,
+                full_description TEXT,
+                category VARCHAR(100) NOT NULL DEFAULT 'AI Tools',
+                price FLOAT DEFAULT 0.0,
+                tags JSONB,
+                features JSONB,
+                icon_name VARCHAR(50) NOT NULL DEFAULT 'Cpu',
+                color_theme VARCHAR(30) NOT NULL DEFAULT 'orange',
+                sales_count INTEGER DEFAULT 0,
+                rating FLOAT DEFAULT 0.0,
+                review_count INTEGER DEFAULT 0,
+                is_active BOOLEAN DEFAULT TRUE,
+                purchase_url VARCHAR(500),
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS marketplace_purchases (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                tool_id INTEGER NOT NULL REFERENCES marketplace_tools(id) ON DELETE CASCADE,
+                status VARCHAR(50) NOT NULL DEFAULT 'pending',
+                amount_paid FLOAT DEFAULT 0.0,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, tool_id)
+            );
+            CREATE TABLE IF NOT EXISTS marketplace_requests (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title VARCHAR(255) NOT NULL,
+                description TEXT NOT NULL,
+                budget VARCHAR(100),
+                timeline VARCHAR(100),
+                status VARCHAR(50) NOT NULL DEFAULT 'open',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
+        db.commit()
+        logger.info("✓ Marketplace tables created/verified (background)")
+    except Exception as e:
+        logger.warning(f"Marketplace table migration: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+    # --- Performance indexes (many CREATE INDEX IF NOT EXISTS) ---
+    try:
+        db2 = SessionLocal()
+        index_statements = [
+            "CREATE INDEX IF NOT EXISTS idx_ba_user_id ON business_analyses(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ba_created_at ON business_analyses(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_sub_user_id ON subscriptions(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_sub_status ON subscriptions(subscription_status)",
+            "CREATE INDEX IF NOT EXISTS idx_sub_created_at ON subscriptions(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_alerts_is_active ON alerts(is_active)",
+            "CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ua_user_id ON user_alerts(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ua_alert_id ON user_alerts(alert_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ua_composite ON user_alerts(user_id, alert_id)",
+            "CREATE INDEX IF NOT EXISTS idx_upa_user_id ON user_pinned_alerts(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_upa_alert_id ON user_pinned_alerts(alert_id)",
+            "CREATE INDEX IF NOT EXISTS idx_upa_composite ON user_pinned_alerts(user_id, alert_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ref_referrer_id ON referrals(referrer_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ref_referred_id ON referrals(referred_user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_com_user_id ON commissions(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_com_referred_id ON commissions(referred_user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_com_sub_id ON commissions(subscription_id)",
+            "CREATE INDEX IF NOT EXISTS idx_com_status ON commissions(status)",
+            "CREATE INDEX IF NOT EXISTS idx_com_created_at ON commissions(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_payout_user_id ON payouts(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_payout_status ON payouts(status)",
+            "CREATE INDEX IF NOT EXISTS idx_pa_user_id ON payout_accounts(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_un_user_id ON user_notifications(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_un_created_at ON user_notifications(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_insights_is_active ON insights(is_active)",
+            "CREATE INDEX IF NOT EXISTS idx_insights_created_at ON insights(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ui_user_id ON user_insights(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ui_insight_id ON user_insights(insight_id)",
+            "CREATE INDEX IF NOT EXISTS idx_upi_user_id ON user_pinned_insights(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_reviews_user_id ON reviews(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_conv_review_id ON conversations(review_id)",
+            "CREATE INDEX IF NOT EXISTS idx_conv_is_read ON conversations(is_read)",
+            "CREATE INDEX IF NOT EXISTS idx_users_sub_status ON users(subscription_status)",
+            "CREATE INDEX IF NOT EXISTS idx_users_is_active ON users(is_active)",
+            "CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_cm_user_id ON channel_members(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_cm_channel_id ON channel_members(channel_id)",
+            "CREATE INDEX IF NOT EXISTS idx_cd_channel_id ON community_discussions(channel_id)",
+            "CREATE INDEX IF NOT EXISTS idx_cd_user_id ON community_discussions(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dr_discussion_id ON discussion_replies(discussion_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dl_user_id ON discussion_likes(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_mp_user_id ON marketplace_purchases(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_mp_tool_id ON marketplace_purchases(tool_id)",
+            "CREATE INDEX IF NOT EXISTS idx_mp_status ON marketplace_purchases(status)",
+            "CREATE INDEX IF NOT EXISTS idx_si_user_id ON saved_items(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_si_composite ON saved_items(user_id, item_type)",
+            "CREATE INDEX IF NOT EXISTS idx_um_user_id ON user_missions(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_cs_user_id ON commission_summaries(user_id)",
+        ]
+        for stmt in index_statements:
+            try:
+                db2.execute(text(stmt))
+            except Exception:
+                pass
+        db2.commit()
+        logger.info(f"✓ Performance indexes verified ({len(index_statements)} statements) (background)")
+    except Exception as idx_err:
+        logger.warning(f"Index creation batch failed: {idx_err}")
+    finally:
+        try:
+            db2.close()
+        except Exception:
+            pass
+
+    logger.info("✓ Background heavy schema migrations completed.")
+
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database tables and caching on application startup"""
+    """
+    FastAPI startup handler.
+
+    Performs only the *minimum* work required before the application can serve
+    traffic:
+
+      1. Starts the three long-running background job tasks (scans, expiry, alerts).
+      2. Calls init_db() (creates core tables via SQLAlchemy metadata).
+      3. Ensures an admin user exists.
+      4. Initializes the cache backend (our Redis-safe version).
+      5. Fires the heavy schema-migration / index / security-setup work as a
+         background task via create_task so that uvicorn can emit
+         "Application startup complete" and the /health endpoint becomes
+         reachable quickly.
+
+    All expensive DDL (CREATE TABLE IF NOT EXISTS for community/marketplace,
+    the large security_setup.sql execution, dozens of CREATE INDEX, the
+    subscription_status backfill UPDATE, etc.) now live in
+    run_heavy_schema_migrations() which runs after the startup coroutine has
+    finished. This directly addresses the Railway symptom of the startup
+    handler hanging after init_db().
+
+    Because the migrations use idempotent "IF NOT EXISTS" statements they are
+    safe to execute while the app is already accepting requests.
+    """
     asyncio.create_task(run_scheduled_scans())
     asyncio.create_task(run_subscription_expiry_job())
     asyncio.create_task(run_new_alert_notifications_job())
+
     try:
+        # --- MINIMAL WORK REQUIRED FOR "Application startup complete" ---
         init_db()
         db_info = get_db_info()
         logger.info(f"✓ Database initialized: {db_info['type']} at {db_info['host']}")
 
-        # Auto-migration for is_active column
-        db = SessionLocal()
+        # Ensure admin exists (quick operation)
+        admin_db = SessionLocal()
         try:
-            # Check if column exists (PostgreSQL specific, but 'ADD COLUMN IF NOT EXISTS' handles it in modern PG)
-            # However, IF NOT EXISTS is PG 9.6+. Assuming safe.
-            # If SQLite, this syntax might fail. The project uses PG exclusively per line 32.
-            # Optimizing partial migrations into fewer round-trips
-            # Postgres supports adding multiple columns in one statement
-            try:
-                db.execute(text("""
-                    ALTER TABLE users
-                    ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE,
-                    ADD COLUMN IF NOT EXISTS department VARCHAR(100),
-                    ADD COLUMN IF NOT EXISTS location VARCHAR(100) DEFAULT 'Nigeria',
-                    ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT 'IT Operations',
-                    ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT FALSE,
-                    ADD COLUMN IF NOT EXISTS email_notifications BOOLEAN DEFAULT TRUE,
-                    ADD COLUMN IF NOT EXISTS company_name VARCHAR(255),
-                    ADD COLUMN IF NOT EXISTS industry VARCHAR(100),
-                    ADD COLUMN IF NOT EXISTS avatar_url TEXT;
-                """))
-
-                db.execute(text("ALTER TABLE reviews ADD COLUMN IF NOT EXISTS is_attended BOOLEAN DEFAULT FALSE"))
-
-                # Allow multiple bank accounts per user — drop the unique constraint
-                # on payout_accounts.user_id so each user can store several accounts.
-                # IF EXISTS makes this idempotent (safe to run on every startup).
-                db.execute(text("""
-                    ALTER TABLE payout_accounts
-                    DROP CONSTRAINT IF EXISTS payout_accounts_user_id_key;
-                """))
-
-                # Subscription table updates
-                db.execute(text("""
-                    ALTER TABLE subscriptions
-                    ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(20);
-                """))
-
-                # Initialize subscription_status for existing records
-                # If end_date < now, it's expired. If status is not successful, it's 'Payment failed'.
-                # Otherwise it's active.
-                db.execute(text("""
-                    UPDATE subscriptions
-                    SET subscription_status = CASE
-                        WHEN end_date < NOW() THEN 'expired'
-                        WHEN status NOT IN ('completed', 'active', 'paid', 'successful') THEN 'Payment failed'
-                        ELSE 'active'
-                    END
-                    WHERE subscription_status IS NULL;
-                """))
-
-
-                # Add recommended_tool_stacks to business_analyses if it doesn't exist
-                try:
-                    db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS recommended_tool_stacks JSON"))
-                except Exception as e:
-                    logger.warning(f"Failed to add recommended_tool_stacks to business_analyses: {e}")
-
-                # Add recommendation_mode and single_tool_recommendation to business_analyses
-                try:
-                    db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS recommendation_mode VARCHAR"))
-                    db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS single_tool_recommendation JSON"))
-                except Exception as e:
-                    logger.warning(f"Failed to add recommendation mode columns to business_analyses: {e}")
-
-                try:
-                    db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS flutterwave_card_token VARCHAR(500)"))
-                    db.commit()
-                except Exception as e:
-                    logger.warning(f"Failed to add flutterwave_card_token to users: {e}")
-
-                # Security table fixes
-                try:
-                    # Rename attempt_time to created_at if it exists
-                    db.execute(text("""
-                        DO $$
-                        BEGIN
-                            IF EXISTS (SELECT 1 FROM information_schema.columns
-                                       WHERE table_name='failed_login_attempts' AND column_name='attempt_time') THEN
-                                ALTER TABLE failed_login_attempts RENAME COLUMN attempt_time TO created_at;
-                            END IF;
-                        END $$;
-                    """))
-                except Exception as e:
-                    logger.warning(f"Failed to rename attempt_time: {e}")
-
-                try:
-                    # Add is_active to firewall_rules if it doesn't exist
-                    db.execute(text("ALTER TABLE firewall_rules ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
-                except Exception as e:
-                    logger.warning(f"Failed to add is_active to firewall_rules: {e}")
-
-                try:
-                    # Add created_at and updated_at to system_settings
-                    db.execute(text("""
-                        ALTER TABLE system_settings
-                        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
-                    """))
-                except Exception as e:
-                    logger.warning(f"Failed to add columns to system_settings: {e}")
-
-                # Create user_notifications table
-                try:
-                    db.execute(text("""
-                        CREATE TABLE IF NOT EXISTS user_notifications (
-                            id SERIAL PRIMARY KEY,
-                            user_id INTEGER NOT NULL REFERENCES users(id),
-                            type VARCHAR(50) NOT NULL,
-                            title VARCHAR(255) NOT NULL,
-                            message TEXT NOT NULL,
-                            link VARCHAR(255),
-                            is_read BOOLEAN DEFAULT FALSE,
-                            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                        );
-                        CREATE INDEX IF NOT EXISTS idx_user_notifications_user_unread ON user_notifications(user_id, is_read);
-                    """))
-                except Exception as e:
-                    logger.warning(f"Failed to create user_notifications table: {e}")
-
-            except Exception as e:
-                # If batch fails (e.g. SQLite doesn't support multiple ADD COLUMN), fall back to individual or log
-                logger.warning(f"Batch migration warning (will attempt individual if critical): {e}")
-
-            db.commit()
-            logger.info("✓ Checked/Added columns to users and reviews tables")
-        except Exception as e:
-            logger.warning(f"Migration warning: {e}")
-            db.rollback()
+            await create_admin_user(admin_db)
         finally:
-            db.close()
+            admin_db.close()
 
-        # Create admin user
-        await create_admin_user(SessionLocal())
-
-        # Schema migrations
-        logger.info("Running schema migrations...")
-
-        # Add email column to ip_blacklist if it doesn't exist
-        db = SessionLocal() # Create a new session for this migration
-        try:
-            db.execute(text("""
-                ALTER TABLE ip_blacklist
-                ADD COLUMN IF NOT EXISTS email VARCHAR(255);
-            """))
-            db.commit()
-            logger.info("✓ Added email column to ip_blacklist table")
-        except Exception as e:
-            logger.warning(f"Email column migration: {e}")
-            db.rollback()
-        finally:
-            db.close() # Close the session
-
-        # Execute security setup SQL
-        try:
-            # BASE_DIR is defined below, but we can use it here if we define it earlier
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            sql_file = os.path.join(project_root, "database", "security_setup.sql")
-            if os.path.exists(sql_file):
-                with open(sql_file, "r") as f:
-                    sql_content = f.read()
-
-                db = SessionLocal()
-                try:
-
-                    # First, drop security_metrics_summary if it exists as a table (not a view)
-                    # This allows us to recreate it as a view
-                    try:
-                        db.execute(text("DROP TABLE IF EXISTS security_metrics_summary CASCADE"))
-                        db.commit()
-                        logger.info("Dropped existing security_metrics_summary table if present")
-                    except Exception as drop_error:
-                        logger.debug(f"No table to drop: {drop_error}")
-                        db.rollback()
-
-                    # Execute the entire SQL file as one block to preserve function definitions
-                    # PostgreSQL can handle multiple statements in one execute call
-                    db.execute(text(sql_content))
-                    db.commit()
-                    logger.info("✓ Security views and triggers initialized from security_setup.sql")
-
-                    # Initialize firewall rules
-                    try:
-                        initialize_default_firewall_rules(db)
-                        firewall_manager.load_rules(db)
-                        logger.info("✓ Firewall rules initialized")
-                    except Exception as fw_error:
-                        logger.warning(f"Firewall initialization: {fw_error}")
-
-                except Exception as e:
-                    logger.error(f"Failed to execute security setup SQL: {e}")
-                    db.rollback()
-                finally:
-                    db.close()
-            else:
-                logger.warning(f"security_setup.sql not found at {sql_file}")
-        except Exception as e:
-            logger.error(f"Error during security SQL initialization: {e}")
-
-        # Create community tables
-        db = SessionLocal()
-        try:
-            db.execute(text("""
-                CREATE TABLE IF NOT EXISTS community_channels (
-                    id SERIAL PRIMARY KEY,
-                    name VARCHAR(100) NOT NULL,
-                    slug VARCHAR(100) UNIQUE NOT NULL,
-                    description TEXT,
-                    category VARCHAR(50) NOT NULL DEFAULT 'General',
-                    member_count INTEGER DEFAULT 0,
-                    post_count INTEGER DEFAULT 0,
-                    icon VARCHAR(10),
-                    is_public BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE IF NOT EXISTS channel_members (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    channel_id INTEGER NOT NULL REFERENCES community_channels(id) ON DELETE CASCADE,
-                    is_moderator BOOLEAN DEFAULT FALSE,
-                    joined_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, channel_id)
-                );
-                CREATE TABLE IF NOT EXISTS community_discussions (
-                    id SERIAL PRIMARY KEY,
-                    channel_id INTEGER NOT NULL REFERENCES community_channels(id) ON DELETE CASCADE,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    title VARCHAR(255) NOT NULL,
-                    content TEXT NOT NULL,
-                    tags JSONB,
-                    like_count INTEGER DEFAULT 0,
-                    reply_count INTEGER DEFAULT 0,
-                    view_count INTEGER DEFAULT 0,
-                    is_pinned BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE IF NOT EXISTS discussion_replies (
-                    id SERIAL PRIMARY KEY,
-                    discussion_id INTEGER NOT NULL REFERENCES community_discussions(id) ON DELETE CASCADE,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    content TEXT NOT NULL,
-                    like_count INTEGER DEFAULT 0,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE IF NOT EXISTS discussion_likes (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    discussion_id INTEGER NOT NULL REFERENCES community_discussions(id) ON DELETE CASCADE,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, discussion_id)
-                );
-                CREATE TABLE IF NOT EXISTS community_events (
-                    id SERIAL PRIMARY KEY,
-                    title VARCHAR(255) NOT NULL,
-                    description TEXT,
-                    event_type VARCHAR(50) NOT NULL DEFAULT 'Webinar',
-                    scheduled_at TIMESTAMP WITH TIME ZONE,
-                    duration_minutes INTEGER DEFAULT 60,
-                    max_attendees INTEGER,
-                    attendee_count INTEGER DEFAULT 0,
-                    host_name VARCHAR(100),
-                    meeting_link VARCHAR(500),
-                    is_published BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE IF NOT EXISTS event_registrations (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    event_id INTEGER NOT NULL REFERENCES community_events(id) ON DELETE CASCADE,
-                    registered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, event_id)
-                );
-                CREATE TABLE IF NOT EXISTS community_activities (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    action_type VARCHAR(50) NOT NULL,
-                    target_id INTEGER,
-                    target_type VARCHAR(50),
-                    target_name VARCHAR(255),
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE IF NOT EXISTS saved_items (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    item_id INTEGER NOT NULL,
-                    item_type VARCHAR(50) NOT NULL,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, item_id, item_type)
-                );
-                CREATE INDEX IF NOT EXISTS idx_channel_members_user ON channel_members(user_id);
-                CREATE INDEX IF NOT EXISTS idx_channel_members_channel ON channel_members(channel_id);
-                CREATE INDEX IF NOT EXISTS idx_discussions_channel ON community_discussions(channel_id);
-                CREATE INDEX IF NOT EXISTS idx_discussions_user ON community_discussions(user_id);
-                CREATE INDEX IF NOT EXISTS idx_community_activities_user ON community_activities(user_id);
-                CREATE INDEX IF NOT EXISTS idx_saved_items_user ON saved_items(user_id);
-            """))
-            db.commit()
-            logger.info("✓ Community tables created/verified")
-        except Exception as e:
-            logger.warning(f"Community table migration: {e}")
-            db.rollback()
-
-        # Marketplace tables
-        try:
-            db.execute(text("""
-                CREATE TABLE IF NOT EXISTS marketplace_tools (
-                    id SERIAL PRIMARY KEY,
-                    name VARCHAR(255) NOT NULL,
-                    author VARCHAR(100) NOT NULL,
-                    description TEXT NOT NULL,
-                    full_description TEXT,
-                    category VARCHAR(100) NOT NULL DEFAULT 'AI Tools',
-                    price FLOAT DEFAULT 0.0,
-                    tags JSONB,
-                    features JSONB,
-                    icon_name VARCHAR(50) NOT NULL DEFAULT 'Cpu',
-                    color_theme VARCHAR(30) NOT NULL DEFAULT 'orange',
-                    sales_count INTEGER DEFAULT 0,
-                    rating FLOAT DEFAULT 0.0,
-                    review_count INTEGER DEFAULT 0,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    purchase_url VARCHAR(500),
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
-                );
-                CREATE TABLE IF NOT EXISTS marketplace_purchases (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    tool_id INTEGER NOT NULL REFERENCES marketplace_tools(id) ON DELETE CASCADE,
-                    status VARCHAR(50) NOT NULL DEFAULT 'pending',
-                    amount_paid FLOAT DEFAULT 0.0,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, tool_id)
-                );
-                CREATE TABLE IF NOT EXISTS marketplace_requests (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    title VARCHAR(255) NOT NULL,
-                    description TEXT NOT NULL,
-                    budget VARCHAR(100),
-                    timeline VARCHAR(100),
-                    status VARCHAR(50) NOT NULL DEFAULT 'open',
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-            """))
-            db.commit()
-            logger.info("✓ Marketplace tables created/verified")
-        except Exception as e:
-            logger.warning(f"Marketplace table migration: {e}")
-            db.rollback()
-        finally:
-            db.close()
-
-        # ── Performance indexes ───────────────────────────────────────────────
-        # CREATE INDEX IF NOT EXISTS is idempotent — safe to run every startup.
-        # These cover every missing index found across the whole project:
-        # foreign keys, filter columns, sort columns, and composite lookups.
-        try:
-            db2 = SessionLocal()
-            index_statements = [
-                # business_analyses
-                "CREATE INDEX IF NOT EXISTS idx_ba_user_id ON business_analyses(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_ba_created_at ON business_analyses(created_at DESC)",
-                # subscriptions
-                "CREATE INDEX IF NOT EXISTS idx_sub_user_id ON subscriptions(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_sub_status ON subscriptions(subscription_status)",
-                "CREATE INDEX IF NOT EXISTS idx_sub_created_at ON subscriptions(created_at DESC)",
-                # alerts
-                "CREATE INDEX IF NOT EXISTS idx_alerts_is_active ON alerts(is_active)",
-                "CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts(created_at DESC)",
-                # user_alerts — composite covers both individual and joint lookups
-                "CREATE INDEX IF NOT EXISTS idx_ua_user_id ON user_alerts(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_ua_alert_id ON user_alerts(alert_id)",
-                "CREATE INDEX IF NOT EXISTS idx_ua_composite ON user_alerts(user_id, alert_id)",
-                # user_pinned_alerts
-                "CREATE INDEX IF NOT EXISTS idx_upa_user_id ON user_pinned_alerts(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_upa_alert_id ON user_pinned_alerts(alert_id)",
-                "CREATE INDEX IF NOT EXISTS idx_upa_composite ON user_pinned_alerts(user_id, alert_id)",
-                # referrals
-                "CREATE INDEX IF NOT EXISTS idx_ref_referrer_id ON referrals(referrer_id)",
-                "CREATE INDEX IF NOT EXISTS idx_ref_referred_id ON referrals(referred_user_id)",
-                # commissions
-                "CREATE INDEX IF NOT EXISTS idx_com_user_id ON commissions(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_com_referred_id ON commissions(referred_user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_com_sub_id ON commissions(subscription_id)",
-                "CREATE INDEX IF NOT EXISTS idx_com_status ON commissions(status)",
-                "CREATE INDEX IF NOT EXISTS idx_com_created_at ON commissions(created_at DESC)",
-                # payouts
-                "CREATE INDEX IF NOT EXISTS idx_payout_user_id ON payouts(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_payout_status ON payouts(status)",
-                # payout_accounts
-                "CREATE INDEX IF NOT EXISTS idx_pa_user_id ON payout_accounts(user_id)",
-                # user_notifications
-                "CREATE INDEX IF NOT EXISTS idx_un_user_id ON user_notifications(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_un_created_at ON user_notifications(created_at DESC)",
-                # insights
-                "CREATE INDEX IF NOT EXISTS idx_insights_is_active ON insights(is_active)",
-                "CREATE INDEX IF NOT EXISTS idx_insights_created_at ON insights(created_at DESC)",
-                # user_insights
-                "CREATE INDEX IF NOT EXISTS idx_ui_user_id ON user_insights(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_ui_insight_id ON user_insights(insight_id)",
-                # user_pinned_insights
-                "CREATE INDEX IF NOT EXISTS idx_upi_user_id ON user_pinned_insights(user_id)",
-                # reviews
-                "CREATE INDEX IF NOT EXISTS idx_reviews_user_id ON reviews(user_id)",
-                # conversations
-                "CREATE INDEX IF NOT EXISTS idx_conv_review_id ON conversations(review_id)",
-                "CREATE INDEX IF NOT EXISTS idx_conv_is_read ON conversations(is_read)",
-                # users — filter/sort columns
-                "CREATE INDEX IF NOT EXISTS idx_users_sub_status ON users(subscription_status)",
-                "CREATE INDEX IF NOT EXISTS idx_users_is_active ON users(is_active)",
-                "CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC)",
-                # community
-                "CREATE INDEX IF NOT EXISTS idx_cm_user_id ON channel_members(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_cm_channel_id ON channel_members(channel_id)",
-                "CREATE INDEX IF NOT EXISTS idx_cd_channel_id ON community_discussions(channel_id)",
-                "CREATE INDEX IF NOT EXISTS idx_cd_user_id ON community_discussions(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_dr_discussion_id ON discussion_replies(discussion_id)",
-                "CREATE INDEX IF NOT EXISTS idx_dl_user_id ON discussion_likes(user_id)",
-                # marketplace
-                "CREATE INDEX IF NOT EXISTS idx_mp_user_id ON marketplace_purchases(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_mp_tool_id ON marketplace_purchases(tool_id)",
-                "CREATE INDEX IF NOT EXISTS idx_mp_status ON marketplace_purchases(status)",
-                # saved items
-                "CREATE INDEX IF NOT EXISTS idx_si_user_id ON saved_items(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_si_composite ON saved_items(user_id, item_type)",
-                # missions
-                "CREATE INDEX IF NOT EXISTS idx_um_user_id ON user_missions(user_id)",
-                # commission_summaries
-                "CREATE INDEX IF NOT EXISTS idx_cs_user_id ON commission_summaries(user_id)",
-            ]
-            for stmt in index_statements:
-                try:
-                    db2.execute(text(stmt))
-                except Exception:
-                    pass  # Index already exists or table missing — skip silently
-            db2.commit()
-            logger.info(f"✓ Performance indexes verified ({len(index_statements)} statements)")
-        except Exception as idx_err:
-            logger.warning(f"Index creation batch failed: {idx_err}")
-        finally:
-            try: db2.close()
-            except Exception: pass
-
-        # Initialize Redis/in-memory cache
+        # Our fixed cache init (no blocking Redis attempt when REDIS_URL absent)
         await init_cache()
 
+        # Fire the *expensive* schema work (community tables, marketplace tables,
+        # security_setup.sql, 30+ indexes, subscription backfills, etc.) in the
+        # background. This is the key change that prevents the startup handler
+        # from hanging after init_db().
+        asyncio.create_task(run_heavy_schema_migrations())
+
+        logger.info("✓ Fast-path startup finished. Heavy migrations & index builds are running in the background.")
+        # Returning from here lets uvicorn log "Application startup complete"
+        # and makes /health (and all routers) reachable.
+
     except Exception as e:
-        logger.error(f"❌ Database initialization failed: {e}")
+        logger.error(f"❌ Critical startup failure: {e}")
         raise
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on application shutdown"""
+    """
+    FastAPI shutdown handler. Currently only responsible for closing the
+    (optional) Redis connection used by the cache layer.
+    """
     await close_cache()
 
 # Include API routers (specific routes)

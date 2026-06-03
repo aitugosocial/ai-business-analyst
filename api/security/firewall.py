@@ -400,6 +400,12 @@ firewall_manager = FirewallManager()
 
 
 def initialize_default_firewall_rules(db: Session):
+    """
+    Seed the firewall_rules table with a baseline set of protective rules
+    (IP reputation, rate limiting, known bad actors, etc.) if the table is
+    empty. Called from the background schema migration task at startup.
+    Idempotent.
+    """
     """Initialize default firewall rules or update existing ones with latest patterns"""
     try:
         default_rules = [
