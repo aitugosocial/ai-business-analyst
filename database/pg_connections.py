@@ -63,28 +63,26 @@ print("✓ Connecting to PostgreSQL database...")
 
 try:
     # Create PostgreSQL engine
-    # Connection pooling settings optimized for cloud deployments like Neon/Railway
-    # pool_recycle: Set to 120 (2 mins) because Neon's proxy/pooler often terminates
-    # idle connections after 5 minutes. Recycling sooner prevents "SSL SYSCALL error: EOF detected".
+    # Pool settings work for both Neon and Railway PostgreSQL.
+    # channel_binding is intentionally omitted: Neon required it but Railway's
+    # standard PostgreSQL does not support it and rejects connections that send it.
     engine = create_engine(
         DATABASE_URL,
         pool_pre_ping=True,       # Health-check connection before each use
-        pool_recycle=90,          # Recycle before Neon's 300s idle timeout
+        pool_recycle=300,         # Railway connections are stable; 5 min recycle is safe
         pool_timeout=20,          # Fail fast — don't block the request for 30 s
-        pool_size=15,             # Raised from 10: supports more concurrent requests
-        max_overflow=30,          # Raised from 20: burst headroom for heavy pages
+        pool_size=15,
+        max_overflow=30,
         echo=False,
-        # execution_options for statement-level timeout — prevents runaway queries
-        # from holding a connection and starving other requests.
         execution_options={"options": "-c statement_timeout=15000"},  # 15 s hard cap
         connect_args={
             "sslmode": "require",
-            "channel_binding": "require",
+            # channel_binding NOT set — Railway does not support it (Neon-specific)
             "keepalives": 1,
-            "keepalives_idle": 20,   # Reduced from 30: detect drops faster
-            "keepalives_interval": 5,
-            "keepalives_count": 3,
-            "connect_timeout": 10,   # Fail connection attempt after 10 s
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+            "connect_timeout": 10,
         },
     )
 

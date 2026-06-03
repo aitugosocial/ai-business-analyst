@@ -269,34 +269,35 @@ class AgenticAnalyzer:
         or any other clearly unethical or criminal purpose.
         Legitimate business challenges — even edgy ones — are SAFE.
         """
-        prompt = f"""You are a safety filter for a business analysis engine.
-Your job: determine whether the following user query is a legitimate business challenge.
+        prompt = f"""You are the safety filter for Lavoo, a business diagnostic and decision engine serving solo founders, small business owners, creators, and consultants worldwide.
 
 USER QUERY: "{user_query}"
 
-A query is UNSAFE if it is asking for help with:
-- Illegal activity (fraud, tax evasion, money laundering, bribery, counterfeiting)
-- Hacking, data theft, or system intrusion
-- Harm to individuals, groups, or competitors
-- Weapons, drugs, or controlled substance trade
-- Exploitation of workers, children, or vulnerable people
-- Any clearly criminal or unethical purpose
+TASK: Determine whether this query is a legitimate business challenge.
 
-A query is SAFE if it is:
-- A real business challenge, even if the business is struggling
-- Questions about marketing, operations, growth, hiring, finance, tech
-- Questions about competitive strategy, pivoting, or recovery
-- Questions that sound edgy but have a legitimate business interpretation
+SAFE — allow through:
+- Any real business problem across any industry, market, or stage: marketing, growth, operations, hiring, finance, product, technology, pricing, partnerships, competitive strategy, pivoting, recovery, monetization, market entry, positioning, unit economics, cash flow, scaling, sunsetting
+- Businesses that are struggling, pre-revenue, in turnaround, or in legal but stigmatized industries (adult platforms, cannabis where legal, gambling, debt collection, nightlife, controversial content)
+- Queries that sound aggressive but have clear business intent ("crush competitors" = competitive strategy, "steal market share" = positioning, "kill my old product" = sunsetting, "dominate the market" = market leadership)
 
-OUTPUT FORMAT (JSON, no markdown):
+UNSAFE — block:
+- Financial crime: fraud, tax evasion, money laundering, bribery, counterfeiting
+- Unauthorized access: hacking, data theft, scraping protected systems, phishing, identity fraud
+- Harm: deliberate harm to individuals, employees, competitors, or the public
+- Illegal trade: weapons, drugs, controlled substances, black-market operations
+- Exploitation: worker exploitation, child labor, trafficking, coercion
+
+DECISION RULES:
+- Default to SAFE when ambiguous. Founders describe problems in raw, frustrated, unpolished language — that is signal, not risk.
+- Only block when harmful intent is the ONLY plausible interpretation. One legitimate reading is enough to pass.
+- Never penalize poor grammar, slang, profanity, frustration, or unconventional framing.
+
+Return JSON only, no markdown:
 {{
-    "is_safe": true or false,
-    "reason": "One sentence explaining why it is or isn't safe",
-    "suggestions": ["Alternative framing 1", "Alternative framing 2"]
-}}
-
-Only return is_safe: false if you are CERTAIN the query is harmful or illegal.
-When in doubt, return is_safe: true."""
+    "is_safe": true | false,
+    "reason": "One sentence. If safe: the legitimate business framing. If unsafe: the specific violation category.",
+    "suggestions": []
+}}"""
 
         try:
             response = await self._llm(
@@ -336,40 +337,52 @@ When in doubt, return is_safe: true."""
                 "what_to_stop": str
             }
         """
-        prompt = f"""You are a senior business strategist with deep expertise across industries — retail, SaaS, services, manufacturing, healthcare, e-commerce, fintech, hospitality, agriculture, and more.
+        prompt = f"""You are operating at the level of a senior partner at McKinsey, BCG, or Bain — but optimized for solo founders and small businesses, not Fortune 500 companies. You combine analytical rigor with execution specificity that a one-person or small-team business actually needs.
+
+You have pattern recognition across thousands of businesses in retail, SaaS, services, manufacturing, healthcare, e-commerce, fintech, hospitality, agriculture, creator economy, agencies, consulting, education, and real estate. You have seen this problem before — in different industries, at different scales — and you know what the root cause actually is.
+
+PERSONA RULE: Write every text field in SECOND PERSON — say "you", "your", "you are". NEVER say "the user", "the founder", "the owner", "this person", or any third-person reference. You are speaking directly to this person as their senior strategic advisor.
 
 USER CHALLENGE: "{user_query}"
 
-Your task: Diagnose THE SINGLE root-cause bottleneck that, if fixed, would unlock the most progress for this person.
+TASK: Diagnose THE SINGLE root-cause bottleneck that, if fixed, would unlock the most forward progress right now.
 
-DIAGNOSIS FRAMEWORK (apply in order):
-1. What is the user actually trying to achieve? What result do they want?
-2. What is the REAL constraint — not the symptom they described, but the underlying cause behind it?
-3. What hard evidence or pattern in their description points to this root cause?
-4. What are the measurable consequences of leaving this bottleneck unaddressed for 90 days?
-5. What is the ONE high-leverage action that addresses the root cause directly?
-6. What is one common but wasteful behavior this person should immediately stop?
+DIAGNOSIS PROTOCOL:
+
+STEP 1 — DESIRED OUTCOME: What measurable result are you actually trying to achieve? Strip away the language — identify the core metric: revenue target, conversion rate, retention, time freedom, profitability threshold, market position.
+
+STEP 2 — ISSUE TREE: Map the causal chain from the symptom described to the structural root cause. Most founders describe symptoms ("not enough leads"). Your job is to identify which part of the structure is the binding constraint. Apply the 5 Whys until you reach something the founder can directly change.
+
+STEP 3 — EVIDENCE ANCHOR: What specific detail in the description confirms this root cause? If the input is sparse, explicitly state your inference: "Based on [detail], I am inferring [structural cause] because [reasoning]."
+
+STEP 4 — PATTERN RECOGNITION: Name the business archetype this matches. Example: "This is the classic 'leaky bucket' pattern — you are investing in acquisition while your retention pipeline has a structural break."
+
+STEP 5 — MISDIAGNOSIS TRAP: What would 90% of advisors, courses, and generic content wrongly diagnose? Name it and explain why it is wrong FOR YOUR SPECIFIC SITUATION. This is the insight that separates $50K consulting from free advice.
+
+STEP 6 — 90-DAY COST MODEL: If you ignore this bottleneck for 90 days, model the cost across: (a) direct loss — revenue or customers forfeited, (b) compounding damage — how the problem gets WORSE over time, not just persists, (c) opportunity cost — what you CANNOT build while this consumes capacity. Use calibrated ranges from comparable businesses.
+
+STEP 7 — UNIT ECONOMICS IMPACT: How does this bottleneck distort your unit economics? Connect the root cause to CAC, LTV, payback period, gross margin, or contribution margin.
 
 CRITICAL OUTPUT RULES:
-- ONE bottleneck only. Not a list, not "it could be X or Y". Commit to the single most important one.
-- The bottleneck title must name the specific business problem (e.g. "No Repeatable Lead Generation System", not "Marketing Issues")
-- Description must identify the gap between current state and required state. Be concrete.
-- Consequence must quantify the business impact (lost revenue, churn, missed opportunities) in specific terms.
-- strategic_priority must name a specific, actionable focus area — not a platitude.
-- what_to_stop must name a specific behavior or activity to eliminate — not a vague instruction.
-- RECOMMENDATION MODE RULE:
-  - "single_tool" = bottleneck can be directly solved by ONE AI/SaaS tool being adopted (e.g. a CRM, writing assistant, analytics tool). Tools do NOT need to pass data between each other.
-  - "automation_stack" = bottleneck requires MULTIPLE tools working in sequence with data handoffs (e.g. CRM → email automation → analytics). One tool alone is insufficient.
+- ONE bottleneck only. Commit. Do not hedge.
+- Title names the broken or missing SYSTEM — not a symptom. Good: "No Post-Purchase Activation Sequence to Convert One-Time Buyers". Bad: "Sales Issues".
+- Description: 3 sentences, second person, states the structural gap between current state and required state.
+- Consequence: 3 sentences, second person, models 90-day cost with calibrated ranges.
+- strategic_priority: names a SPECIFIC MECHANISM to build, not a category. Good: "Build a 3-email post-purchase sequence that fires within 24 hours and drives second transaction within 14 days." Bad: "Focus on retention."
+- what_to_stop: names a SPECIFIC BEHAVIOR and its cost. "Stop redesigning your landing page before you have 10 paying customers — every hour on polish before product-market fit produces zero revenue signal."
+- RECOMMENDATION MODE:
+  - "single_tool" = ONE AI/SaaS tool directly solves this, no data handoffs needed
+  - "automation_stack" = requires MULTIPLE tools in sequence with data handoffs
 
 OUTPUT FORMAT (JSON only, no markdown):
 {{
     "primary_bottleneck": {{
-        "title": "Specific problem title (5-10 words)",
-        "description": "What is broken and why — be specific about the gap (2-3 sentences)",
-        "consequence": "What happens in 90 days if this isn't fixed — name the business cost (1-2 sentences)"
+        "title": "Specific structural problem title (5-10 words) — names the missing or broken system",
+        "description": "3 sentences in second person. States the structural gap, the evidence from your situation, and the pattern archetype this matches.",
+        "consequence": "3 sentences in second person. Models 90-day cost: direct loss + compounding damage + opportunity cost. Include calibrated ranges."
     }},
-    "strategic_priority": "The single most important thing to focus on this month (1 specific sentence)",
-    "what_to_stop": "The specific wasteful action to eliminate immediately (1 direct sentence)",
+    "strategic_priority": "One sentence in second person naming the specific mechanism or system to build — concrete enough to start this week.",
+    "what_to_stop": "One sentence in second person naming the specific behavior to eliminate and its direct cost.",
     "recommendation_mode": "single_tool or automation_stack"
 }}"""
 
@@ -410,31 +423,44 @@ OUTPUT FORMAT (JSON only, no markdown):
         """
         primary_title = primary_result["primary_bottleneck"]["title"]
 
-        prompt = f"""You are a senior business strategist mapping the constraint landscape around a diagnosed bottleneck.
+        prompt = f"""You are mapping the full constraint landscape around a diagnosed primary bottleneck — the same analysis a McKinsey engagement team produces in their "key issues" workstream, focused on the specific dynamics of a solo founder or small business.
+
+Your job is not to list more problems. It is to identify the forces that create a COMPOUNDING TRAP — the reason this bottleneck is harder to solve than it appears, and why previous attempts to fix it have likely stalled.
+
+PERSONA RULE: Write every text field in SECOND PERSON — say "you", "your". NEVER use third-person references.
 
 USER CHALLENGE: "{user_query}"
 PRIMARY BOTTLENECK: "{primary_title}"
 
-Your task: Identify the 2-4 secondary constraints that make the primary bottleneck WORSE or prevent the user from fixing it.
+TASK: Identify 2-4 secondary constraints that compound your primary bottleneck or structurally block you from solving it.
 
-CONSTRAINT IDENTIFICATION RULES:
-1. Secondary constraints COMPOUND the primary — they either feed into it or reduce the user's capacity to solve it
-2. Each constraint must be DISTINCT — no overlaps with each other or with the primary bottleneck
-3. Each constraint must be grounded in something the user described or that is a predictable consequence of their situation
-4. Order by impact severity (most damaging to least)
-5. If the situation is straightforward, return exactly 2. If complex, return 3-4.
-6. Each description must explain: (a) what the constraint IS, and (b) how it makes the primary bottleneck harder to solve
+CONSTRAINT ANALYSIS FRAMEWORK:
+
+1. AMPLIFICATION TEST: Each constraint must make the primary bottleneck measurably WORSE through a specific causal mechanism. Name the mechanism — not just the correlation. "Your shallow onboarding data limits the quality of your diagnosis output, which means users receive generic recommendations, which accelerates their conclusion that the product is not personalized enough to justify returning" — not "your onboarding needs work."
+
+2. DISTINCTNESS TEST: Each constraint must be structurally independent. If removing one would automatically resolve another, merge them. No conceptual overlap with each other or the primary.
+
+3. EVIDENCE TEST: Ground each constraint in something you explicitly described OR a structural consequence that necessarily follows from your situation. If inferring, state the inference chain.
+
+4. CAPACITY DRAIN: At least one constraint should address your CAPACITY to solve the primary bottleneck — the person who must fix the problem is also running every other function. Identify where this capacity drain hits hardest.
+
+5. SEVERITY ORDERING: Rank by compounding velocity — the constraint that accelerates damage fastest goes first.
+
+Return exactly 2 for focused single-dimension challenges. Return 3-4 only when the landscape is genuinely multi-dimensional and each adds a distinct causal pathway.
 
 OUTPUT FORMAT (JSON only, no markdown):
 {{
     "secondary_constraints": [
         {{
-            "id": 1,
-            "title": "Specific constraint name (5-8 words)",
-            "description": "What the constraint is and how it compounds the primary bottleneck (2 sentences)"
+            "id": 2,
+            "title": "Specific constraint name describing a structural gap or behavioral pattern (5-8 words)",
+            "description": "3 sentences in second person. (a) What the constraint IS — the specific gap or pattern. (b) The CAUSAL MECHANISM by which it compounds your primary bottleneck — step by step, not just 'it makes things worse'. (c) What happens if this constraint is left unaddressed while you attempt to fix the primary bottleneck."
         }}
     ]
-}}"""
+}}
+
+Number constraints starting at 2 (your primary bottleneck is always #1).
+No markdown, no dashes, no bullet prefixes in any text value."""
 
         try:
             response = await self._llm(
@@ -639,6 +665,206 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         return plan
 
     # =========================================================================
+    # GLOBAL TOOLKIT ASSIGNMENT (replaces per-plan sequential loop)
+    # =========================================================================
+
+    async def _assign_toolkits_globally(
+        self, action_plans: list[dict], user_query: str
+    ) -> list[dict]:
+        """
+        Assign AI tools to action plans in a single globally-aware LLM pass.
+
+        Why global assignment instead of per-plan loops:
+        - Per-plan searches return overlapping candidates (related plans → related tools)
+        - Even sequential filtering can't prevent the second-best tool from being
+          semantically identical to the first across multiple plans
+        - One LLM call that sees ALL plans + ALL candidates simultaneously can make
+          globally optimal, non-repeating assignments — no two plans get the same tool
+
+        Flow:
+        1. Search for candidates per plan using ONLY that plan's steps (not user_query)
+        2. Pool all unique candidates into a single deduplicated catalog
+        3. One LLM call assigns each tool to the one plan it fits best
+        4. Attach results back to plan objects
+        """
+        needy_indices = [
+            i for i, p in enumerate(action_plans) if p.get("needs_ai_tool", False)
+        ]
+        for plan in action_plans:
+            plan.pop("needs_ai_tool", None)
+
+        if not needy_indices:
+            return action_plans
+
+        # ── Step 1: per-plan semantic search (action-specific, not user_query-biased) ──
+        all_tools: dict[str, dict] = {}  # canonical tool name → tool record
+        plan_candidate_names: dict[int, list[str]] = {}  # plan_idx → tool names from search
+
+        for plan_idx in needy_indices:
+            plan = action_plans[plan_idx]
+            what_to_do_list = plan.get("what_to_do", []) if isinstance(plan.get("what_to_do"), list) else []
+            steps_text = " ".join(what_to_do_list)
+            action_description = f"{plan['title']}: {steps_text}"
+
+            candidates = await self._search_ai_tools(
+                user_query=user_query,
+                action_description=action_description,
+                top_k=12,
+            )
+            names_for_plan: list[str] = []
+            for t in candidates:
+                name = t["tool_name"]
+                if name not in all_tools:
+                    all_tools[name] = t
+                names_for_plan.append(name)
+            plan_candidate_names[plan_idx] = names_for_plan
+
+        if not all_tools:
+            return action_plans
+
+        # ── Step 2: build a single prompt with all plans + all tools ──
+        plans_section_parts: list[str] = []
+        for plan_idx in needy_indices:
+            plan = action_plans[plan_idx]
+            what_to_do_list = plan.get("what_to_do", []) if isinstance(plan.get("what_to_do"), list) else []
+            numbered_steps = "\n".join(f"   {i+1}. {s}" for i, s in enumerate(what_to_do_list))
+            # List which tools the search returned for this plan (as a hint)
+            relevant = ", ".join(plan_candidate_names.get(plan_idx, [])[:6])
+            plans_section_parts.append(
+                f"PLAN {plan_idx + 1}: {plan['title']}\n"
+                f"  Steps:\n{numbered_steps}\n"
+                f"  Semantically relevant candidates for this plan: {relevant}"
+            )
+        plans_section = "\n\n".join(plans_section_parts)
+
+        tools_section_parts: list[str] = []
+        for name, t in all_tools.items():
+            url = t.get("url") or t.get("website") or "unknown"
+            tools_section_parts.append(
+                f"- {name} | URL: {url}\n  {t.get('description', '')[:200]}"
+            )
+        tools_section = "\n".join(tools_section_parts)
+
+        plan_ids_str = ", ".join(str(i + 1) for i in needy_indices)
+
+        prompt = f"""You are a tool-matching specialist operating with the precision of a technology due diligence team. You match functional capabilities to tools based on verified feature alignment — not keyword similarity, not brand recognition, not marketing claims, not popularity.
+
+Your output appears directly on action plan cards that a solo founder will use to make decisions. Every word must be specific, concrete, and unique to the plan it accompanies.
+
+PERSONA RULE: Write "what_it_helps" and "why_this_tool" in SECOND PERSON — "you", "your". Never "the user", "the founder", or any third-person reference.
+
+GLOBAL CONSTRAINT: Each tool can be assigned to AT MOST ONE plan across the entire analysis. Once assigned, that tool is locked. If the same tool is the best match for multiple plans, assign it to the plan where it covers an "essential" automation need over a convenience feature, and among equals, to the higher-ranked plan (lower number = higher priority).
+
+USER BUSINESS CHALLENGE: "{user_query}"
+
+ACTION PLANS THAT NEED TOOLS (plans {plan_ids_str}):
+{plans_section}
+
+FULL TOOL CATALOG (from semantic search — use ONLY names from this list):
+{tools_section}
+
+MATCHING PROTOCOL:
+
+STEP 1 — FEATURE-LEVEL MATCH
+For each plan, identify tools in the catalog whose DOCUMENTED CORE FUNCTION directly performs a capability required by a named step. Not "this tool is in the same category" — the tool must have a specific feature that executes the required function.
+
+STEP 2 — SPECIFICITY OF DESCRIPTIONS
+"what_it_helps" must name the EXACT step number and describe what the tool does for THAT step in one concrete sentence. This text appears on the plan card — it must be unique to these steps, not a generic product description.
+Good: "Step 2: This tool sends your weekly re-engagement sequence automatically, personalised with each contact's last action, so you never manually write or send a follow-up again."
+Bad: "A powerful automation platform."
+
+"why_this_tool" must name the SPECIFIC FEATURE or function — by name where possible — that makes this the right choice for these steps. One sentence, no generic claims.
+Good: "Its visual automation builder lets you create a triggered email sequence with conditional branching in under 20 minutes, no code required."
+Bad: "It is user-friendly and widely used."
+
+STEP 3 — ASSIGNMENT RULES
+1. Each tool can be assigned to AT MOST ONE plan. No repeats across the analysis.
+2. Only assign a tool if it directly addresses a named step. Do NOT assign based on general category fit.
+3. If no tool in the catalog genuinely fits a plan's specific steps, omit that plan from the assignments array.
+4. Return the tool's URL from the catalog exactly as shown.
+5. Do NOT start any text value with a dash, bullet, or em dash.
+
+OUTPUT FORMAT (JSON only, no markdown):
+{{
+  "assignments": [
+    {{
+      "plan_index": 1,
+      "tool_name": "Exact name from the catalog",
+      "website": "Exact URL from the catalog or null",
+      "what_it_helps": "Step N: one concrete sentence in second person about what this tool does for that specific step — unique to this plan.",
+      "why_this_tool": "One sentence naming the specific feature or function that makes this the right fit for these steps — no generic claims."
+    }}
+  ]
+}}
+
+Omit any plan where no catalog tool genuinely fits its specific steps."""
+
+        try:
+            response = await self._llm(
+                model=self.fast_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=900,
+            )
+            raw = response.choices[0].message.content.strip()
+            if "```json" in raw:
+                raw = raw.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw:
+                raw = raw.split("```")[1].split("```")[0].strip()
+            parsed = _safe_json_loads(raw)
+            assignments: list[dict] = parsed.get("assignments", []) or []
+
+        except Exception as e:
+            logger.warning(f"Global toolkit assignment failed: {e} — plans will have no toolkit")
+            assignments = []
+
+        # ── Step 3: normalised name map + used-tool guard ──
+        canonical_map: dict[str, str] = {n.strip().lower(): n for n in all_tools}
+        assigned_tool_names: set[str] = set()
+        assigned_plans: set[int] = set()
+
+        for assignment in assignments:
+            raw_plan_idx = int(assignment.get("plan_index", 0)) - 1  # 1-based → 0-based
+            if raw_plan_idx not in needy_indices:
+                continue
+            if raw_plan_idx in assigned_plans:
+                continue  # plan already got a tool
+
+            llm_name = (assignment.get("tool_name") or "").strip()
+            canonical = canonical_map.get(llm_name.lower())
+            if not canonical:
+                continue  # name didn't match any candidate
+            if canonical in assigned_tool_names:
+                continue  # tool already used by another plan
+
+            assigned_tool_names.add(canonical)
+            assigned_plans.add(raw_plan_idx)
+
+            toolkit = {
+                "tool_name": canonical,
+                "website": assignment.get("website") or all_tools[canonical].get("url") or None,
+                "what_it_helps": assignment.get("what_it_helps", ""),
+                "why_this_tool": assignment.get("why_this_tool", ""),
+            }
+            action_plans[raw_plan_idx]["toolkit"] = toolkit
+            logger.info(
+                f"Assigned '{canonical}' → plan {raw_plan_idx + 1} '{action_plans[raw_plan_idx]['title'][:40]}'"
+            )
+
+        # Plans not assigned get an explicit null toolkit
+        for plan_idx in needy_indices:
+            if plan_idx not in assigned_plans:
+                action_plans[plan_idx]["toolkit"] = None
+                logger.info(
+                    f"No tool assigned to plan {plan_idx + 1} '{action_plans[plan_idx]['title'][:40]}'"
+                )
+
+        logger.info(
+            f"Global assignment complete: {len(assigned_plans)}/{len(needy_indices)} plans received a tool"
+        )
+        return action_plans
+
+    # =========================================================================
     # STAGE 3: ACTION PLANS AGENT
     # =========================================================================
 
@@ -670,44 +896,87 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         primary_title = primary_result["primary_bottleneck"]["title"]
         constraints = json.dumps([c["title"] for c in secondary_result["secondary_constraints"]])
 
-        prompt_actions = f"""You are a senior business strategist building a ranked action plan. You think in first principles and prioritize leverage over effort.
+        prompt_actions = f"""You are a senior strategist building a ranked action plan with the analytical rigor of BCG's "value creation roadmap" and the execution specificity that a solo founder with 2–3 hours per day actually needs.
+
+Your strategic advantage over traditional consulting: you do not present options and let the client decide. You commit to the highest-leverage sequence and explain why the alternatives are inferior. A $50,000 consulting deck gives you 5 equally-weighted recommendations. This analysis gives you a ranked stack where #1 is the clear priority and the reasoning for the ranking is transparent.
+
+GLOBAL QUALITY STANDARDS — every field must pass ALL of these:
+1. PERSONA: Second person only — "you", "your". NEVER "the user", "the founder", "the owner", or any third-person reference.
+2. SPECIFICITY: Passes the intern test — a smart person with zero context about your business executes this correctly on first attempt.
+3. QUANTIFICATION: Every impact statement names a specific metric, a calibrated directional range (e.g. "15–30%"), and a timeframe ("within 45 days"). No vague language like "significant improvement" or "better results".
+4. COMMITMENT: Never hedge with "consider", "might", "could", or "it depends". Commit to the recommendation and state the assumption if context is thin.
+5. CONTRARIAN: For every plan, name what conventional advice would tell you to do — and explain in one sentence why that is wrong for your specific situation.
+6. FORMATTING: Do NOT start any list item, step, or task with a dash (-), bullet (•), or em dash (—). Write plain complete sentences only.
 
 USER CHALLENGE: "{user_query}"
 PRIMARY BOTTLENECK: "{primary_title}"
 SECONDARY CONSTRAINTS: {constraints}
 
-Your task: Create 3-5 action plans that directly dismantle the primary bottleneck. Rank them by leverage — the plan that will produce the fastest measurable result goes first.
+TASK: Create 3–5 action plans that directly dismantle your primary bottleneck. Rank by leverage — the plan that produces the fastest measurable business result goes first.
 
-ACTION PLAN RULES:
-1. RANK by leverage, not by chronological order or alphabetical order
-2. Every action must address the PRIMARY BOTTLENECK directly — not a secondary constraint
-3. "what_to_do" must be a LIST of 3-5 specific, executable steps the user can act on today. Each step is a complete sentence. Do NOT be vague (no "research options" or "consider doing X"). Name the exact action.
-4. "why_it_matters" must be a LIST of 2-3 business impact statements. Each statement names a specific outcome: revenue gained, cost saved, churn reduced, speed increased, risk eliminated. Complete sentences.
-5. "effort_level" = one of: Low (days), Medium (1-2 weeks), or High (weeks to months)
-6. "needs_ai_tool" = true ONLY if an AI or SaaS tool would meaningfully accelerate or automate a specific step in what_to_do. false if this is purely a human/process action.
-7. Keep action titles specific (e.g. "Build a Weekly Referral Outreach System" not "Improve Marketing")
-8. Maximum 5 action plans. Minimum 3.
-9. "exclusions_note" must name the strategies you considered but excluded, and give a concrete reason for each exclusion
-10. FORMATTING: Do NOT start any list item with a dash (-), bullet, or em dash. Write plain complete sentences only.
+RANKING METHODOLOGY (BCG impact-feasibility matrix, adapted for solo founders):
+- IMPACT VELOCITY: How fast does measurable evidence appear? (Not "how big is the eventual impact" — how fast does the SIGNAL appear?)
+- LEVERAGE MULTIPLIER: Does completing this make subsequent plans easier, faster, or more valuable? Plans that unlock other plans rank higher.
+- EXECUTION INDEPENDENCE: Can you start this alone, this week, with no external dependencies?
+- REVERSIBILITY: Can you course-correct cheaply if the first approach needs adjustment?
+Rank 1 = highest impact velocity × leverage multiplier, executable independently, with course-correction optionality.
+Do NOT rank by effort. A high-effort plan can be rank 1 if it unlocks everything downstream.
+
+PER-PLAN REQUIREMENTS:
+
+"what_to_do" — 3–5 steps in second person. Each step contains:
+(a) The EXACT action to take
+(b) The SPECIFIC output or deliverable it produces
+(c) The METRIC or observable signal that confirms it is done correctly
+Steps are SEQUENTIAL — each builds on the previous and assumes its completion.
+Good: "Write a 3-question post-purchase survey targeting the moment of highest engagement — the confirmation page — using a free form tool, and set a 24-hour email trigger to send to every buyer. Review the first 20 responses to identify the top two unmet expectations."
+Bad: "Collect customer feedback."
+
+"why_it_matters" — 2–3 impact statements in second person:
+At least one must name a UNIT ECONOMICS metric (CAC, LTV, gross margin, payback period, contribution margin) with a calibrated range and timeframe.
+At least one must name a COMPOUNDING effect — what becomes possible only after this action is complete.
+Good: "You will increase repeat purchase rate by 18–35% within 60 days, based on patterns in comparable direct-to-consumer businesses with similar first-purchase AOV."
+Bad: "You will improve customer loyalty."
+
+"failure_mode" — One sentence in second person naming the single most common reason this plan stalls, written as a direct warning:
+"You will be tempted to [specific trap] because [specific reason] — when this happens, [specific corrective action]."
+
+"time_to_first_signal" — The specific leading indicator that confirms this plan is working, with a timeframe and a diagnostic fallback:
+"First signal in X days — when you observe [specific measurable event]. If you do not see this signal by day Y, [specific diagnostic action]."
+
+"conventional_vs_this" — One sentence each:
+"conventional": what standard advice (blogs, courses, generic consultants) would recommend.
+"why_wrong": why that advice is wrong or suboptimal for your specific situation and stage.
+
+"needs_ai_tool": true ONLY if a tool would meaningfully automate or sustain a specific step that manual execution cannot maintain beyond week 1. false for human judgment, one-time, or infrequent actions.
 
 OUTPUT FORMAT (JSON only, no markdown):
 {{
     "action_plans": [
         {{
             "id": 1,
-            "title": "Specific action title (5-10 words)",
+            "title": "Specific title naming what is being built, fixed, or created (5-10 words) — not a category",
             "what_to_do": [
-                "Step 1: specific, actionable, named action (no dashes, no bullet prefixes)",
-                "Step 2: specific, actionable, named action (no dashes, no bullet prefixes)"
+                "Step 1 in second person: exact action + specific output + completion signal.",
+                "Step 2 building on step 1: exact action + specific output + completion signal.",
+                "Step 3 building on step 2: exact action + specific output + completion signal."
             ],
             "why_it_matters": [
-                "Specific business impact with a named outcome"
+                "You will [specific unit economics outcome with calibrated range and timeframe].",
+                "Once complete, this unlocks [specific compounding effect that was previously blocked].",
+                "This shifts your [specific metric] by [specific directional change] within [specific timeframe]."
             ],
-            "effort_level": "Low",
+            "failure_mode": "You will be tempted to [specific trap] because [reason] — when this happens, [corrective action].",
+            "time_to_first_signal": "First signal in X days — when you observe [specific measurable event]. If absent by day Y, [diagnostic action].",
+            "conventional_vs_this": {{
+                "conventional": "Standard advice would tell you to [common recommendation].",
+                "why_wrong": "That is wrong for your situation because [specific reason tied to your stage and context]."
+            }},
+            "effort_level": "Low or Medium or High",
             "needs_ai_tool": false
         }}
     ],
-    "exclusions_note": "Name 2-3 strategies you excluded and exactly why each was deprioritized"
+    "exclusions_note": "Strategies considered but excluded: [name each with a concrete reason tied to your specific situation, stage, and constraints]."
 }}"""
 
         try:
@@ -727,23 +996,16 @@ OUTPUT FORMAT (JSON only, no markdown):
             result = _safe_json_loads(result_text)
             action_plans = result["action_plans"]
 
-            # Attach toolkits sequentially so the shared `used_tool_names` set
-            # correctly prevents any tool from appearing in two action cards.
-            # plan_index and total_plans are passed so the LLM prompt can
-            # reference its position in the analysis ("plan 2 of 3") and reason
-            # about what has already been assigned.
-            used_tool_names: set = set()
-            action_plans_with_toolkits = []
-            total_plans = len(action_plans)
-            for plan_index, plan in enumerate(action_plans):
-                enriched = await self._attach_toolkit(
-                    plan, user_query, used_tool_names,
-                    plan_index=plan_index, total_plans=total_plans,
-                )
-                action_plans_with_toolkits.append(enriched)
-            result["action_plans"] = action_plans_with_toolkits
+            # Global assignment: one LLM pass sees all plans + all candidates
+            # simultaneously and assigns each tool to exactly one plan.
+            # This guarantees no tool appears in two action cards even when
+            # action plans share semantically similar themes.
+            result["action_plans"] = await self._assign_toolkits_globally(
+                action_plans=action_plans,
+                user_query=user_query,
+            )
 
-            logger.info(f"Generated {len(result['action_plans'])} action plans with semantic tool matching")
+            logger.info(f"Generated {len(result['action_plans'])} action plans with global tool assignment")
             return result
 
         except Exception as e:
@@ -781,19 +1043,7 @@ OUTPUT FORMAT (JSON only, no markdown):
         tool_context = "\n".join(tool_context_parts)
         allowed_names_str = ", ".join(f'"{n}"' for n in allowed_tool_names)
 
-        prompt = f"""You are an automation workflow expert. A semantic search engine selected these tools from a live database to match a user's business problem. Explain HOW they work together as a workflow.
-
-STRICT RULE: You MUST ONLY reference these exact tool names from the database: {allowed_names_str}
-Do NOT mention, suggest, or invent any other tools.
-
-USER QUERY: "{user_query}"
-PRIMARY BOTTLENECK: "{primary_bottleneck}"
-
-TOOLS SELECTED FROM DATABASE:
-{tool_context}
-
-Explain how these {len(tools)} tool(s) form an automation workflow for this user.
-
+        prompt = f""" 
 OUTPUT FORMAT (JSON only, no markdown fences):
 {{
   "stack_name": "Short descriptive name showing the flow (e.g., Tool A → Tool B)",
@@ -1008,29 +1258,36 @@ OUTPUT FORMAT (JSON only, no markdown):
         action_list = json.dumps(action_titles)
         action_steps_json = json.dumps(action_steps)
 
-        prompt = f"""You are an execution sprint planner who turns strategy into a concrete 7-day action schedule.
+        prompt = f"""You are an execution architect who converts strategic analysis into a daily action schedule that a busy solo founder will actually complete. You understand the psychology of founder execution: momentum compounds, early wins prevent abandonment, visible progress creates motivation, and the biggest risk is not choosing the wrong action — it is doing nothing because the plan felt overwhelming.
+
+The consulting firms produce 80-page implementation roadmaps that sit in a drawer. You produce a 7-day sprint that gets executed because each day has one clear action, one clear output, and one clear "done" signal.
+
+PERSONA RULE: Write every text field in SECOND PERSON — "you", "your". NEVER use third-person. You are speaking directly to the person who will execute this roadmap.
 
 USER CHALLENGE: "{user_query}"
 ACTION PLANS (in priority order): {action_list}
 FIRST STEPS PER ACTION: {action_steps_json}
 
-Your task: Build a 7-Day Sprint roadmap that walks the user through the highest-priority actions in a logical, achievable sequence. Then write a motivational quote.
+TASK: Build a 7-day sprint roadmap that walks through the highest-priority actions in a logical, achievable sequence. Then write a motivational quote.
 
 ROADMAP RULES:
 1. Break the 7 days into 2-4 phases — no more than 4
-2. Phase names must describe what the user is DOING (e.g. "Days 1-2: Diagnose and Decide", not "Phase 1")
-3. Each phase must contain 2-4 tasks drawn directly from the action plan steps above
-4. Tasks must be specific and actioned ("Set up your CRM pipeline with 3 stages" not "Do CRM work")
-5. The total span must equal exactly 7 days
-6. Order: foundation/diagnosis first, execution second, review/optimize last
-7. Do NOT repeat the same task across phases
-8. FORMATTING: Do NOT start any task with a dash (-), bullet, or em dash. Write plain complete sentences only.
+2. Phase names describe what YOU are actively DOING in second person ("Days 1-2: Audit Your Current Funnel and Identify the Three Biggest Leaks" not "Phase 1: Discovery")
+3. Each phase contains 2-4 tasks drawn directly from the action plan steps above — no invented tasks
+4. Where a task involves a tool, name the specific first action to take in it
+5. Tasks are complete sentences in second person: specific action + specific output
+6. The total span equals exactly 7 days
+7. Sequence: AUDIT AND DECIDE first → BUILD AND SHIP second → MEASURE AND ADJUST last
+8. No task repeats across phases
+9. FORMATTING: Do NOT start any task with a dash (-), bullet, or em dash. Write plain complete sentences only.
+
+QUICK WIN — identify the single task from your #1 ranked action plan completable in 90 minutes or less that produces a VISIBLE, TANGIBLE output — something you can screenshot, share, or point to as evidence of progress. Not "research" or "think about." This anchors day 1.
 
 QUOTE RULES:
-1. Write a quote that speaks directly to the user's specific challenge — not a generic business platitude
-2. It must be encouraging AND grounded in reality (acknowledge the difficulty)
-3. Maximum 2 sentences
-4. Sound like a mentor who has seen this situation before and knows they can get through it
+1. Speaks directly to YOUR specific challenge — not a generic motivational poster
+2. Acknowledges the real difficulty — the weight, the doubt, the overwhelm. Do not pretend this is easy.
+3. Then grounds it in evidence: you have seen this pattern resolve, you know what the first signal of momentum looks like.
+4. Maximum 2 sentences. Sounds like a mentor who has personally watched someone in this exact situation find their way through — not a motivational speaker who has never been in the arena.
 
 OUTPUT FORMAT (JSON only, no markdown):
 {{
