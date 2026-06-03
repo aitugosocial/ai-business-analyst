@@ -225,33 +225,6 @@ async def analyze_business_goal(
 
         content_type = request.headers.get("content-type", "")
 
-        # ── Idempotency guard ────────────────────────────────────────────────
-        # Railway's HTTP/2 proxy can drop long-running connections. The browser
-        # sees "Failed to fetch" and the user retries, creating duplicate records.
-        # If this user submitted an analysis within the last 60 seconds that has
-        # already completed (id is present), return it immediately.
-        from datetime import timedelta
-        from sqlalchemy import desc as _desc
-        recent_cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
-        recent = (
-            db.query(BusinessAnalysis)
-            .filter(
-                BusinessAnalysis.user_id == user_id,
-                BusinessAnalysis.created_at >= recent_cutoff,
-            )
-            .order_by(_desc(BusinessAnalysis.created_at))
-            .first()
-        )
-        if recent:
-            logger.info(
-                f"⚡ Returning recent analysis {recent.id} for user {user_id} "
-                f"(submitted within 60 s — duplicate request prevented)"
-            )
-            return {
-                "success": True,
-                "message": "Analysis completed successfully",
-                "data": format_analysis_for_frontend(recent),
-            }
         business_goal = ""
         files = []
 
@@ -264,6 +237,33 @@ async def analyze_business_goal(
             files = form_data.getlist("files")
         else:
             raise HTTPException(status_code=400, detail="Invalid Content-Type")
+
+        # ── Deduplication guard ────────────────────────────────────────────────
+        # If the user submits the exact same business goal, return the existing
+        # analysis from the database instead of running a new 30s LLM job.
+        from sqlalchemy import desc as _desc
+        
+        _goal_str = business_goal or ""
+        if _goal_str.strip():
+            recent = (
+                db.query(BusinessAnalysis)
+                .filter(
+                    BusinessAnalysis.user_id == user_id,
+                    BusinessAnalysis.business_goal == _goal_str,
+                )
+                .order_by(_desc(BusinessAnalysis.created_at))
+                .first()
+            )
+            if recent:
+                logger.info(
+                    f"⚡ Returning existing analysis {recent.id} for user {user_id} "
+                    f"(duplicate prompt detected)"
+                )
+                return {
+                    "success": True,
+                    "message": "Analysis completed successfully",
+                    "data": format_analysis_for_frontend(recent),
+                }
 
         if not business_goal and not files:
             raise HTTPException(status_code=400, detail="Business goal or a document/image upload is required")
@@ -416,19 +416,19 @@ async def analyze_business_goal_stream(
         def _send(event: str, payload: dict) -> str:
             return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
-        # Idempotency: return a cached recent result immediately
-        from datetime import timedelta
+        # Idempotency: return a cached recent result immediately if prompt matches
         from sqlalchemy import desc as _desc
-        recent_cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
-        recent = (
-            db.query(BusinessAnalysis)
-            .filter(
-                BusinessAnalysis.user_id == user_id,
-                BusinessAnalysis.created_at >= recent_cutoff,
+        recent = None
+        if business_goal and business_goal.strip():
+            recent = (
+                db.query(BusinessAnalysis)
+                .filter(
+                    BusinessAnalysis.user_id == user_id,
+                    BusinessAnalysis.business_goal == business_goal,
+                )
+                .order_by(_desc(BusinessAnalysis.created_at))
+                .first()
             )
-            .order_by(_desc(BusinessAnalysis.created_at))
-            .first()
-        )
         if recent:
             yield _send("progress", {"step": "complete", "pct": 100, "msg": "Retrieved recent analysis"})
             yield _send("result", {"success": True, "data": format_analysis_for_frontend(recent)})
@@ -678,19 +678,19 @@ async def analyze_business_goal_stream(
     if not business_goal:
         raise HTTPException(status_code=400, detail="Could not extract content from uploaded files")
 
-    # Idempotency guard (same 60s window as /analyze)
-    from datetime import timedelta
+    # Deduplication guard: if the user already analyzed this exact same goal
     from sqlalchemy import desc as _desc
-    recent_cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
-    recent = (
-        db.query(BusinessAnalysis)
-        .filter(
-            BusinessAnalysis.user_id == user_id,
-            BusinessAnalysis.created_at >= recent_cutoff,
+    recent = None
+    if business_goal and business_goal.strip():
+        recent = (
+            db.query(BusinessAnalysis)
+            .filter(
+                BusinessAnalysis.user_id == user_id,
+                BusinessAnalysis.business_goal == business_goal,
+            )
+            .order_by(_desc(BusinessAnalysis.created_at))
+            .first()
         )
-        .order_by(_desc(BusinessAnalysis.created_at))
-        .first()
-    )
 
     if recent:
         async def _cached_stream():
