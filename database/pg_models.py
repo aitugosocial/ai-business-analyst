@@ -145,6 +145,12 @@ class AITool(Base):
     who_should_use = Column(Text)  # JSON string of use cases
     compatibility_integration = Column(Text)  # JSON string of integrations
 
+    # Vector embedding for semantic search (pgvector, 384 dims).
+    # Populated by scripts/generate_tool_embeddings.py (or on import via cache clear + reload).
+    # Used by decision_engine/vector_recommender.py and generate script.
+    # We store/assign as "[0.123, -0.45, ...]" string; Postgres vector type handles it.
+    embedding = Column("embedding", nullable=True)
+
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

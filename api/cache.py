@@ -34,25 +34,37 @@ import time
 async def init_cache():
     """
     Initialize caching backend (Redis or fallback to in-memory)
-    Call this during FastAPI startup event
+    Call this during FastAPI startup event.
+
+    IMPORTANT: Only connects to Redis if REDIS_URL is explicitly set.
+    This prevents startup hangs on platforms like Railway when no Redis
+    service is provisioned (would otherwise block on localhost:6379).
+    In-memory fallback is always available and sufficient for most use cases.
     """
     global redis_client
 
-    # Get Redis URL from environment (optional)
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+    # Get Redis URL from environment (optional — do NOT default to localhost)
+    redis_url = os.getenv("REDIS_URL")
+
+    if not redis_url:
+        # Fast path: no Redis configured (common on Railway, Render, etc.)
+        logger.info("📦 No REDIS_URL set — initializing in-memory cache (no network connection attempted)")
+        FastAPICache.init(InMemoryBackend(), prefix="aianalyst:")
+        redis_client = None
+        return
 
     try:
-        # Attempt to connect to Redis
+        # Attempt to connect to Redis only when explicitly configured
         redis_client = await aioredis.from_url(
             redis_url,
             encoding="utf-8",
             decode_responses=True,
-            socket_connect_timeout=5  # 5 second timeout
+            socket_connect_timeout=3,
+            socket_timeout=3,
         )
 
         # Test connection
-        if redis_client is not None:
-            await redis_client.ping()
+        await redis_client.ping()
 
         # Initialize FastAPICache with Redis backend
         FastAPICache.init(RedisBackend(redis_client), prefix="aianalyst:")

@@ -105,7 +105,7 @@ def update_tool_embeddings(db: Session, batch_size: int = BATCH_SIZE):
         # Generate embedding texts
         texts = [generate_embedding_text(tool) for tool in batch]
 
-        # Generate embeddings via xAI
+        # Generate embeddings locally with sentence-transformers (free, private, 384d)
         try:
             embeddings = generate_embeddings_batch(texts)
 
