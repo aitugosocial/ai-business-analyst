@@ -467,12 +467,20 @@ async def analyze_business_goal_stream(
                 (55, "Building action plans…"),
                 (70, "Selecting AI tools…"),
                 (85, "Compiling execution roadmap…"),
+                (90, "Reviewing recommendations…"),
+                (95, "Finalizing report…"),
+                (98, "Almost done…")
             ]
-            for pct, msg in hb_steps:
-                done, _ = await asyncio.wait([analysis_task], timeout=4)
+            
+            step_idx = 0
+            while not analysis_task.done():
+                done, _ = await asyncio.wait([analysis_task], timeout=4.0)
                 if done:
                     break
+                pct, msg = hb_steps[min(step_idx, len(hb_steps) - 1)]
                 yield _send("progress", {"step": "thinking", "pct": pct, "msg": msg})
+                yield ": keepalive\n\n"
+                step_idx += 1
 
             result = await analysis_task
             yield _send("progress", {"step": "complete", "pct": 100, "msg": "Analysis complete!"})
@@ -739,7 +747,13 @@ async def analyze_business_goal_stream(
         task = asyncio.create_task(_run_analysis())
         try:
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=4.0)
+                except asyncio.TimeoutError:
+                    # Send a keep-alive comment to keep Railway/Cloudflare connections open
+                    yield ": keepalive\n\n"
+                    continue
+                    
                 if item is None:
                     break
                 event_type = item.pop("type")

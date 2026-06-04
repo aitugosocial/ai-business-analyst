@@ -193,7 +193,7 @@ class BusinessAnalysis(Base):
     # Admin Monitoring Fields
     confidence_score = Column(Integer, nullable=True)  # 0-100 confidence score
     recommendation_mode = Column(String, nullable=True)  # "single_tool" | "automation_stack"
-    single_tool_recommendation = Column(JSON, nullable=True)  # {tool_name, description, why_this_tool, website, price}
+    single_tool_recommendation = Column(JSON, nullable=True)  # {tool_name, description, website, price}
     duration = Column(String(50), nullable=True)  # e.g., "2.5s"
     analysis_type = Column(String(100), nullable=True)  # agentic
     insights_count = Column(Integer, default=0)  # Number of insights generated

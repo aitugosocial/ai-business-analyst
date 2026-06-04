@@ -589,8 +589,7 @@ YOUR TASK:
 3. Select UP TO 2 tools ONLY if the steps clearly need two different capabilities (e.g. step 1 needs analytics, step 3 needs email automation). Otherwise select 1.
 4. Return an empty array if no tool genuinely addresses a specific step.
 5. CRITICAL — "what_it_helps": name the exact step number(s) and describe what the tool does for that step in one concrete sentence. This text will appear on a card next to THIS specific action plan — it must be unique to these steps, not a generic description of the tool.
-6. CRITICAL — "why_this_tool": name the specific feature or function that makes this the right choice for these steps. One sentence, no generic claims.
-7. Return the tool's website URL from the candidate list exactly as shown.
+6. Return the tool's website URL from the candidate list exactly as shown.
 
 OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
 {{
@@ -598,8 +597,7 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         {{
             "tool_name": "Exact name from the candidate list",
             "website": "Exact URL from the candidate list, or null",
-            "what_it_helps": "Step N: one concrete sentence describing what the tool does for that specific step",
-            "why_this_tool": "One sentence naming the specific feature that makes this tool the right fit"
+            "what_it_helps": "Step N: one concrete sentence describing what the tool does for that specific step"
         }}
     ]
 }}"""
@@ -751,7 +749,7 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
 
 Your output appears directly on action plan cards that a solo founder will use to make decisions. Every word must be specific, concrete, and unique to the plan it accompanies.
 
-PERSONA RULE: Write "what_it_helps" and "why_this_tool" in SECOND PERSON — "you", "your". Never "the user", "the founder", or any third-person reference.
+PERSONA RULE: Write "what_it_helps" in SECOND PERSON — "you", "your". Never "the user", "the founder", or any third-person reference.
 
 GLOBAL CONSTRAINT: Each tool can be assigned to AT MOST ONE plan across the entire analysis. Once assigned, that tool is locked. If the same tool is the best match for multiple plans, assign it to the plan where it covers an "essential" automation need over a convenience feature, and among equals, to the higher-ranked plan (lower number = higher priority).
 
@@ -773,10 +771,6 @@ STEP 2 — SPECIFICITY OF DESCRIPTIONS
 Good: "Step 2: This tool sends your weekly re-engagement sequence automatically, personalised with each contact's last action, so you never manually write or send a follow-up again."
 Bad: "A powerful automation platform."
 
-"why_this_tool" must name the SPECIFIC FEATURE or function — by name where possible — that makes this the right choice for these steps. One sentence, no generic claims.
-Good: "Its visual automation builder lets you create a triggered email sequence with conditional branching in under 20 minutes, no code required."
-Bad: "It is user-friendly and widely used."
-
 STEP 3 — ASSIGNMENT RULES
 1. Each tool can be assigned to AT MOST ONE plan. No repeats across the analysis.
 2. Only assign a tool if it directly addresses a named step. Do NOT assign based on general category fit.
@@ -791,8 +785,7 @@ OUTPUT FORMAT (JSON only, no markdown):
       "plan_index": 1,
       "tool_name": "Exact name from the catalog",
       "website": "Exact URL from the catalog or null",
-      "what_it_helps": "Step N: one concrete sentence in second person about what this tool does for that specific step — unique to this plan.",
-      "why_this_tool": "One sentence naming the specific feature or function that makes this the right fit for these steps — no generic claims."
+      "what_it_helps": "Step N: one concrete sentence in second person about what this tool does for that specific step — unique to this plan."
     }}
   ]
 }}
@@ -844,7 +837,6 @@ Omit any plan where no catalog tool genuinely fits its specific steps."""
                 "tool_name": canonical,
                 "website": assignment.get("website") or all_tools[canonical].get("url") or None,
                 "what_it_helps": assignment.get("what_it_helps", ""),
-                "why_this_tool": assignment.get("why_this_tool", ""),
             }
             action_plans[raw_plan_idx]["toolkit"] = toolkit
             logger.info(
@@ -887,7 +879,7 @@ Omit any plan where no catalog tool genuinely fits its specific steps."""
                 "action_plans": [
                     {
                         "id", "title", "what_to_do", "why_it_matters",
-                        "effort_level", "toolkit": {"tool_name", "what_it_helps", "why_this_tool"} | null
+                        "effort_level", "toolkit": {"tool_name", "what_it_helps"} | null
                     }
                 ],
                 "exclusions_note": str
@@ -1194,8 +1186,7 @@ Select the ONE tool that most directly helps solve this specific challenge.
 OUTPUT FORMAT (JSON only, no markdown):
 {{
     "selected_index": 0,
-    "what_it_helps": "Explain what specific part of the user's challenge this tool addresses (1 concrete sentence — name the actual task or problem it solves)",
-    "why_this_tool": "Name the specific capability that makes this tool the right choice for this user's situation (1 sentence — be specific, not generic)"
+    "what_it_helps": "Explain what specific part of the user's challenge this tool addresses (1 concrete sentence — name the actual task or problem it solves)"
 }}"""
 
             sel_response = await self._llm(
@@ -1223,7 +1214,6 @@ OUTPUT FORMAT (JSON only, no markdown):
             single_tool = {
                 "tool_name": tool_name,
                 "description": sel.get("what_it_helps") or top.get("description", ""),
-                "why_this_tool": sel.get("why_this_tool") or top.get("description", ""),
                 "website": website,
                 "price": price,
             }
