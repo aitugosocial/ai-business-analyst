@@ -344,6 +344,162 @@ async def resolve_constraint(
         )
 
 
+class MissionActivateRequest(BaseModel):
+    mission_name: Optional[str] = None
+    start_date: Optional[str] = None
+    day_plans: Optional[list] = None  # [{"day": 1, "durationDays": 1}, ...]
+    opening_note: Optional[str] = None
+
+@router.post("/{analysis_id}/activate")
+async def activate_mission(
+    analysis_id: int,
+    body: MissionActivateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Store mission activation configuration"""
+    try:
+        analysis = db.query(BusinessAnalysis).filter(
+            BusinessAnalysis.id == analysis_id,
+            BusinessAnalysis.user_id == current_user.id
+        ).first()
+
+        if not analysis:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+
+        user_progress = analysis.user_progress or {}
+        if not isinstance(user_progress, dict):
+            user_progress = {}
+
+        user_progress['mission_config'] = {
+            'mission_name': body.mission_name,
+            'start_date': body.start_date,
+            'day_plans': body.day_plans or [],
+            'opening_note': body.opening_note,
+            'activated_at': datetime.now(timezone.utc).isoformat()
+        }
+
+        if 'completed_actions' not in user_progress:
+            user_progress['completed_actions'] = []
+        if 'reflections' not in user_progress:
+            user_progress['reflections'] = {}
+        if 'completion_dates' not in user_progress:
+            user_progress['completion_dates'] = {}
+
+        analysis.user_progress = user_progress
+        db.commit()
+
+        return {
+            "success": True,
+            "message": "Mission activated",
+            "data": {"analysis_id": analysis_id, "mission_config": user_progress['mission_config']}
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error activating mission: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to activate mission")
+
+
+class RoadmapCommentRequest(BaseModel):
+    task_id: str
+    text: str
+    parent_id: Optional[str] = None
+
+@router.post("/{analysis_id}/roadmap-comment")
+async def add_roadmap_comment(
+    analysis_id: int,
+    body: RoadmapCommentRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Add a comment to an execution roadmap task"""
+    try:
+        analysis = db.query(BusinessAnalysis).filter(
+            BusinessAnalysis.id == analysis_id,
+            BusinessAnalysis.user_id == current_user.id
+        ).first()
+
+        if not analysis:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+
+        user_progress = analysis.user_progress or {}
+        if not isinstance(user_progress, dict):
+            user_progress = {}
+
+        if 'roadmap_comments' not in user_progress:
+            user_progress['roadmap_comments'] = {}
+
+        task_comments = user_progress['roadmap_comments'].get(body.task_id, [])
+
+        comment_id = f"comment-{datetime.now(timezone.utc).timestamp()}"
+        new_comment = {
+            'id': comment_id,
+            'text': body.text,
+            'author': {'name': current_user.name or 'You', 'initials': (current_user.name or 'YO')[:2].upper()},
+            'createdAt': datetime.now(timezone.utc).isoformat(),
+            'parent_id': body.parent_id,
+        }
+
+        if body.parent_id:
+            for comment in task_comments:
+                if comment['id'] == body.parent_id:
+                    if 'replies' not in comment:
+                        comment['replies'] = []
+                    comment['replies'].append(new_comment)
+                    break
+        else:
+            task_comments.append(new_comment)
+
+        user_progress['roadmap_comments'][body.task_id] = task_comments
+        analysis.user_progress = user_progress
+        db.commit()
+
+        return {"success": True, "data": new_comment}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error adding roadmap comment: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to add comment")
+
+
+@router.delete("/{analysis_id}/roadmap-comment/{comment_id}")
+async def delete_roadmap_comment(
+    analysis_id: int,
+    comment_id: str,
+    task_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Delete a roadmap comment"""
+    try:
+        analysis = db.query(BusinessAnalysis).filter(
+            BusinessAnalysis.id == analysis_id,
+            BusinessAnalysis.user_id == current_user.id
+        ).first()
+        if not analysis:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+
+        user_progress = analysis.user_progress or {}
+        if isinstance(user_progress, dict) and 'roadmap_comments' in user_progress:
+            task_comments = user_progress['roadmap_comments'].get(task_id, [])
+            user_progress['roadmap_comments'][task_id] = [c for c in task_comments if c['id'] != comment_id]
+            analysis.user_progress = user_progress
+            db.commit()
+
+        return {"success": True, "message": "Comment deleted"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to delete comment")
+
+
 @router.get("/{analysis_id}")
 async def get_mission_details(
     analysis_id: int,
