@@ -366,10 +366,10 @@ STEP 7 — UNIT ECONOMICS IMPACT: How does this bottleneck distort your unit eco
 CRITICAL OUTPUT RULES:
 - ONE bottleneck only. Commit. Do not hedge.
 - Title names the broken or missing SYSTEM — not a symptom. Good: "No Post-Purchase Activation Sequence to Convert One-Time Buyers". Bad: "Sales Issues".
-- Description: 3 sentences, second person, states the structural gap between current state and required state.
-- Consequence: 3 sentences, second person, models 90-day cost with calibrated ranges.
-- strategic_priority: names a SPECIFIC MECHANISM to build, not a category. Good: "Build a 3-email post-purchase sequence that fires within 24 hours and drives second transaction within 14 days." Bad: "Focus on retention."
-- what_to_stop: names a SPECIFIC BEHAVIOR and its cost. "Stop redesigning your landing page before you have 10 paying customers — every hour on polish before product-market fit produces zero revenue signal."
+- Description: EXACTLY 2 sentences, second person, states the structural gap and the pattern archetype. Hard limit: 40 words maximum.
+- Consequence: EXACTLY 2 sentences, second person, models 90-day cost with ONE calibrated range. Hard limit: 40 words maximum.
+- strategic_priority: ONE sentence, second person, names the specific mechanism. Hard limit: 25 words maximum. Good: "Build a 3-email post-purchase sequence that fires within 24 hours and drives second transaction within 14 days." Bad: "Focus on retention."
+- what_to_stop: ONE sentence, second person, names the specific behavior and its cost. Hard limit: 25 words maximum.
 - RECOMMENDATION MODE:
   - "single_tool" = ONE AI/SaaS tool directly solves this, no data handoffs needed
   - "automation_stack" = requires MULTIPLE tools in sequence with data handoffs
@@ -378,11 +378,11 @@ OUTPUT FORMAT (JSON only, no markdown):
 {{
     "primary_bottleneck": {{
         "title": "Specific structural problem title (5-10 words) — names the missing or broken system",
-        "description": "3 sentences in second person. States the structural gap, the evidence from your situation, and the pattern archetype this matches.",
-        "consequence": "3 sentences in second person. Models 90-day cost: direct loss + compounding damage + opportunity cost. Include calibrated ranges."
+        "description": "2 sentences max 40 words. Structural gap + pattern archetype.",
+        "consequence": "2 sentences max 40 words. 90-day cost with one calibrated range."
     }},
-    "strategic_priority": "One sentence in second person naming the specific mechanism or system to build — concrete enough to start this week.",
-    "what_to_stop": "One sentence in second person naming the specific behavior to eliminate and its direct cost.",
+    "strategic_priority": "One sentence max 25 words naming the specific mechanism to build this week.",
+    "what_to_stop": "One sentence max 25 words naming the specific behavior to eliminate and its cost.",
     "recommendation_mode": "single_tool or automation_stack"
 }}"""
 
@@ -454,13 +454,14 @@ OUTPUT FORMAT (JSON only, no markdown):
         {{
             "id": 2,
             "title": "Specific constraint name describing a structural gap or behavioral pattern (5-8 words)",
-            "description": "3 sentences in second person. (a) What the constraint IS — the specific gap or pattern. (b) The CAUSAL MECHANISM by which it compounds your primary bottleneck — step by step, not just 'it makes things worse'. (c) What happens if this constraint is left unaddressed while you attempt to fix the primary bottleneck."
+            "description": "2 sentences MAX in second person, 40 words total hard limit. Sentence 1: the structural gap and its causal mechanism on the primary bottleneck. Sentence 2: the consequence if unaddressed."
         }}
     ]
 }}
 
 Number constraints starting at 2 (your primary bottleneck is always #1).
-No markdown, no dashes, no bullet prefixes in any text value."""
+No markdown, no dashes, no bullet prefixes in any text value.
+WORD LIMIT RULE: Each description must be 40 words or fewer. Do not exceed this under any circumstance."""
 
         try:
             response = await self._llm(
