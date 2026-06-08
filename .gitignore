@@ -90,7 +90,12 @@ create_stripe_prices.py
 lavoo_neon_backup.sql
 export_db.py
 import_tools.py
-scripts/_enrich_checkpoint.json
-scripts/_enrich_checkpoint.json.bak
-scripts/enrich_tool_features.py
-scripts/sync_csv_to_db.py
+scripts/ 
+set_permanent_accounts.py 
+set_beta_users.py 
+testing_guidelines.md 
+verification_script.py 
+run_migrations.py 
+debug_imports.py 
+reset_test_users.py 
+docs/
