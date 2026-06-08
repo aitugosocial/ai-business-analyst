@@ -140,7 +140,8 @@ async def get_user_missions(
                 'points_reward': total_steps * 20,
                 'status': mission_status,
                 'created_at': analysis.created_at.isoformat() if analysis.created_at else None,
-                'steps': steps
+                'steps': steps,
+                'mission_config': user_progress.get('mission_config'),
             })
 
         return {
@@ -572,7 +573,8 @@ async def get_mission_details(
                 'completed_steps': len(completed_steps),
                 'points_reward': len(_parse_action_plans(analysis)) * 20,
                 'status': 'completed' if len(completed_steps) == len(_parse_action_plans(analysis)) else 'active',
-                'steps': steps
+                'steps': steps,
+                'mission_config': user_progress.get('mission_config'),
             }
         }
 

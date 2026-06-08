@@ -454,14 +454,14 @@ OUTPUT FORMAT (JSON only, no markdown):
         {{
             "id": 2,
             "title": "Specific constraint name describing a structural gap or behavioral pattern (5-8 words)",
-            "description": "2 sentences MAX in second person, 40 words total hard limit. Sentence 1: the structural gap and its causal mechanism on the primary bottleneck. Sentence 2: the consequence if unaddressed."
+            "description": "2 sentences MAX, strictly 30 words or fewer. Must fit in 3 display lines. Sentence 1: the structural gap and its direct causal mechanism. Sentence 2: the consequence if unaddressed."
         }}
     ]
 }}
 
 Number constraints starting at 2 (your primary bottleneck is always #1).
 No markdown, no dashes, no bullet prefixes in any text value.
-WORD LIMIT RULE: Each description must be 40 words or fewer. Do not exceed this under any circumstance."""
+LINE LIMIT RULE: Each description must fit in exactly 3 display lines — 30 words maximum, hard limit. Violating this breaks the UI. Do not exceed 30 words under any circumstance."""
 
         try:
             response = await self._llm(
@@ -1125,7 +1125,8 @@ OUTPUT FORMAT (JSON only, no markdown fences):
         """
         try:
             if recommendation_mode == "single_tool":
-                return await self._recommend_single_tool(user_query)
+                action_plans_for_tool = action_plans_result.get("action_plans", []) or []
+                return await self._recommend_single_tool(user_query, action_plans_for_tool)
 
             action_plans = action_plans_result.get("action_plans", []) or []
             stacks = recommend_automation_stacks(
@@ -1158,10 +1159,11 @@ OUTPUT FORMAT (JSON only, no markdown fences):
             logger.error(f"Stage 3B failed: {e}", exc_info=True)
             return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
 
-    async def _recommend_single_tool(self, user_query: str) -> Dict[str, Any]:
+    async def _recommend_single_tool(self, user_query: str, action_plans: list = None) -> Dict[str, Any]:
         """
         Stage 3B (single_tool mode): Return the single best AI tool for the user's query.
-        Used when recommendation_mode == "single_tool" — one focused tool, no stack needed.
+        Also generates per-plan descriptions so each action card shows unique context for
+        the same tool — no extra LLM call, same request with more structured output.
         """
         from database.pg_models import AITool
         try:
@@ -1169,32 +1171,64 @@ OUTPUT FORMAT (JSON only, no markdown fences):
             if not tools:
                 return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
 
-            # Use LLM to select the best of the top-3 matches and generate
-            # a specific, action-relevant reason — not a generic fallback.
-            tool_summaries = [
+            tool_summaries = "\n".join(
                 f"{i+1}. {t['tool_name']}: {t['description'][:150]}"
                 for i, t in enumerate(tools)
-            ]
-            selection_prompt = f"""You are selecting the single best AI tool for a user's business challenge.
+            )
 
-USER CHALLENGE: "{user_query}"
+            # Build action plans context for per-plan descriptions
+            plans_section = ""
+            plan_desc_keys = ""
+            if action_plans:
+                lines = []
+                for i, plan in enumerate(action_plans):
+                    title = plan.get("title") or plan.get("action_title") or f"Plan {i + 1}"
+                    steps = (plan.get("what_to_do") or plan.get("what_to_do_steps")
+                             or plan.get("steps") or [])
+                    step_preview = "; ".join(str(s) for s in steps[:2])[:120] if steps else ""
+                    lines.append(f"Plan {i}: {title}" + (f" — {step_preview}" if step_preview else ""))
+                plans_section = "\n".join(lines)
+                plan_desc_keys = ", ".join(
+                    f'"{i}": "one direct sentence for plan {i}"'
+                    for i in range(len(action_plans))
+                )
 
-CANDIDATE TOOLS (from semantic search):
-{chr(10).join(tool_summaries)}
+            plan_desc_block = (
+                f',\n    "plan_descriptions": {{{plan_desc_keys}}}'
+                if action_plans else ""
+            )
+            plans_block = (
+                f"\nACTION PLANS:\n{plans_section}"
+                if plans_section else ""
+            )
+            plan_desc_rule = (
+                '\n- "plan_descriptions": dict keyed by plan index (string). Each value is ONE direct sentence explaining what this tool does for THAT plan\'s specific steps. Reference the plan\'s actual task. Second-person voice ("you"). No mention of "user".'
+                if action_plans else ""
+            )
 
-Select the ONE tool that most directly helps solve this specific challenge.
+            selection_prompt = f"""You are selecting the single best AI tool for a business challenge.
 
-OUTPUT FORMAT (JSON only, no markdown):
+BUSINESS CHALLENGE: "{user_query}"{plans_block}
+
+CANDIDATE TOOLS:
+{tool_summaries}
+
+Select the ONE tool that most directly addresses this challenge.
+
+RULES:
+- "what_it_helps": one direct sentence naming the specific task this tool solves. Second-person voice. No mention of "user" or "the user".{plan_desc_rule}
+
+OUTPUT (JSON only, no markdown):
 {{
     "selected_index": 0,
-    "what_it_helps": "Explain what specific part of the user's challenge this tool addresses (1 concrete sentence — name the actual task or problem it solves)"
+    "what_it_helps": "Direct sentence — what specific task this tool automates or solves"{plan_desc_block}
 }}"""
 
             sel_response = await self._llm(
                 model=self.fast_model,
                 messages=[{"role": "user", "content": selection_prompt}],
                 temperature=0.3,
-                max_tokens=250,
+                max_tokens=500 if action_plans else 250,
             )
             sel_text = sel_response.choices[0].message.content.strip()
             if "```json" in sel_text:
@@ -1218,6 +1252,12 @@ OUTPUT FORMAT (JSON only, no markdown):
                 "website": website,
                 "price": price,
             }
+
+            # Attach per-plan descriptions when available
+            plan_descriptions = sel.get("plan_descriptions")
+            if isinstance(plan_descriptions, dict) and plan_descriptions:
+                single_tool["plan_descriptions"] = plan_descriptions
+
             return {"recommended_tool_stacks": [], "single_tool_recommendation": single_tool}
         except Exception as e:
             logger.error(f"Single-tool recommendation failed: {e}", exc_info=True)

@@ -485,6 +485,10 @@ async def analyze_business_goal_stream(
             result = await analysis_task
             yield _send("progress", {"step": "complete", "pct": 100, "msg": "Analysis complete!"})
             yield _send("result", {"success": True, "data": result["data"]})
+            # Small pause so Railway's HTTP/2 proxy finishes flushing the final
+            # chunk before the generator closes the stream.
+            await asyncio.sleep(0.3)
+            yield ": done\n\n"
 
         except Exception as e:
             err_str = str(e)
@@ -514,7 +518,11 @@ async def analyze_business_goal_stream(
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 
