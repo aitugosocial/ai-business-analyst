@@ -11,18 +11,76 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 import json
 
+def _ensure_dict(value, field_name: str = "field") -> dict:
+    """Safely coerce any JSON column value to a dict.
+
+    PostgreSQL JSON columns sometimes return raw JSON strings instead of parsed
+    dicts when data was written by older code paths or direct SQL inserts.
+    This guard handles: None, empty string, valid JSON string, and non-dict types.
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        if not value.strip():
+            return {}
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+            logger.warning(f"[Missions] {field_name} parsed to non-dict type {type(parsed).__name__}, using {{}}")
+            return {}
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"[Missions] {field_name} is an unparseable string: {e!r} | value[:120]: {str(value)[:120]}")
+            return {}
+    logger.warning(f"[Missions] {field_name} unexpected type {type(value).__name__}, using {{}}")
+    return {}
+
+
+def _ensure_list(value, field_name: str = "field") -> list:
+    """Safely coerce any JSON column value to a list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+            logger.warning(f"[Missions] {field_name} parsed to non-list type {type(parsed).__name__}, wrapping")
+            return [parsed] if parsed else []
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"[Missions] {field_name} is an unparseable string: {e!r}")
+            return []
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
 def _parse_action_plans(analysis):
     if not analysis or getattr(analysis, 'action_plans', None) is None:
         return []
     plans = getattr(analysis, 'action_plans', [])
-    if isinstance(plans, str):
-        try:
-            plans = json.loads(plans)
-        except json.JSONDecodeError:
-            return []
-    if not isinstance(plans, list):
-        return [plans] if plans else []
-    return plans
+    plans = _ensure_list(plans, "action_plans")
+    # Ensure every element is a dict — sometimes individual elements are JSON strings
+    result = []
+    for i, item in enumerate(plans):
+        if isinstance(item, dict):
+            result.append(item)
+        elif isinstance(item, str):
+            try:
+                parsed = json.loads(item)
+                result.append(parsed if isinstance(parsed, dict) else {})
+            except (json.JSONDecodeError, ValueError):
+                logger.error(f"[Missions] action_plans[{i}] is an unparseable string, skipping")
+                result.append({})
+        else:
+            logger.warning(f"[Missions] action_plans[{i}] unexpected type {type(item).__name__}, skipping")
+    return result
 
 from pydantic import BaseModel
 
@@ -92,8 +150,9 @@ async def get_user_missions(
                 seen_priorities.add(priority_key)
 
             # Get user progress from analysis metadata
-            user_progress = analysis.user_progress or {}
-            completed_steps = user_progress.get('completed_actions', [])
+            user_progress = _ensure_dict(analysis.user_progress, f"user_progress[{analysis.id}]")
+            completed_steps = _ensure_list(user_progress.get('completed_actions', []), "completed_actions")
+            reflections = _ensure_dict(user_progress.get('reflections', {}), "reflections")
 
             # Convert action plans to mission steps
             steps = []
@@ -101,18 +160,20 @@ async def get_user_missions(
                 step_id = f"{analysis.id}_action_{idx}"
                 is_completed = step_id in completed_steps
 
+                what_to_do = _ensure_list(
+                    action.get('what_to_do') or action.get('what_to_do_steps'),
+                    f"action[{idx}].what_to_do"
+                )
                 steps.append({
                     'id': step_id,
                     'day': idx,
-                    'label': action.get('title', action.get('action_title', f'Action {idx}')),
-                    'description': action.get('what_to_do', [''])[0] if action.get('what_to_do') else
-                                   action.get('what_to_do_steps', [''])[0] if action.get('what_to_do_steps') else
-                                   action.get('description', ''),
+                    'label': action.get('title') or action.get('action_title') or f'Action {idx}',
+                    'description': what_to_do[0] if what_to_do else action.get('description', ''),
                     'done': is_completed,
                     'active': not is_completed and (idx == len(completed_steps) + 1),
                     'points': 20,
                     'effort': action.get('effort', 'MEDIUM'),
-                    'reflection': user_progress.get('reflections', {}).get(step_id)
+                    'reflection': reflections.get(step_id)
                 })
 
             # Calculate progress
@@ -141,7 +202,7 @@ async def get_user_missions(
                 'status': mission_status,
                 'created_at': analysis.created_at.isoformat() if analysis.created_at else None,
                 'steps': steps,
-                'mission_config': user_progress.get('mission_config'),
+                'mission_config': _ensure_dict(user_progress.get('mission_config'), "mission_config") or None,
             })
 
         return {
@@ -150,6 +211,7 @@ async def get_user_missions(
         }
 
     except Exception as e:
+        logger.error(f"[Missions] Error in get_user_missions: {type(e).__name__}: {e}", exc_info=True)
         logger.error(f"Error fetching missions: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -182,17 +244,8 @@ async def get_active_missions(
             if priority_key:
                 seen_active.add(priority_key)
 
-            user_progress = analysis.user_progress or {}
-            if isinstance(user_progress, str):
-                import json
-                try:
-                    user_progress = json.loads(user_progress)
-                except json.JSONDecodeError:
-                    user_progress = {}
-            if not isinstance(user_progress, dict):
-                user_progress = {}
-
-            completed_steps = user_progress.get('completed_actions', [])
+            user_progress = _ensure_dict(analysis.user_progress, f"user_progress[{analysis.id}]")
+            completed_steps = _ensure_list(user_progress.get('completed_actions', []), "completed_actions")
             total_steps = len(action_plans)
 
             # Only include if not fully completed
@@ -238,8 +291,8 @@ async def get_active_constraints(
         active_constraints = []
 
         for analysis in analyses:
-            user_progress = analysis.user_progress or {}
-            resolved_constraints = user_progress.get('resolved_constraints', [])
+            user_progress = _ensure_dict(analysis.user_progress, f"user_progress[{analysis.id}]")
+            resolved_constraints = _ensure_list(user_progress.get('resolved_constraints', []), "resolved_constraints")
 
             # Add primary bottleneck if exists and not resolved
             if analysis.primary_bottleneck:
@@ -308,10 +361,10 @@ async def resolve_constraint(
                 detail="Analysis not found"
             )
 
-        # Initialize user_progress if not exists
-        user_progress = analysis.user_progress or {}
-
+        user_progress = _ensure_dict(analysis.user_progress, "user_progress")
         if 'resolved_constraints' not in user_progress:
+            user_progress['resolved_constraints'] = []
+        if not isinstance(user_progress['resolved_constraints'], list):
             user_progress['resolved_constraints'] = []
 
         if constraint_id not in user_progress['resolved_constraints']:
@@ -368,9 +421,7 @@ async def activate_mission(
         if not analysis:
             raise HTTPException(status_code=404, detail="Analysis not found")
 
-        user_progress = analysis.user_progress or {}
-        if not isinstance(user_progress, dict):
-            user_progress = {}
+        user_progress = _ensure_dict(analysis.user_progress, "user_progress")
 
         user_progress['mission_config'] = {
             'mission_name': body.mission_name,
@@ -426,10 +477,7 @@ async def add_roadmap_comment(
         if not analysis:
             raise HTTPException(status_code=404, detail="Analysis not found")
 
-        user_progress = analysis.user_progress or {}
-        if not isinstance(user_progress, dict):
-            user_progress = {}
-
+        user_progress = _ensure_dict(analysis.user_progress, "user_progress")
         if 'roadmap_comments' not in user_progress:
             user_progress['roadmap_comments'] = {}
 
@@ -485,8 +533,8 @@ async def delete_roadmap_comment(
         if not analysis:
             raise HTTPException(status_code=404, detail="Analysis not found")
 
-        user_progress = analysis.user_progress or {}
-        if isinstance(user_progress, dict) and 'roadmap_comments' in user_progress:
+        user_progress = _ensure_dict(analysis.user_progress, "user_progress")
+        if 'roadmap_comments' in user_progress:
             task_comments = user_progress['roadmap_comments'].get(task_id, [])
             user_progress['roadmap_comments'][task_id] = [c for c in task_comments if c['id'] != comment_id]
             analysis.user_progress = user_progress
@@ -520,7 +568,10 @@ async def get_mission_details(
                 detail="Mission not found"
             )
 
-        if not _parse_action_plans(analysis):
+        action_plans = _parse_action_plans(analysis)
+        logger.info(f"[Missions] get_mission_details: analysis {analysis_id} has {len(action_plans)} action plans")
+
+        if not action_plans:
             return {
                 "success": True,
                 "data": {
@@ -530,34 +581,50 @@ async def get_mission_details(
                 }
             }
 
-        user_progress = analysis.user_progress or {}
-        completed_steps = user_progress.get('completed_actions', [])
+        user_progress = _ensure_dict(analysis.user_progress, "user_progress")
+        logger.info(f"[Missions] user_progress keys: {list(user_progress.keys())}")
+
+        completed_steps = _ensure_list(user_progress.get('completed_actions', []), "completed_actions")
+        completion_dates = _ensure_dict(user_progress.get('completion_dates', {}), "completion_dates")
+        reflections = _ensure_dict(user_progress.get('reflections', {}), "reflections")
+        mission_config = _ensure_dict(user_progress.get('mission_config'), "mission_config") or None
+
+        primary_bottleneck = _ensure_dict(analysis.primary_bottleneck, "primary_bottleneck")
 
         steps = []
-        for idx, action in enumerate(_parse_action_plans(analysis), 1):
+        for idx, action in enumerate(action_plans, 1):
             step_id = f"{analysis.id}_action_{idx}"
             is_completed = step_id in completed_steps
 
-            # Get full action details
-            what_to_do = action.get('what_to_do', action.get('what_to_do_steps', action.get('steps', [])))
-            why_matters = action.get('why_this_matters', action.get('why_it_matters', action.get('why_it_matters_bullets', [])))
+            what_to_do = _ensure_list(
+                action.get('what_to_do') or action.get('what_to_do_steps') or action.get('steps'),
+                f"action[{idx}].what_to_do"
+            )
+            why_matters = _ensure_list(
+                action.get('why_this_matters') or action.get('why_it_matters') or action.get('why_it_matters_bullets'),
+                f"action[{idx}].why_matters"
+            )
 
             steps.append({
                 'id': step_id,
                 'number': idx,
                 'day': idx,
-                'label': action.get('title', action.get('action_title', f'Action {idx}')),
-                'description': what_to_do[0] if what_to_do else '',
+                'label': action.get('title') or action.get('action_title') or f'Action {idx}',
+                'description': what_to_do[0] if what_to_do else action.get('description', ''),
                 'full_steps': what_to_do,
                 'why_it_matters': why_matters,
                 'effort': action.get('effort', 'MEDIUM'),
                 'done': is_completed,
                 'active': not is_completed and (idx == len(completed_steps) + 1),
                 'points': 20,
-                'toolkit': action.get('ai_tool', action.get('toolkit')),
-                'completed_at': user_progress.get('completion_dates', {}).get(step_id),
-                'reflection': user_progress.get('reflections', {}).get(step_id)
+                'toolkit': action.get('ai_tool') or action.get('toolkit'),
+                'completed_at': completion_dates.get(step_id),
+                'reflection': reflections.get(step_id)
             })
+
+        total = len(action_plans)
+        done_count = len(completed_steps)
+        logger.info(f"[Missions] analysis {analysis_id}: {done_count}/{total} steps done, mission_config={'present' if mission_config else 'absent'}")
 
         return {
             "success": True,
@@ -566,22 +633,22 @@ async def get_mission_details(
                 'analysis_id': analysis.id,
                 'business_goal': analysis.business_goal,
                 'title': analysis.strategic_priority or analysis.business_goal,
-                'description': analysis.primary_bottleneck.get('description', '') if analysis.primary_bottleneck else '',
+                'description': primary_bottleneck.get('description', ''),
                 'strategic_priority': analysis.strategic_priority,
-                'progress': round(len(completed_steps) / len(_parse_action_plans(analysis)) * 100, 1),
-                'total_steps': len(_parse_action_plans(analysis)),
-                'completed_steps': len(completed_steps),
-                'points_reward': len(_parse_action_plans(analysis)) * 20,
-                'status': 'completed' if len(completed_steps) == len(_parse_action_plans(analysis)) else 'active',
+                'progress': round(done_count / total * 100, 1),
+                'total_steps': total,
+                'completed_steps': done_count,
+                'points_reward': total * 20,
+                'status': 'completed' if done_count == total else ('active' if done_count > 0 else 'not_started'),
                 'steps': steps,
-                'mission_config': user_progress.get('mission_config'),
+                'mission_config': mission_config,
             }
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching mission details: {str(e)}")
+        logger.error(f"[Missions] Error in get_mission_details for analysis {analysis_id}: {type(e).__name__}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch mission details"
@@ -615,19 +682,23 @@ async def complete_mission_step(
                 detail="Invalid step number"
             )
 
-        # Initialize user_progress if not exists
-        user_progress = analysis.user_progress or {
-            'completed_actions': [],
-            'completion_dates': {},
-            'reflections': {}
-        }
+        # Parse user_progress safely — JSON columns can come back as strings
+        user_progress = _ensure_dict(analysis.user_progress, "user_progress")
+        if 'completed_actions' not in user_progress:
+            user_progress['completed_actions'] = []
+        if 'completion_dates' not in user_progress:
+            user_progress['completion_dates'] = {}
+        if 'reflections' not in user_progress:
+            user_progress['reflections'] = {}
+        # Ensure completed_actions is a list (might be stored as something else)
+        if not isinstance(user_progress['completed_actions'], list):
+            user_progress['completed_actions'] = []
 
         step_id = f"{analysis_id}_action_{step_number}"
+        logger.info(f"[Missions] Completing step {step_id}, current completed: {user_progress['completed_actions']}")
 
         # Mark as completed
-        if step_id not in user_progress.get('completed_actions', []):
-            if 'completed_actions' not in user_progress:
-                user_progress['completed_actions'] = []
+        if step_id not in user_progress['completed_actions']:
             user_progress['completed_actions'].append(step_id)
 
             if 'completion_dates' not in user_progress:
