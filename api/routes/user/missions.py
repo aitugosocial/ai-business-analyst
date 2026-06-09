@@ -425,7 +425,9 @@ async def activate_mission(
 
         user_progress['mission_config'] = {
             'mission_name': body.mission_name,
-            'start_date': body.start_date,
+            # Always use server-side UTC date so the countdown starts from NOW,
+            # regardless of when the analysis was originally run or what the client submitted.
+            'start_date': datetime.now(timezone.utc).date().isoformat(),
             'day_plans': body.day_plans or [],
             'opening_note': body.opening_note,
             'activated_at': datetime.now(timezone.utc).isoformat()
@@ -697,7 +699,9 @@ async def complete_mission_step(
         step_id = f"{analysis_id}_action_{step_number}"
         logger.info(f"[Missions] Completing step {step_id}, current completed: {user_progress['completed_actions']}")
 
-        # Mark as completed
+        chops_this_call = 0
+
+        # Mark as completed (idempotent — safe to call again for reflection updates)
         if step_id not in user_progress['completed_actions']:
             user_progress['completed_actions'].append(step_id)
 
@@ -707,12 +711,18 @@ async def complete_mission_step(
 
             # Award chops (20 points per step)
             current_user.total_chops = (current_user.total_chops or 0) + 20
+            chops_this_call += 20
 
-        # Save reflection if provided
-        if body.reflection:
+        # Save reflection if provided; award 20 bonus chops for the FIRST reflection
+        if body.reflection and body.reflection.strip():
             if 'reflections' not in user_progress:
                 user_progress['reflections'] = {}
+            is_new_reflection = not user_progress['reflections'].get(step_id)
             user_progress['reflections'][step_id] = body.reflection
+            if is_new_reflection:
+                current_user.total_chops = (current_user.total_chops or 0) + 20
+                chops_this_call += 20
+                logger.info(f"[Missions] Awarded 20 reflection chops for {step_id}")
 
         # Update analysis with new progress
         analysis.user_progress = user_progress
@@ -724,6 +734,7 @@ async def complete_mission_step(
             # Award bonus chops for completing entire mission
             bonus_chops = len(_parse_action_plans(analysis)) * 5
             current_user.total_chops = (current_user.total_chops or 0) + bonus_chops
+            chops_this_call += bonus_chops
 
         db.commit()
 
@@ -733,7 +744,7 @@ async def complete_mission_step(
             "data": {
                 'step_id': step_id,
                 'completed': True,
-                'chops_earned': 20,
+                'chops_earned': chops_this_call,
                 'mission_completed': is_mission_completed,
                 'total_chops': current_user.total_chops
             }
