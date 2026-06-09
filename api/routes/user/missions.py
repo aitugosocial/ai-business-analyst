@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 import json
 
 def _ensure_dict(value, field_name: str = "field") -> dict:
@@ -374,6 +375,7 @@ async def resolve_constraint(
             current_user.total_chops = (current_user.total_chops or 0) + 30
 
         analysis.user_progress = user_progress
+        flag_modified(analysis, 'user_progress')
         db.commit()
 
         return {
@@ -441,6 +443,7 @@ async def activate_mission(
             user_progress['completion_dates'] = {}
 
         analysis.user_progress = user_progress
+        flag_modified(analysis, 'user_progress')
         db.commit()
 
         return {
@@ -506,6 +509,7 @@ async def add_roadmap_comment(
 
         user_progress['roadmap_comments'][body.task_id] = task_comments
         analysis.user_progress = user_progress
+        flag_modified(analysis, 'user_progress')
         db.commit()
 
         return {"success": True, "data": new_comment}
@@ -540,6 +544,7 @@ async def delete_roadmap_comment(
             task_comments = user_progress['roadmap_comments'].get(task_id, [])
             user_progress['roadmap_comments'][task_id] = [c for c in task_comments if c['id'] != comment_id]
             analysis.user_progress = user_progress
+            flag_modified(analysis, 'user_progress')
             db.commit()
 
         return {"success": True, "message": "Comment deleted"}
@@ -708,12 +713,9 @@ async def complete_mission_step(
             if 'completion_dates' not in user_progress:
                 user_progress['completion_dates'] = {}
             user_progress['completion_dates'][step_id] = datetime.now(timezone.utc).isoformat()
+            # Chops are NOT awarded for step completion — only for reflections (see below)
 
-            # Award chops (20 points per step)
-            current_user.total_chops = (current_user.total_chops or 0) + 20
-            chops_this_call += 20
-
-        # Save reflection if provided; award 20 bonus chops for the FIRST reflection
+        # Save reflection if provided; award 20 chops for the FIRST reflection on this step
         if body.reflection and body.reflection.strip():
             if 'reflections' not in user_progress:
                 user_progress['reflections'] = {}
@@ -726,17 +728,15 @@ async def complete_mission_step(
 
         # Update analysis with new progress
         analysis.user_progress = user_progress
+        # flag_modified forces SQLAlchemy to issue an UPDATE even when the same
+        # dict object is mutated in-place (JSON columns are not tracked by default).
+        flag_modified(analysis, 'user_progress')
 
         # Check if mission completed
         is_mission_completed = len(user_progress['completed_actions']) == len(_parse_action_plans(analysis))
 
-        if is_mission_completed:
-            # Award bonus chops for completing entire mission
-            bonus_chops = len(_parse_action_plans(analysis)) * 5
-            current_user.total_chops = (current_user.total_chops or 0) + bonus_chops
-            chops_this_call += bonus_chops
-
         db.commit()
+        logger.info(f"[Missions] Persisted: {step_id} completed={step_id in user_progress['completed_actions']}, total_done={len(user_progress['completed_actions'])}")
 
         return {
             "success": True,
