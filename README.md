@@ -1,6 +1,6 @@
-# AI Business Analyst
+# The first business decision engine for solo founder
 
-A FastAPI-based app for recommending AI tools and providing business insights for creators/entrepreneurs.
+Lavoo is the very first gamified diagnostic and decision engine for the solo economy. Great business decisions can take days, months and years, now with Lavoo they take a few mins even seconds. This is the business doctor. 
 
 ## Setup
 1. Clone: git clone https://github.com/aitugosocial/ai-business-analyst.git
