@@ -425,11 +425,20 @@ async def activate_mission(
 
         user_progress = _ensure_dict(analysis.user_progress, "user_progress")
 
+        today = datetime.now(timezone.utc).date()
+        start_date = today
+        if body.start_date:
+            try:
+                requested_date = datetime.strptime(body.start_date, "%Y-%m-%d").date()
+                # Allow today or any future date; ignore past dates (defaults to today)
+                if requested_date >= today:
+                    start_date = requested_date
+            except ValueError:
+                pass
+
         user_progress['mission_config'] = {
             'mission_name': body.mission_name,
-            # Always use server-side UTC date so the countdown starts from NOW,
-            # regardless of when the analysis was originally run or what the client submitted.
-            'start_date': datetime.now(timezone.utc).date().isoformat(),
+            'start_date': start_date.isoformat(),
             'day_plans': body.day_plans or [],
             'opening_note': body.opening_note,
             'activated_at': datetime.now(timezone.utc).isoformat()
@@ -458,6 +467,63 @@ async def activate_mission(
         db.rollback()
         logger.error(f"Error activating mission: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to activate mission")
+
+
+class MissionAdjustRequest(BaseModel):
+    start_date: Optional[str] = None
+    day_plans: Optional[list] = None  # [{"day": 1, "durationDays": 1}, ...]
+
+
+@router.post("/{analysis_id}/adjust")
+async def adjust_mission(
+    analysis_id: int,
+    body: MissionAdjustRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Adjust an already-activated mission's start date and/or per-mission day allocations."""
+    try:
+        analysis = db.query(BusinessAnalysis).filter(
+            BusinessAnalysis.id == analysis_id,
+            BusinessAnalysis.user_id == current_user.id
+        ).first()
+
+        if not analysis:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+
+        user_progress = _ensure_dict(analysis.user_progress, "user_progress")
+        mission_config = _ensure_dict(user_progress.get('mission_config'), "mission_config")
+
+        if not mission_config:
+            raise HTTPException(status_code=400, detail="Mission has not been activated yet")
+
+        if body.start_date:
+            try:
+                datetime.strptime(body.start_date, "%Y-%m-%d")
+                mission_config['start_date'] = body.start_date
+            except ValueError:
+                raise HTTPException(status_code=400, detail="start_date must be in YYYY-MM-DD format")
+
+        if body.day_plans is not None:
+            mission_config['day_plans'] = body.day_plans
+
+        user_progress['mission_config'] = mission_config
+        analysis.user_progress = user_progress
+        flag_modified(analysis, 'user_progress')
+        db.commit()
+
+        return {
+            "success": True,
+            "message": "Mission adjusted",
+            "data": {"analysis_id": analysis_id, "mission_config": mission_config}
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error adjusting mission: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to adjust mission")
 
 
 class RoadmapCommentRequest(BaseModel):
