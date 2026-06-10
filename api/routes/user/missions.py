@@ -83,6 +83,38 @@ def _parse_action_plans(analysis):
             logger.warning(f"[Missions] action_plans[{i}] unexpected type {type(item).__name__}, skipping")
     return result
 
+def _flatten_roadmap_tasks(analysis):
+    """Flatten execution_roadmap phases into an ordered list of individual
+    mission tasks — one per "Day N" shown in the UI.
+
+    Each phase's `tasks` list is de-duplicated the same way the frontend does
+    (normalised first-60-chars match, reset per phase) so the count here always
+    matches the number of "All Tasks" / Day Button entries the user sees.
+    """
+    if not analysis or getattr(analysis, 'execution_roadmap', None) is None:
+        return []
+    roadmap = _ensure_list(getattr(analysis, 'execution_roadmap', []), "execution_roadmap")
+    flattened = []
+    for phase in roadmap:
+        if isinstance(phase, str):
+            try:
+                phase = json.loads(phase)
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if not isinstance(phase, dict):
+            continue
+        tasks = _ensure_list(phase.get('tasks'), "phase.tasks")
+        seen = set()
+        for t in tasks:
+            text = str(t)
+            key = ' '.join(text.lower().split())[:60]
+            if key in seen:
+                continue
+            seen.add(key)
+            flattened.append({'text': text, 'phase': phase.get('phase') or phase.get('title')})
+    return flattened
+
+
 from pydantic import BaseModel
 
 from database.pg_connections import get_db
@@ -177,8 +209,9 @@ async def get_user_missions(
                     'reflection': reflections.get(step_id)
                 })
 
-            # Calculate progress
-            total_steps = len(steps)
+            # Calculate progress — total missions = number of individual roadmap
+            # tasks (one per "Day N"), not the number of action plans.
+            total_steps = len(_flatten_roadmap_tasks(analysis)) or len(steps)
             completed_count = len(completed_steps)
             progress_percentage = (completed_count / total_steps * 100) if total_steps > 0 else 0
 
@@ -247,7 +280,7 @@ async def get_active_missions(
 
             user_progress = _ensure_dict(analysis.user_progress, f"user_progress[{analysis.id}]")
             completed_steps = _ensure_list(user_progress.get('completed_actions', []), "completed_actions")
-            total_steps = len(action_plans)
+            total_steps = len(_flatten_roadmap_tasks(analysis)) or len(action_plans)
 
             # Only include if not fully completed
             if len(completed_steps) < total_steps:
@@ -259,7 +292,7 @@ async def get_active_missions(
                     'progress': round(len(completed_steps) / total_steps * 100, 1) if total_steps > 0 else 0,
                     'total_steps': total_steps,
                     'completed_steps': len(completed_steps),
-                    'next_action': _parse_action_plans(analysis)[len(completed_steps)].get('title', '') if len(completed_steps) < len(_parse_action_plans(analysis)) else None
+                    'next_action': action_plans[len(completed_steps)].get('title', '') if len(completed_steps) < len(action_plans) else None
                 })
 
         return {
@@ -641,10 +674,13 @@ async def get_mission_details(
                 detail="Mission not found"
             )
 
-        action_plans = _parse_action_plans(analysis)
-        logger.info(f"[Missions] get_mission_details: analysis {analysis_id} has {len(action_plans)} action plans")
+        # Each individual roadmap task is one mission ("Day N" / D-number) —
+        # not each action_plan. The number of missions is whatever the LLM's
+        # execution_roadmap actually contains, however many that is.
+        roadmap_tasks = _flatten_roadmap_tasks(analysis)
+        logger.info(f"[Missions] get_mission_details: analysis {analysis_id} has {len(roadmap_tasks)} roadmap tasks")
 
-        if not action_plans:
+        if not roadmap_tasks:
             return {
                 "success": True,
                 "data": {
@@ -665,37 +701,26 @@ async def get_mission_details(
         primary_bottleneck = _ensure_dict(analysis.primary_bottleneck, "primary_bottleneck")
 
         steps = []
-        for idx, action in enumerate(action_plans, 1):
+        for idx, task in enumerate(roadmap_tasks, 1):
             step_id = f"{analysis.id}_action_{idx}"
             is_completed = step_id in completed_steps
-
-            what_to_do = _ensure_list(
-                action.get('what_to_do') or action.get('what_to_do_steps') or action.get('steps'),
-                f"action[{idx}].what_to_do"
-            )
-            why_matters = _ensure_list(
-                action.get('why_this_matters') or action.get('why_it_matters') or action.get('why_it_matters_bullets'),
-                f"action[{idx}].why_matters"
-            )
 
             steps.append({
                 'id': step_id,
                 'number': idx,
                 'day': idx,
-                'label': action.get('title') or action.get('action_title') or f'Action {idx}',
-                'description': what_to_do[0] if what_to_do else action.get('description', ''),
-                'full_steps': what_to_do,
-                'why_it_matters': why_matters,
-                'effort': action.get('effort', 'MEDIUM'),
+                'label': task['text'],
+                'description': task['text'],
+                'phase': task.get('phase'),
+                'effort': 'MEDIUM',
                 'done': is_completed,
                 'active': not is_completed and (idx == len(completed_steps) + 1),
                 'points': 20,
-                'toolkit': action.get('ai_tool') or action.get('toolkit'),
                 'completed_at': completion_dates.get(step_id),
                 'reflection': reflections.get(step_id)
             })
 
-        total = len(action_plans)
+        total = len(roadmap_tasks)
         done_count = len(completed_steps)
         logger.info(f"[Missions] analysis {analysis_id}: {done_count}/{total} steps done, mission_config={'present' if mission_config else 'absent'}")
 
@@ -749,7 +774,8 @@ async def complete_mission_step(
                 detail="Mission not found"
             )
 
-        if not _parse_action_plans(analysis) or step_number > len(_parse_action_plans(analysis)):
+        roadmap_tasks = _flatten_roadmap_tasks(analysis)
+        if not roadmap_tasks or step_number > len(roadmap_tasks):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid step number"
@@ -801,7 +827,7 @@ async def complete_mission_step(
         flag_modified(analysis, 'user_progress')
 
         # Check if mission completed
-        is_mission_completed = len(user_progress['completed_actions']) == len(_parse_action_plans(analysis))
+        is_mission_completed = len(user_progress['completed_actions']) == len(roadmap_tasks)
 
         db.commit()
         logger.info(f"[Missions] Persisted: {step_id} completed={step_id in user_progress['completed_actions']}, total_done={len(user_progress['completed_actions'])}")
