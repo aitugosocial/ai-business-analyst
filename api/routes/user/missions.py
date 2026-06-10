@@ -779,7 +779,9 @@ async def complete_mission_step(
             if 'completion_dates' not in user_progress:
                 user_progress['completion_dates'] = {}
             user_progress['completion_dates'][step_id] = datetime.now(timezone.utc).isoformat()
-            # Chops are NOT awarded for step completion — only for reflections (see below)
+            # Award 20 chops for completing the mission step itself (first time only)
+            current_user.total_chops = (current_user.total_chops or 0) + 20
+            chops_this_call += 20
 
         # Save reflection if provided; award 20 chops for the FIRST reflection on this step
         if body.reflection and body.reflection.strip():
