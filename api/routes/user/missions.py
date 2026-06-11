@@ -95,7 +95,7 @@ def _flatten_roadmap_tasks(analysis):
         return []
     roadmap = _ensure_list(getattr(analysis, 'execution_roadmap', []), "execution_roadmap")
     flattened = []
-    for phase in roadmap:
+    for phase_index, phase in enumerate(roadmap):
         if isinstance(phase, str):
             try:
                 phase = json.loads(phase)
@@ -105,13 +105,22 @@ def _flatten_roadmap_tasks(analysis):
             continue
         tasks = _ensure_list(phase.get('tasks'), "phase.tasks")
         seen = set()
+        task_index = 0
         for t in tasks:
             text = str(t)
             key = ' '.join(text.lower().split())[:60]
             if key in seen:
                 continue
             seen.add(key)
-            flattened.append({'text': text, 'phase': phase.get('phase') or phase.get('title')})
+            flattened.append({
+                'text': text,
+                'phase': phase.get('phase') or phase.get('title'),
+                # Matches the id the frontend assigns to this same task in
+                # execution-roadmap-enhanced.tsx's roadmap-transform effect,
+                # which is how `roadmap_comments` are keyed.
+                'frontend_id': f"task-{phase_index}-{task_index}",
+            })
+            task_index += 1
     return flattened
 
 
@@ -187,31 +196,36 @@ async def get_user_missions(
             completed_steps = _ensure_list(user_progress.get('completed_actions', []), "completed_actions")
             reflections = _ensure_dict(user_progress.get('reflections', {}), "reflections")
 
-            # Convert action plans to mission steps
+            # Convert roadmap tasks to mission steps — one step per "Day N"
+            # roadmap task (the same flattened D1..DN list shown on the
+            # results page), not one per action plan.
+            roadmap_tasks = _flatten_roadmap_tasks(analysis)
+            # Fall back to one step per action plan only if the analysis has
+            # no execution_roadmap at all.
+            source_tasks = roadmap_tasks or [
+                {'text': a.get('title') or a.get('action_title') or f'Action {i}'}
+                for i, a in enumerate(action_plans, 1)
+            ]
             steps = []
-            for idx, action in enumerate(action_plans, 1):
+            for idx, task in enumerate(source_tasks, 1):
                 step_id = f"{analysis.id}_action_{idx}"
                 is_completed = step_id in completed_steps
 
-                what_to_do = _ensure_list(
-                    action.get('what_to_do') or action.get('what_to_do_steps'),
-                    f"action[{idx}].what_to_do"
-                )
                 steps.append({
                     'id': step_id,
                     'day': idx,
-                    'label': action.get('title') or action.get('action_title') or f'Action {idx}',
-                    'description': what_to_do[0] if what_to_do else action.get('description', ''),
+                    'label': task['text'],
+                    'description': task['text'],
                     'done': is_completed,
                     'active': not is_completed and (idx == len(completed_steps) + 1),
                     'points': 20,
-                    'effort': action.get('effort', 'MEDIUM'),
+                    'effort': 'MEDIUM',
                     'reflection': reflections.get(step_id)
                 })
 
             # Calculate progress — total missions = number of individual roadmap
             # tasks (one per "Day N"), not the number of action plans.
-            total_steps = len(_flatten_roadmap_tasks(analysis)) or len(steps)
+            total_steps = len(roadmap_tasks) or len(steps)
             completed_count = len(completed_steps)
             progress_percentage = (completed_count / total_steps * 100) if total_steps > 0 else 0
 
@@ -696,6 +710,7 @@ async def get_mission_details(
         completed_steps = _ensure_list(user_progress.get('completed_actions', []), "completed_actions")
         completion_dates = _ensure_dict(user_progress.get('completion_dates', {}), "completion_dates")
         reflections = _ensure_dict(user_progress.get('reflections', {}), "reflections")
+        roadmap_comments = _ensure_dict(user_progress.get('roadmap_comments', {}), "roadmap_comments")
         mission_config = _ensure_dict(user_progress.get('mission_config'), "mission_config") or None
 
         primary_bottleneck = _ensure_dict(analysis.primary_bottleneck, "primary_bottleneck")
@@ -717,7 +732,8 @@ async def get_mission_details(
                 'active': not is_completed and (idx == len(completed_steps) + 1),
                 'points': 20,
                 'completed_at': completion_dates.get(step_id),
-                'reflection': reflections.get(step_id)
+                'reflection': reflections.get(step_id),
+                'comments': roadmap_comments.get(task['frontend_id'], [])
             })
 
         total = len(roadmap_tasks)
