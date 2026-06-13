@@ -472,14 +472,16 @@ async def activate_mission(
 
         user_progress = _ensure_dict(analysis.user_progress, "user_progress")
 
-        today = datetime.now(timezone.utc).date()
-        start_date = today
+        # Default to the server's UTC date only if the client didn't send one.
+        # Trust a client-supplied date as-is — it reflects the user's LOCAL
+        # calendar day, which can legitimately be a day ahead or behind the
+        # server's UTC date depending on the user's timezone. Re-validating
+        # it against UTC "today" would silently overwrite a correct local
+        # date with an off-by-one UTC date.
+        start_date = datetime.now(timezone.utc).date()
         if body.start_date:
             try:
-                requested_date = datetime.strptime(body.start_date, "%Y-%m-%d").date()
-                # Allow today or any future date; ignore past dates (defaults to today)
-                if requested_date >= today:
-                    start_date = requested_date
+                start_date = datetime.strptime(body.start_date, "%Y-%m-%d").date()
             except ValueError:
                 pass
 
