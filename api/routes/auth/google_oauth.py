@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from database.pg_connections import get_db
 from database.pg_models import User
 from api.routes.auth.login import create_access_token
+from api.services.streak_service import update_login_streak
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +187,9 @@ async def google_callback(
                 
                 db.add(user)
                 logger.info(f"New user created via Google OAuth: {email}")
-            
+
+            update_login_streak(db, user)
+
             db.commit()
             db.refresh(user)
             

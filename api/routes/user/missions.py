@@ -625,9 +625,17 @@ async def add_roadmap_comment(
         user_progress['roadmap_comments'][body.task_id] = task_comments
         analysis.user_progress = user_progress
         flag_modified(analysis, 'user_progress')
+
+        # Award chops for engaging with the roadmap via comments/replies
+        chops_earned = 20
+        current_user.total_chops = (current_user.total_chops or 0) + chops_earned
+
         db.commit()
 
-        return {"success": True, "data": new_comment}
+        return {
+            "success": True,
+            "data": {**new_comment, "chops_earned": chops_earned, "total_chops": current_user.total_chops},
+        }
 
     except HTTPException:
         raise

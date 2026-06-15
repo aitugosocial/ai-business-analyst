@@ -326,6 +326,7 @@ async def get_user_progress(
         return {
             "total_chops": chops,
             "execution_streak": streak,
+            "login_streak": user.login_streak or 0,
             "total_analyses": total_analyses,
             "analyses_last_30_days": analyses_30d,
             "execution_score": execution_score,

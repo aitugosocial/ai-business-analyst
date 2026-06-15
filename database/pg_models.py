@@ -5,7 +5,7 @@ This file contains all ORM models for the application.
 """
 
 from pydantic import BaseModel, ConfigDict, EmailStr
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text, ForeignKey, JSON, Boolean, DECIMAL, Enum, Numeric, Index
+from sqlalchemy import Column, Date, DateTime, Float, Integer, String, Text, ForeignKey, JSON, Boolean, DECIMAL, Enum, Numeric, Index
 from sqlalchemy.dialects.postgresql import UUID, INET, JSONB
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import relationship, synonym
@@ -56,6 +56,13 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     user_status = Column(String(20), server_default="active", nullable=False)
     last_login = Column(DateTime(timezone=True), nullable=True)
+
+    # Daily login streak (Lavoo chops): consecutive calendar days logged in.
+    # Resets to 0 the moment a 7-day streak is rewarded (next login starts a
+    # fresh cycle at 1); also resets to 0/1 if a day is missed.
+    login_streak = Column(Integer, default=0)
+    login_streak_date = Column(Date, nullable=True)
+
     subscription_status = Column(String, default="Free")
     subscription_plan = Column(String, nullable=True)
 
@@ -416,6 +423,7 @@ class NotificationType(enum.Enum):
     REFERRAL_REGISTERED = "referral_registered"
     PAYOUT_COMPLETED = "payout_completed"
     SYSTEM_ALERT = "system_alert"
+    LOGIN_STREAK_REWARD = "login_streak_reward"
 
 class UserNotification(Base):
     """

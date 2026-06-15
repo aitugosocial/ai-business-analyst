@@ -20,6 +20,7 @@ from database.pg_connections import get_db
 from typing import Optional
 from database.pg_models import ShowUser, User, AuthResponse, FailedLoginAttempt, SecurityEvent, IPBlacklist
 from api.utils.sub_utils import sync_user_subscription
+from api.services.streak_service import update_login_streak
 
 bearer_scheme = HTTPBearer()
 router = APIRouter(prefix="", tags=["authenticate"])
@@ -464,6 +465,7 @@ def login(request: ShowUser, response: Response, fastapi_request: Request, db: S
     # When they login again, they become active automatically
     user.updated_at = datetime.now(timezone.utc)
     user.last_login = datetime.now(timezone.utc)
+    update_login_streak(db, user)
 
     # Note: Subscription status sync moved to dashboard load (lazy loading)
     # to prevent blocking login endpoint
