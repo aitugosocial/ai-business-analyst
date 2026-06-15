@@ -3,7 +3,6 @@ from datetime import datetime, timezone, timedelta
 import logging
 
 from database.pg_models import User, NotificationType
-from api.services.notification_service import NotificationService
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +22,7 @@ def update_login_streak(db: Session, user: User) -> None:
       reset the streak to 0 (the next login starts a fresh cycle at 1), and
       create a notification for the user.
     """
+    from api.services.notification_service import NotificationService
     today = datetime.now(timezone.utc).date()
     last_date = user.login_streak_date
 
