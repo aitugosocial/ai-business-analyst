@@ -121,7 +121,7 @@ def _flatten_roadmap_tasks(analysis):
                 'frontend_id': f"task-{phase_index}-{task_index}",
             })
             task_index += 1
-    return flattened
+    return flattened[:7]
 
 
 from pydantic import BaseModel
@@ -824,6 +824,22 @@ async def complete_mission_step(
 
         chops_this_call = 0
 
+        # Award 20 chops only for the very first mission step ever completed by this user.
+        # All subsequent step completions earn 0; reflections/comments are the only other
+        # source of chops after that first step.
+        is_first_ever_step = False
+        if step_id not in user_progress['completed_actions'] and len(user_progress['completed_actions']) == 0:
+            other_analyses = db.query(BusinessAnalysis).filter(
+                BusinessAnalysis.user_id == current_user.id,
+                BusinessAnalysis.id != analysis_id
+            ).all()
+            has_prior_completion = any(
+                _ensure_dict(a.user_progress, "user_progress").get('completed_actions')
+                for a in other_analyses
+            )
+            if not has_prior_completion:
+                is_first_ever_step = True
+
         # Mark as completed (idempotent — safe to call again for reflection updates)
         if step_id not in user_progress['completed_actions']:
             user_progress['completed_actions'].append(step_id)
@@ -831,9 +847,9 @@ async def complete_mission_step(
             if 'completion_dates' not in user_progress:
                 user_progress['completion_dates'] = {}
             user_progress['completion_dates'][step_id] = datetime.now(timezone.utc).isoformat()
-            # Award 20 chops for completing the mission step itself (first time only)
-            current_user.total_chops = (current_user.total_chops or 0) + 20
-            chops_this_call += 20
+            if is_first_ever_step:
+                current_user.total_chops = (current_user.total_chops or 0) + 20
+                chops_this_call += 20
 
         # Save reflection if provided; award 20 chops for the FIRST reflection on this step
         if body.reflection and body.reflection.strip():

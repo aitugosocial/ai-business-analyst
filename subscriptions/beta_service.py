@@ -129,8 +129,12 @@ class BetaService:
                 launch_date = BetaService.get_launch_date()
                 if launch_date:
                     grace_end = BetaService.calculate_grace_period_end(launch_date)
-                    
-            if now < grace_end:
+            # Normalize to naive UTC before comparing — DB TIMESTAMPTZ columns are
+            # returned as timezone-aware datetimes which can't be compared to the
+            # naive `now` above, causing "can't compare offset-naive and
+            # offset-aware datetimes" at runtime.
+            grace_end_cmp = grace_end.replace(tzinfo=None) if grace_end.tzinfo else grace_end
+            if now < grace_end_cmp:
                 return True
         
         # Fallback to global launch date
@@ -263,7 +267,8 @@ class BetaService:
                     "show_card_info": False
                 }
 
-            time_remaining = grace_end - now
+            grace_end_cmp = grace_end.replace(tzinfo=None) if grace_end.tzinfo else grace_end
+            time_remaining = grace_end_cmp - now
             days_rem = time_remaining.days
             
             is_beta = getattr(user, 'is_beta_user', False)
