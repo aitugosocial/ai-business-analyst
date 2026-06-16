@@ -24,7 +24,7 @@ def upgrade() -> None:
     # guards are used throughout so the migration is safe to run against a DB
     # that is partially or fully ahead of Alembic's recorded revision.
 
-    # --- security_metrics_summary ------------------------------------------
+    # --- security_metrics_summary -------------------------------------------
     op.execute("""
         CREATE TABLE IF NOT EXISTS security_metrics_summary (
             total_events_24h         INTEGER NOT NULL PRIMARY KEY,
