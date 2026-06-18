@@ -1157,6 +1157,10 @@ OUTPUT FORMAT (JSON only, no markdown fences):
 
         except Exception as e:
             logger.error(f"Stage 3B failed: {e}", exc_info=True)
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
             return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
 
     async def _recommend_single_tool(self, user_query: str, action_plans: list = None) -> Dict[str, Any]:
@@ -1261,6 +1265,10 @@ OUTPUT (JSON only, no markdown):
             return {"recommended_tool_stacks": [], "single_tool_recommendation": single_tool}
         except Exception as e:
             logger.error(f"Single-tool recommendation failed: {e}", exc_info=True)
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
             return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
 
     # =========================================================================
@@ -1445,6 +1453,14 @@ OUTPUT FORMAT (JSON only, no markdown):
     ) -> int:
         """Persist analysis results to the database."""
         from database.pg_models import BusinessAnalysis
+
+        # Clear any aborted transaction state left by earlier DB operations
+        # (e.g., failed tool lookups in _recommend_single_tool or _stage3_automation_stacks).
+        # Only read operations happen before this point, so rolling back is safe.
+        try:
+            self.db.rollback()
+        except Exception:
+            pass
 
         try:
             single_tool_recommendation = automation_stack_result.get("single_tool_recommendation")
