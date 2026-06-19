@@ -255,10 +255,35 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                 
                 db.add(new_subscription)
                 db.flush()
-                
+
+                # Award 20 chops to the referrer if this subscriber was referred
+                from database.pg_models import Referral as ReferralModel
+                referral_record = db.query(ReferralModel).filter(
+                    ReferralModel.referred_user_id == user.id
+                ).first()
+                if referral_record:
+                    referrer_user = db.query(User).filter(User.id == referral_record.referrer_id).first()
+                    if referrer_user:
+                        referrer_user.total_chops = (referrer_user.total_chops or 0) + 20
+                        referrer_user.referral_chops = (referrer_user.referral_chops or 0) + 20
+                        referral_record.chops_awarded = (referral_record.chops_awarded or 0) + 20
+                        logger.info(
+                            "[FLW verify] awarded 20 chops to referrer %s for referred user %s subscribing",
+                            referrer_user.id, user.id
+                        )
+                        from api.services.notification_service import NotificationService as NS
+                        NS.create_notification(
+                            db=db,
+                            user_id=referrer_user.id,
+                            type="referral_subscription",
+                            title="🎉 Referral Subscribed!",
+                            message=f"{user.name} subscribed to a plan. You earned 20 chops!",
+                            link="/dashboard/earnings"
+                        )
+
                 # Calculate commission
                 from subscriptions.commission_service import CommissionService
-                
+
                 commission = CommissionService.calculate_commission(
                     subscription=new_subscription,
                     db=db

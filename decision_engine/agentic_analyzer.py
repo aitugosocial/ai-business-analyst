@@ -837,7 +837,11 @@ Omit any plan where no catalog tool genuinely fits its specific steps."""
             toolkit = {
                 "tool_name": canonical,
                 "website": assignment.get("website") or all_tools[canonical].get("url") or None,
-                "what_it_helps": assignment.get("what_it_helps", ""),
+                # Prefer LLM-generated plan-specific description; fall back to DB description
+                "what_it_helps": (
+                    assignment.get("what_it_helps")
+                    or all_tools[canonical].get("description", "")
+                ),
             }
             action_plans[raw_plan_idx]["toolkit"] = toolkit
             logger.info(
@@ -1312,10 +1316,11 @@ TASK: Build a 7-day sprint roadmap that walks through the highest-priority actio
 ROADMAP RULES:
 1. Break the 7 days into 2-4 phases — no more than 4
 2. Phase names describe what YOU are actively DOING in second person ("Days 1-2: Audit Your Current Funnel and Identify the Three Biggest Leaks" not "Phase 1: Discovery")
-3. Each phase contains 2-4 tasks drawn directly from the action plan steps above — no invented tasks
+3. Each phase contains tasks drawn directly from the action plan steps above — no invented tasks
 4. Where a task involves a tool, name the specific first action to take in it
 5. Tasks are complete sentences in second person: specific action + specific output
 6. The total span equals exactly 7 days
+10. CRITICAL: The total number of tasks across ALL phases MUST equal exactly 7. Count carefully before submitting: tasks_in_phase_1 + tasks_in_phase_2 + ... = 7. Distribute tasks unevenly across phases if needed to hit 7 exactly.
 7. Sequence: AUDIT AND DECIDE first → BUILD AND SHIP second → MEASURE AND ADJUST last
 8. No task repeats across phases
 9. FORMATTING: Do NOT start any task with a dash (-), bullet, or em dash. Write plain complete sentences only.
@@ -1373,6 +1378,26 @@ OUTPUT FORMAT (JSON only, no markdown):
                         seen.add(key)
                         deduped.append(t)
                 phase["tasks"] = deduped
+
+            # Enforce exactly 7 tasks total. Trim excess; warn on deficit but
+            # never pad synthetically — better to have 6 real tasks than 7 with
+            # a fabricated one.
+            roadmap = result.get("execution_roadmap", [])
+            total_tasks = sum(len(p.get("tasks", [])) for p in roadmap)
+            if total_tasks > 7:
+                remaining = 7
+                for phase in roadmap:
+                    tasks = phase.get("tasks", [])
+                    take = min(len(tasks), remaining)
+                    phase["tasks"] = tasks[:take]
+                    remaining -= take
+                    if remaining == 0:
+                        for later_phase in roadmap[roadmap.index(phase) + 1:]:
+                            later_phase["tasks"] = []
+                        break
+                logger.info(f"Trimmed roadmap tasks from {total_tasks} → 7")
+            elif total_tasks < 7:
+                logger.warning(f"Roadmap has {total_tasks} tasks (expected 7) — LLM under-generated")
 
             logger.info(
                 f"Created {result['total_phases']}-phase roadmap ({result['estimated_days']} days)"
