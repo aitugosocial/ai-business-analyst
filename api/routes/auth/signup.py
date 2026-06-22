@@ -161,11 +161,16 @@ def signup(
         new_user.total_chops = (new_user.total_chops or 0) + 10
         logger.info(f"[SIGNUP] Awarded 10 chops to referred user {new_user.email}")
 
+        # Award 10 chops to the referrer for a successful signup using their code
+        referrer.total_chops = (referrer.total_chops or 0) + 10
+        referrer.referral_chops = (referrer.referral_chops or 0) + 10
+        logger.info(f"[SIGNUP] Awarded 10 chops to referrer {referrer.email}")
+
         # Create referral record (chops_awarded tracks referrer's reward, set on subscription)
         referral = Referral(
             referrer_id=referrer.id,
             referred_user_id=new_user.id,
-            chops_awarded=0,
+            chops_awarded=10,
             created_at=datetime.now(timezone.utc)
         )
         db.add(referral)
@@ -180,13 +185,13 @@ def signup(
             link="/dashboard/earnings"
         )
 
-        # Notify referrer of the new signup
+        # Notify referrer of the new signup + their chops reward
         NotificationService.create_notification(
             db=db,
             user_id=referrer.id,
             type=NotificationType.REFERRAL_REGISTERED.value,
-            title="New Referral!",
-            message=f"{new_user.name} has registered using your link.",
+            title="New Referral! +10 Chops",
+            message=f"{new_user.name} signed up using your referral link. You earned 10 chops!",
             link="/dashboard/referrals"
         )
 
