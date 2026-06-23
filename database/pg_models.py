@@ -1593,6 +1593,9 @@ class UserSettings(Base):
     profile_visibility = Column(String(50), default="community")  # public, community, private
     show_earnings = Column(Boolean, default=True)
 
+    # Community Settings
+    show_mission_comments_in_community = Column(Boolean, default=False)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -1639,7 +1642,9 @@ class CommunityDiscussion(Base):
     like_count = Column(Integer, default=0)
     reply_count = Column(Integer, default=0)
     view_count = Column(Integer, default=0)
+    chops_gifted = Column(Integer, default=0)
     is_pinned = Column(Boolean, default=False)
+    post_type = Column(String(50), default="discussion")  # discussion | reflection
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     channel = relationship("CommunityChannel", back_populates="discussions")

@@ -17,6 +17,7 @@ from database.pg_models import (
     CommunityDiscussion, DiscussionReply, DiscussionLike,
     CommunityEvent, EventRegistration,
     CommunityActivity, SavedItem,
+    UserSettings, UserMissionStep, UserMission,
 )
 from api.routes.auth.login import get_current_user
 
@@ -75,6 +76,10 @@ def _channel_dict(ch: CommunityChannel, joined_ids: Optional[set] = None) -> dic
     }
 
 
+class GiftChopsRequest(BaseModel):
+    amount: int
+
+
 def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None) -> dict:
     has_liked = d.id in liked_ids if liked_ids is not None else False
     return {
@@ -84,6 +89,8 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None) ->
         "pinned": d.is_pinned, "is_pinned": d.is_pinned,
         "hot": d.like_count >= 10,  # computed: hot if 10+ likes
         "view_count": d.view_count, "has_liked": has_liked, "liked_by_user": has_liked,
+        "chops_gifted": d.chops_gifted or 0,
+        "type": getattr(d, 'post_type', None) or 'discussion',
         "author": {"id": d.user.id, "name": d.user.name} if d.user else None,
         "channel": {"id": d.channel.id, "name": d.channel.name, "slug": d.channel.slug} if d.channel else None,
         "created_at": d.created_at.isoformat() if d.created_at else None,
@@ -118,6 +125,7 @@ class CreateDiscussionRequest(BaseModel):
     content: str
     channel_id: int
     tags: Optional[List[str]] = None
+    type: Optional[str] = "discussion"  # "discussion" | "reflection"
 
 
 class CreateReplyRequest(BaseModel):
@@ -265,7 +273,58 @@ async def get_discussions(
             DiscussionLike.user_id == current_user.id,
             DiscussionLike.discussion_id.in_(discussion_ids)
         ).all()} if discussion_ids else set()
-        return {"success": True, "data": [_discussion_dict(d, liked) for d in discussions]}
+        result = [_discussion_dict(d, liked) for d in discussions]
+
+        # Include mission step reflections from users who opted in
+        try:
+            opted_in_user_ids = db.query(UserSettings.user_id).filter(
+                UserSettings.show_mission_comments_in_community == True
+            ).all()
+            opted_in_ids = [row[0] for row in opted_in_user_ids]
+            if opted_in_ids:
+                steps_with_reflections = (
+                    db.query(UserMissionStep, User)
+                    .join(UserMission, UserMissionStep.user_mission_id == UserMission.id)
+                    .join(User, UserMission.user_id == User.id)
+                    .filter(
+                        UserMission.user_id.in_(opted_in_ids),
+                        UserMissionStep.reflection.isnot(None),
+                        UserMissionStep.reflection != '',
+                        UserMissionStep.completed == True,
+                    )
+                    .order_by(UserMissionStep.completed_at.desc())
+                    .limit(50)
+                    .all()
+                )
+                used_keys: set = set()
+                for step, author in steps_with_reflections:
+                    key = f"ms_{step.id}"
+                    if key in used_keys:
+                        continue
+                    used_keys.add(key)
+                    result.append({
+                        "id": f"ms_{step.id}",
+                        "type": "reflection",
+                        "title": (step.reflection or '')[:80],
+                        "content": step.reflection or '',
+                        "excerpt": (step.reflection or '')[:160],
+                        "tags": [],
+                        "like_count": 0, "reply_count": 0,
+                        "likes": 0, "replies": 0,
+                        "pinned": False, "is_pinned": False,
+                        "hot": False,
+                        "view_count": 0,
+                        "has_liked": False, "liked_by_user": False,
+                        "chops_gifted": 0,
+                        "author": {"id": author.id, "name": author.name or "Member"},
+                        "channel": "resources-and-reflections",
+                        "created_at": step.completed_at.isoformat() if step.completed_at else None,
+                        "updated_at": None,
+                    })
+        except Exception as reflection_err:
+            logger.warning(f"Mission reflections fetch error: {reflection_err}")
+
+        return {"success": True, "data": result}
     except Exception as e:
         logger.error(f"Get discussions error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch discussions")
@@ -305,10 +364,11 @@ async def create_discussion(
     if not ch:
         raise HTTPException(status_code=404, detail="Channel not found")
 
+    post_type = (body.type or 'discussion') if body.type in ('discussion', 'reflection') else 'discussion'
     d = CommunityDiscussion(
         channel_id=body.channel_id, user_id=current_user.id,
         title=body.title.strip(), content=body.content.strip(),
-        tags=body.tags or []
+        tags=body.tags or [], post_type=post_type,
     )
     db.add(d)
     ch.post_count = (ch.post_count or 0) + 1
@@ -316,7 +376,7 @@ async def create_discussion(
     db.commit()
     db.refresh(d)
     _log_activity(db, current_user.id, "posted", d.id, "discussion", d.title)
-    return {"success": True, "data": _discussion_dict(d, current_user.id, db)}
+    return {"success": True, "data": _discussion_dict(d, set())}
 
 
 @router.post("/discussions/{discussion_id}/like")
@@ -341,6 +401,34 @@ async def like_discussion(
     d.like_count = (d.like_count or 0) + 1
     db.commit()
     return {"success": True, "liked": True, "like_count": d.like_count}
+
+
+@router.post("/discussions/{discussion_id}/gift_chops")
+async def gift_chops_to_discussion(
+    discussion_id: int,
+    body: GiftChopsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+    if (current_user.total_chops or 0) < body.amount:
+        raise HTTPException(status_code=400, detail="Insufficient chops")
+
+    current_user.total_chops = (current_user.total_chops or 0) - body.amount
+
+    if d.user_id and d.user_id != current_user.id:
+        author = db.query(User).filter_by(id=d.user_id).first()
+        if author:
+            author.total_chops = (author.total_chops or 0) + body.amount
+
+    d.chops_gifted = (d.chops_gifted or 0) + body.amount
+    db.commit()
+
+    return {"success": True, "chops_gifted": d.chops_gifted, "remaining_chops": current_user.total_chops}
 
 
 @router.post("/discussions/{discussion_id}/replies")

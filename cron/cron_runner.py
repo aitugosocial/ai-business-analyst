@@ -1,14 +1,88 @@
 #!/usr/bin/env python3
 """
-Entry point for the Railway cron service container.
-Startup command: python cron/cron_runner.py
-Delegates to scripts/cron_runner.py which contains the full scheduler.
+Cron runner — entry point for the Railway cron service container.
+
+Schedule:
+  insights   — every 4 hours
+  cleanup    — once per day (every 24 hours)
 """
+
+import asyncio
+import logging
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Re-use the canonical runner that already lives in scripts/
-exec(open(PROJECT_ROOT / "scripts" / "cron_runner.py").read())
+from dotenv import load_dotenv
+load_dotenv(PROJECT_ROOT / ".env.local")
+load_dotenv(PROJECT_ROOT / ".env.production")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("cron_runner")
+
+INSIGHTS_INTERVAL_SECONDS = 4 * 60 * 60   # 4 hours
+CLEANUP_INTERVAL_SECONDS  = 24 * 60 * 60  # 24 hours
+
+
+def _run_script(script_name: str) -> int:
+    script_path = PROJECT_ROOT / "scripts" / script_name
+    logger.info(f"▶ Running {script_name}")
+    result = subprocess.run(
+        [sys.executable, str(script_path)],
+        cwd=str(PROJECT_ROOT),
+    )
+    if result.returncode == 0:
+        logger.info(f"✅ {script_name} completed successfully")
+    else:
+        logger.error(f"❌ {script_name} exited with code {result.returncode}")
+    return result.returncode
+
+
+async def run_insights_loop():
+    while True:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _run_script, "cron_insights.py")
+        except Exception as exc:
+            logger.error(f"Insights job error: {exc}", exc_info=True)
+        logger.info(f"Next insights run in {INSIGHTS_INTERVAL_SECONDS // 3600}h")
+        await asyncio.sleep(INSIGHTS_INTERVAL_SECONDS)
+
+
+async def run_cleanup_loop():
+    while True:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _run_script, "cron_cleanup.py")
+        except Exception as exc:
+            logger.error(f"Cleanup job error: {exc}", exc_info=True)
+        logger.info(f"Next cleanup run in {CLEANUP_INTERVAL_SECONDS // 3600}h")
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+
+
+async def main():
+    logger.info("=" * 60)
+    logger.info(f"Lavoo Cron Runner starting — {datetime.now().isoformat()}")
+    logger.info(f"  Insights : every {INSIGHTS_INTERVAL_SECONDS // 3600}h")
+    logger.info(f"  Cleanup  : every {CLEANUP_INTERVAL_SECONDS // 3600}h")
+    logger.info("=" * 60)
+
+    logger.info("Running initial pass of all jobs...")
+    await asyncio.get_event_loop().run_in_executor(None, _run_script, "cron_insights.py")
+    await asyncio.get_event_loop().run_in_executor(None, _run_script, "cron_cleanup.py")
+    logger.info("Initial pass complete. Entering scheduled loop.")
+
+    await asyncio.gather(
+        run_insights_loop(),
+        run_cleanup_loop(),
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

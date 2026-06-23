@@ -40,6 +40,9 @@ class UserSettingsResponse(BaseModel):
     profileVisibility: str
     showEarnings: bool
 
+    # Community Settings
+    showMissionCommentsInCommunity: bool = False
+
 
 class UpdateSettingsRequest(BaseModel):
     # Notification Settings
@@ -60,6 +63,9 @@ class UpdateSettingsRequest(BaseModel):
     profileVisibility: Optional[str] = None
     showEarnings: Optional[bool] = None
 
+    # Community Settings
+    showMissionCommentsInCommunity: Optional[bool] = None
+
 
 # ===== Helper Functions =====
 
@@ -79,7 +85,8 @@ def get_or_create_settings(db: Session, user_id: int) -> UserSettings:
             dark_mode=False,
             compact_view=False,
             profile_visibility='community',
-            show_earnings=True
+            show_earnings=True,
+            show_mission_comments_in_community=False,
         )
         db.add(settings)
         db.commit()
@@ -110,7 +117,8 @@ async def get_settings(
             darkMode=settings.dark_mode,
             compactView=settings.compact_view,
             profileVisibility=settings.profile_visibility,
-            showEarnings=settings.show_earnings
+            showEarnings=settings.show_earnings,
+            showMissionCommentsInCommunity=getattr(settings, 'show_mission_comments_in_community', False) or False,
         )
     except Exception as e:
         logger.error(f"Error fetching settings: {str(e)}")
@@ -150,6 +158,8 @@ async def update_settings(
             settings.profile_visibility = request.profileVisibility
         if request.showEarnings is not None:
             settings.show_earnings = request.showEarnings
+        if request.showMissionCommentsInCommunity is not None:
+            settings.show_mission_comments_in_community = request.showMissionCommentsInCommunity
 
         db.commit()
         db.refresh(settings)
@@ -169,7 +179,8 @@ async def update_settings(
                 darkMode=settings.dark_mode,
                 compactView=settings.compact_view,
                 profileVisibility=settings.profile_visibility,
-                showEarnings=settings.show_earnings
+                showEarnings=settings.show_earnings,
+                showMissionCommentsInCommunity=getattr(settings, 'show_mission_comments_in_community', False) or False,
             )
         }
 

@@ -10,7 +10,7 @@ from sqlalchemy import func, cast, Date
 from datetime import datetime, timedelta, timezone
 
 from database.pg_connections import get_db
-from database.pg_models import BusinessAnalysis, User, Commission, Referral
+from database.pg_models import BusinessAnalysis, User, Commission, Referral, UserAlert, CommunityDiscussion
 from api.routes.auth.login import get_current_user
 
 import logging
@@ -120,6 +120,20 @@ async def get_user_stats(
         except Exception as e:
             logger.warning(f"Referral stats partial fail for user {user_id}: {e}")
 
+        # 4. Alerts shared + community posts
+        alerts_shared = 0
+        community_posts = 0
+        try:
+            alerts_shared = db.query(func.count(UserAlert.id)).filter(
+                UserAlert.user_id == user_id,
+                UserAlert.has_shared == True
+            ).scalar() or 0
+            community_posts = db.query(func.count(CommunityDiscussion.id)).filter(
+                CommunityDiscussion.user_id == user_id
+            ).scalar() or 0
+        except Exception as e:
+            logger.warning(f"Alerts/community stats partial fail for user {user_id}: {e}")
+
         result = {
             "total_analyses": int(total_analyses),
             "avg_confidence": int(avg_confidence),
@@ -128,7 +142,9 @@ async def get_user_stats(
             "total_commissions": float(total_commissions),
             "paid_commissions": float(paid_commissions),
             "total_referrals": int(total_referrals),
-            "referrals_this_month": int(referrals_this_month)
+            "referrals_this_month": int(referrals_this_month),
+            "alerts_shared": int(alerts_shared),
+            "community_posts": int(community_posts),
         }
         return result
 
@@ -145,7 +161,9 @@ async def get_user_stats(
             "total_commissions": 0.0,
             "paid_commissions": 0.0,
             "total_referrals": 0,
-            "referrals_this_month": 0
+            "referrals_this_month": 0,
+            "alerts_shared": 0,
+            "community_posts": 0,
         }
 
 # ─── Level config (AiTugo Chops Framework v6 — Levels 1–51) ────────────────
