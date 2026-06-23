@@ -275,7 +275,9 @@ async def get_discussions(
         ).all()} if discussion_ids else set()
         result = [_discussion_dict(d, liked) for d in discussions]
 
-        # Include mission step reflections from users who opted in
+        # Include mission step reflections from users who opted in.
+        # Only require reflection text to exist — not that the step is "completed",
+        # because users can write notes on in-progress steps too.
         try:
             opted_in_user_ids = db.query(UserSettings.user_id).filter(
                 UserSettings.show_mission_comments_in_community == True
@@ -290,9 +292,8 @@ async def get_discussions(
                         UserMission.user_id.in_(opted_in_ids),
                         UserMissionStep.reflection.isnot(None),
                         UserMissionStep.reflection != '',
-                        UserMissionStep.completed == True,
                     )
-                    .order_by(UserMissionStep.completed_at.desc())
+                    .order_by(UserMissionStep.id.desc())
                     .limit(50)
                     .all()
                 )
@@ -302,6 +303,7 @@ async def get_discussions(
                     if key in used_keys:
                         continue
                     used_keys.add(key)
+                    ts = getattr(step, 'completed_at', None) or getattr(step, 'created_at', None)
                     result.append({
                         "id": f"ms_{step.id}",
                         "type": "reflection",
@@ -316,9 +318,16 @@ async def get_discussions(
                         "view_count": 0,
                         "has_liked": False, "liked_by_user": False,
                         "chops_gifted": 0,
-                        "author": {"id": author.id, "name": author.name or "Member"},
-                        "channel": "resources-and-reflections",
-                        "created_at": step.completed_at.isoformat() if step.completed_at else None,
+                        "author": {
+                            "id": author.id,
+                            "name": author.name or "Member",
+                            "initials": (author.name or "M")[:2].upper(),
+                            "gradient": "from-orange-400 to-rose-400",
+                            "role": "",
+                        },
+                        "channel": "reflections",
+                        "created_at": ts.isoformat() if ts else None,
+                        "timeAgo": ts.isoformat() if ts else None,
                         "updated_at": None,
                     })
         except Exception as reflection_err:

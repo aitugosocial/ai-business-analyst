@@ -1078,6 +1078,12 @@ async def startup_event():
         try:
             _sync_db.execute(text("ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS post_type VARCHAR(50) DEFAULT 'discussion'"))
             _sync_db.execute(text("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS show_mission_comments_in_community BOOLEAN DEFAULT FALSE"))
+            # user_mission_steps.reflection was added to the ORM model but the column
+            # was never migrated — every reflections fetch threw OperationalError silently.
+            _sync_db.execute(text("ALTER TABLE user_mission_steps ADD COLUMN IF NOT EXISTS reflection TEXT"))
+            _sync_db.execute(text("ALTER TABLE user_mission_steps ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP WITH TIME ZONE"))
+            # Backfill any NULL values left by rows created before the column existed.
+            _sync_db.execute(text("UPDATE user_settings SET show_mission_comments_in_community = FALSE WHERE show_mission_comments_in_community IS NULL"))
             _sync_db.commit()
             logger.info("✓ Critical community columns ensured (synchronous)")
         except Exception as _e:
