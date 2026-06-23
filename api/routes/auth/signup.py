@@ -112,6 +112,7 @@ def signup(
             logger.info(f"[SIGNUP] Waitlist record found for {email}: code={waitlist_refcode}, count={waitlist_refcount}")
     except Exception as wl_err:
         logger.warning(f"[SIGNUP] Could not read waitlist table: {wl_err}")
+        db.rollback()  # Reset the failed transaction so subsequent queries work
 
     # Use waitlist referral code if available and not already taken in users table
     if waitlist_refcode and not db.query(User).filter(User.referral_code == waitlist_refcode).first():

@@ -80,19 +80,57 @@ class GiftChopsRequest(BaseModel):
     amount: int
 
 
+_AUTHOR_GRADIENTS = [
+    "from-orange-400 to-rose-400",
+    "from-blue-400 to-cyan-500",
+    "from-green-400 to-teal-500",
+    "from-violet-400 to-purple-600",
+    "from-amber-400 to-orange-500",
+    "from-pink-400 to-rose-500",
+]
+
+# All valid topic slugs that can be stored as post_type
+_TOPIC_SLUGS = {
+    'what-worked', 'tool-recommendations', 'collaboration-offers',
+    'questions', 'shared-wins', 'resources',
+}
+
+
 def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None) -> dict:
     has_liked = d.id in liked_ids if liked_ids is not None else False
+    post_type_val = getattr(d, 'post_type', None) or 'discussion'
+
+    # Return topic slug as a plain string so the frontend can filter by it directly.
+    # Generic 'discussion' posts fall back to the actual backend channel object.
+    if post_type_val == 'reflection':
+        channel_display: any = 'reflections'
+    elif post_type_val in _TOPIC_SLUGS:
+        channel_display = post_type_val
+    else:
+        channel_display = {"id": d.channel.id, "name": d.channel.name, "slug": d.channel.slug} if d.channel else None
+
+    author_obj = None
+    if d.user:
+        name = d.user.name or "Member"
+        author_obj = {
+            "id": d.user.id,
+            "name": name,
+            "initials": name[:2].upper(),
+            "gradient": _AUTHOR_GRADIENTS[d.user.id % len(_AUTHOR_GRADIENTS)],
+            "role": getattr(d.user, 'role', '') or '',
+        }
+
     return {
         "id": d.id, "channel_id": d.channel_id, "title": d.title, "content": d.content,
         "tags": d.tags or [], "like_count": d.like_count, "reply_count": d.reply_count,
-        "likes": d.like_count, "replies": d.reply_count,  # frontend aliases
+        "likes": d.like_count, "replies": d.reply_count,
         "pinned": d.is_pinned, "is_pinned": d.is_pinned,
-        "hot": d.like_count >= 10,  # computed: hot if 10+ likes
+        "hot": d.like_count >= 10,
         "view_count": d.view_count, "has_liked": has_liked, "liked_by_user": has_liked,
         "chops_gifted": d.chops_gifted or 0,
-        "type": getattr(d, 'post_type', None) or 'discussion',
-        "author": {"id": d.user.id, "name": d.user.name} if d.user else None,
-        "channel": {"id": d.channel.id, "name": d.channel.name, "slug": d.channel.slug} if d.channel else None,
+        "type": post_type_val,
+        "author": author_obj,
+        "channel": channel_display,
         "created_at": d.created_at.isoformat() if d.created_at else None,
         "updated_at": d.updated_at.isoformat() if d.updated_at else None,
     }
@@ -373,7 +411,9 @@ async def create_discussion(
     if not ch:
         raise HTTPException(status_code=404, detail="Channel not found")
 
-    post_type = (body.type or 'discussion') if body.type in ('discussion', 'reflection') else 'discussion'
+    _all_valid_types = {'discussion', 'reflection'} | _TOPIC_SLUGS
+    raw_type = (body.type or 'discussion').strip().lower()
+    post_type = raw_type if raw_type in _all_valid_types else 'discussion'
     d = CommunityDiscussion(
         channel_id=body.channel_id, user_id=current_user.id,
         title=body.title.strip(), content=body.content.strip(),
