@@ -1072,6 +1072,20 @@ async def startup_event():
             from fastapi_cache import FastAPICache
             FastAPICache.init(InMemoryBackend(), prefix="aianalyst:")
 
+        # Critical columns needed before any request is served — run synchronously
+        # so they exist whether or not the heavy background migration has finished.
+        _sync_db = SessionLocal()
+        try:
+            _sync_db.execute(text("ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS post_type VARCHAR(50) DEFAULT 'discussion'"))
+            _sync_db.execute(text("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS show_mission_comments_in_community BOOLEAN DEFAULT FALSE"))
+            _sync_db.commit()
+            logger.info("✓ Critical community columns ensured (synchronous)")
+        except Exception as _e:
+            logger.warning(f"Critical column migration warning (non-fatal): {_e}")
+            _sync_db.rollback()
+        finally:
+            _sync_db.close()
+
         # Fire the *expensive* schema work (community tables, marketplace tables,
         # security_setup.sql, 30+ indexes, subscription backfills, etc.) in the
         # background. This is the key change that prevents the startup handler
