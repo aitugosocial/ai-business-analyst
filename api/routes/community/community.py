@@ -28,29 +28,29 @@ router = APIRouter(prefix="/api/community", tags=["community"])
 # Module-level flag — seed only runs once per process (not on every request)
 _channels_seeded: bool = False
 
-# ─── Default seed channels ──────────────────────────────────────────────────
+# ─── Topic-based channels (matches frontend FIXED_COMMUNITY_TOPICS) ──────────
 
-DEFAULT_CHANNELS = [
-    {"name": "Business Strategy", "slug": "business-strategy", "description": "Discuss strategic planning, growth, and competitive positioning.", "category": "Strategy", "icon": "📊"},
-    {"name": "AI & Technology", "slug": "ai-technology", "description": "Explore AI tools, automation, and emerging tech for business.", "category": "Technology", "icon": "🤖"},
-    {"name": "Marketing & Growth", "slug": "marketing-growth", "description": "Share marketing tips, growth hacks, and customer acquisition strategies.", "category": "Marketing", "icon": "📣"},
-    {"name": "Finance & Revenue", "slug": "finance-revenue", "description": "Revenue models, pricing, fundraising, and financial management.", "category": "Finance", "icon": "💰"},
-    {"name": "Operations", "slug": "operations", "description": "Streamline processes, manage teams, and optimize day-to-day operations.", "category": "Operations", "icon": "⚙️"},
-    {"name": "Community", "slug": "community", "description": "General discussions, introductions, and community updates.", "category": "General", "icon": "🌍"},
+TOPIC_CHANNELS = [
+    {"name": "What Worked", "slug": "what-worked", "description": "Share strategies and tactics that delivered results.", "category": "Insights", "icon": "✅"},
+    {"name": "Tool Recommendations", "slug": "tool-recommendations", "description": "Recommend tools and software that help founders.", "category": "Tools", "icon": "🔧"},
+    {"name": "Collaboration Offers", "slug": "collaboration-offers", "description": "Find partners and collaborators for your projects.", "category": "Network", "icon": "🤝"},
+    {"name": "Questions", "slug": "questions", "description": "Ask the community anything about building your business.", "category": "Help", "icon": "❓"},
+    {"name": "Shared Wins", "slug": "shared-wins", "description": "Celebrate milestones and wins with the community.", "category": "Motivation", "icon": "🏆"},
+    {"name": "Resources", "slug": "resources", "description": "Share useful resources, articles, and templates.", "category": "Learning", "icon": "📚"},
+    {"name": "Reflections", "slug": "reflections", "description": "Share reflections from completing decision engine missions.", "category": "Growth", "icon": "💭"},
 ]
 
 
 def _seed_channels(db: Session):
-    """Seed default channels if the table is empty. Skips the DB count on subsequent calls."""
+    """Seed topic-based channels if they don't exist yet. One channel per topic slug."""
     global _channels_seeded
     if _channels_seeded:
         return
-    count = db.query(CommunityChannel).count()
-    if count == 0:
-        for ch in DEFAULT_CHANNELS:
-            db.add(CommunityChannel(**ch))
-        db.commit()
-        logger.info("Seeded default community channels")
+    for ch_data in TOPIC_CHANNELS:
+        existing = db.query(CommunityChannel).filter_by(slug=ch_data["slug"]).first()
+        if not existing:
+            db.add(CommunityChannel(**ch_data))
+    db.commit()
     _channels_seeded = True
 
 
@@ -92,7 +92,7 @@ _AUTHOR_GRADIENTS = [
 # All valid topic slugs that can be stored as post_type
 _TOPIC_SLUGS = {
     'what-worked', 'tool-recommendations', 'collaboration-offers',
-    'questions', 'shared-wins', 'resources',
+    'questions', 'shared-wins', 'resources', 'reflections',
 }
 
 
@@ -239,7 +239,8 @@ async def get_channels(
 ):
     try:
         _seed_channels(db)
-        q = db.query(CommunityChannel).filter_by(is_public=True)
+        valid_slugs = [ch["slug"] for ch in TOPIC_CHANNELS]
+        q = db.query(CommunityChannel).filter(CommunityChannel.slug.in_(valid_slugs))
         if category and category.lower() != "all":
             q = q.filter(CommunityChannel.category == category)
         channels = q.order_by(CommunityChannel.member_count.desc()).all()
