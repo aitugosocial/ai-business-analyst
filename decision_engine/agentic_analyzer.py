@@ -921,7 +921,7 @@ Do NOT rank by effort. A high-effort plan can be rank 1 if it unlocks everything
 
 PER-PLAN REQUIREMENTS:
 
-"what_to_do" — 3–5 steps in second person. Each step contains:
+"what_to_do" — EXACTLY 3–5 steps (no more than 5) in second person. Each step contains:
 (a) The EXACT action to take
 (b) The SPECIFIC output or deliverable it produces
 (c) The METRIC or observable signal that confirms it is done correctly
@@ -929,7 +929,7 @@ Steps are SEQUENTIAL — each builds on the previous and assumes its completion.
 Good: "Write a 3-question post-purchase survey targeting the moment of highest engagement — the confirmation page — using a free form tool, and set a 24-hour email trigger to send to every buyer. Review the first 20 responses to identify the top two unmet expectations."
 Bad: "Collect customer feedback."
 
-"why_it_matters" — 2–3 impact statements in second person:
+"why_it_matters" — EXACTLY 2–3 impact statements (no more than 3) in second person:
 At least one must name a UNIT ECONOMICS metric (CAC, LTV, gross margin, payback period, contribution margin) with a calibrated range and timeframe.
 At least one must name a COMPOUNDING effect — what becomes possible only after this action is complete.
 Good: "You will increase repeat purchase rate by 18–35% within 60 days, based on patterns in comparable direct-to-consumer businesses with similar first-purchase AOV."
@@ -1318,7 +1318,7 @@ ROADMAP RULES:
 2. Phase names describe what YOU are actively DOING in second person ("Days 1-2: Audit Your Current Funnel and Identify the Three Biggest Leaks" not "Phase 1: Discovery")
 3. Each phase contains tasks drawn directly from the action plan steps above — no invented tasks
 4. Where a task involves a tool, name the specific first action to take in it
-5. Tasks are complete sentences in second person: specific action + specific output
+5. Tasks are complete sentences in second person: specific action + specific output. Each task MUST be expressible in 1–2 sentences maximum — no long paragraphs. A reader must be able to read any single task in under 10 seconds.
 6. The total span equals exactly 7 days
 10. CRITICAL: The total number of tasks across ALL phases MUST equal exactly 7. Count carefully before submitting: tasks_in_phase_1 + tasks_in_phase_2 + ... = 7. Distribute tasks unevenly across phases if needed to hit 7 exactly.
 7. Sequence: AUDIT AND DECIDE first → BUILD AND SHIP second → MEASURE AND ADJUST last

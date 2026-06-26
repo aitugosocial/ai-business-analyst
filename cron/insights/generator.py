@@ -458,8 +458,9 @@ Return only the JSON. No commentary, no explanation. Deliver pure gold at speed.
         return saved, skipped
 
 
-async def run_content_generation(insight_count: int = 3):
+async def run_content_generation(insight_count: int = 3) -> dict:
     db = SessionLocal()
+    saved, skipped = 0, 0
     try:
         generator = InsightsGenerator(db)
         logger.info("\n📊 Generating Insights...")
@@ -474,3 +475,4 @@ async def run_content_generation(insight_count: int = 3):
         logger.error(f"Failed to generate insights: {e}")
     finally:
         db.close()
+    return {"insights_saved": saved, "insights_skipped": skipped}

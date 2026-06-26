@@ -17,41 +17,13 @@ from database.pg_models import (
     CommunityDiscussion, DiscussionReply, DiscussionLike,
     CommunityEvent, EventRegistration,
     CommunityActivity, SavedItem,
-    UserSettings, UserMissionStep, UserMission,
+    UserSettings, BusinessAnalysis,
 )
 from api.routes.auth.login import get_current_user
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/community", tags=["community"])
-
-# Module-level flag — seed only runs once per process (not on every request)
-_channels_seeded: bool = False
-
-# ─── Topic-based channels (matches frontend FIXED_COMMUNITY_TOPICS) ──────────
-
-TOPIC_CHANNELS = [
-    {"name": "What Worked", "slug": "what-worked", "description": "Share strategies and tactics that delivered results.", "category": "Insights", "icon": "✅"},
-    {"name": "Tool Recommendations", "slug": "tool-recommendations", "description": "Recommend tools and software that help founders.", "category": "Tools", "icon": "🔧"},
-    {"name": "Collaboration Offers", "slug": "collaboration-offers", "description": "Find partners and collaborators for your projects.", "category": "Network", "icon": "🤝"},
-    {"name": "Questions", "slug": "questions", "description": "Ask the community anything about building your business.", "category": "Help", "icon": "❓"},
-    {"name": "Shared Wins", "slug": "shared-wins", "description": "Celebrate milestones and wins with the community.", "category": "Motivation", "icon": "🏆"},
-    {"name": "Resources", "slug": "resources", "description": "Share useful resources, articles, and templates.", "category": "Learning", "icon": "📚"},
-    {"name": "Reflections", "slug": "reflections", "description": "Share reflections from completing decision engine missions.", "category": "Growth", "icon": "💭"},
-]
-
-
-def _seed_channels(db: Session):
-    """Seed topic-based channels if they don't exist yet. One channel per topic slug."""
-    global _channels_seeded
-    if _channels_seeded:
-        return
-    for ch_data in TOPIC_CHANNELS:
-        existing = db.query(CommunityChannel).filter_by(slug=ch_data["slug"]).first()
-        if not existing:
-            db.add(CommunityChannel(**ch_data))
-    db.commit()
-    _channels_seeded = True
 
 
 def _log_activity(db: Session, user_id: int, action_type: str, target_id: Optional[int] = None, target_type: Optional[str] = None, target_name: Optional[str] = None):
@@ -238,8 +210,7 @@ async def get_channels(
     db: Session = Depends(get_db)
 ):
     try:
-        _seed_channels(db)
-        valid_slugs = [ch["slug"] for ch in TOPIC_CHANNELS]
+        valid_slugs = list(_TOPIC_SLUGS)
         q = db.query(CommunityChannel).filter(CommunityChannel.slug.in_(valid_slugs))
         if category and category.lower() != "all":
             q = q.filter(CommunityChannel.category == category)
@@ -314,61 +285,60 @@ async def get_discussions(
         ).all()} if discussion_ids else set()
         result = [_discussion_dict(d, liked) for d in discussions]
 
-        # Include mission step reflections from users who opted in.
-        # Only require reflection text to exist — not that the step is "completed",
-        # because users can write notes on in-progress steps too.
+        # Include mission roadmap comments from users who opted in.
+        # Comments live in analysis.user_progress['roadmap_comments'] (a dict of task_id → [comment, ...]).
         try:
             opted_in_user_ids = db.query(UserSettings.user_id).filter(
                 UserSettings.show_mission_comments_in_community == True
             ).all()
             opted_in_ids = [row[0] for row in opted_in_user_ids]
             if opted_in_ids:
-                steps_with_reflections = (
-                    db.query(UserMissionStep, User)
-                    .join(UserMission, UserMissionStep.user_mission_id == UserMission.id)
-                    .join(User, UserMission.user_id == User.id)
-                    .filter(
-                        UserMission.user_id.in_(opted_in_ids),
-                        UserMissionStep.reflection.isnot(None),
-                        UserMissionStep.reflection != '',
-                    )
-                    .order_by(UserMissionStep.id.desc())
-                    .limit(50)
+                analyses = (
+                    db.query(BusinessAnalysis, User)
+                    .join(User, BusinessAnalysis.user_id == User.id)
+                    .filter(BusinessAnalysis.user_id.in_(opted_in_ids))
                     .all()
                 )
-                used_keys: set = set()
-                for step, author in steps_with_reflections:
-                    key = f"ms_{step.id}"
-                    if key in used_keys:
+                for analysis, author in analyses:
+                    up = analysis.user_progress or {}
+                    roadmap_comments = up.get('roadmap_comments', {}) if isinstance(up, dict) else {}
+                    if not isinstance(roadmap_comments, dict):
                         continue
-                    used_keys.add(key)
-                    ts = getattr(step, 'completed_at', None) or getattr(step, 'created_at', None)
-                    result.append({
-                        "id": f"ms_{step.id}",
-                        "type": "reflection",
-                        "title": (step.reflection or '')[:80],
-                        "content": step.reflection or '',
-                        "excerpt": (step.reflection or '')[:160],
-                        "tags": [],
-                        "like_count": 0, "reply_count": 0,
-                        "likes": 0, "replies": 0,
-                        "pinned": False, "is_pinned": False,
-                        "hot": False,
-                        "view_count": 0,
-                        "has_liked": False, "liked_by_user": False,
-                        "chops_gifted": 0,
-                        "author": {
-                            "id": author.id,
-                            "name": author.name or "Member",
-                            "initials": (author.name or "M")[:2].upper(),
-                            "gradient": "from-orange-400 to-rose-400",
-                            "role": "",
-                        },
-                        "channel": "reflections",
-                        "created_at": ts.isoformat() if ts else None,
-                        "timeAgo": ts.isoformat() if ts else None,
-                        "updated_at": None,
-                    })
+                    for task_id, comments in roadmap_comments.items():
+                        if not isinstance(comments, list):
+                            continue
+                        for comment in comments:
+                            text = comment.get('text', '').strip()
+                            if not text:
+                                continue
+                            created_at = comment.get('createdAt')
+                            comment_id = comment.get('id', f"rc_{analysis.id}_{task_id}")
+                            result.append({
+                                "id": f"rc_{comment_id}",
+                                "type": "reflection",
+                                "title": text[:80],
+                                "content": text,
+                                "excerpt": text[:160],
+                                "tags": [],
+                                "like_count": 0, "reply_count": 0,
+                                "likes": 0, "replies": 0,
+                                "pinned": False, "is_pinned": False,
+                                "hot": False,
+                                "view_count": 0,
+                                "has_liked": False, "liked_by_user": False,
+                                "chops_gifted": 0,
+                                "author": {
+                                    "id": author.id,
+                                    "name": author.name or "Member",
+                                    "initials": (author.name or "M")[:2].upper(),
+                                    "gradient": "from-orange-400 to-rose-400",
+                                    "role": "",
+                                },
+                                "channel": "reflections",
+                                "created_at": created_at,
+                                "timeAgo": created_at,
+                                "updated_at": None,
+                            })
         except Exception as reflection_err:
             logger.warning(f"Mission reflections fetch error: {reflection_err}")
 
