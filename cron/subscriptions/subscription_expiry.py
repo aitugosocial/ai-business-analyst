@@ -8,10 +8,11 @@ Schedule: Run daily at 2 AM UTC
 
 import sys
 import os
+from pathlib import Path
 from datetime import datetime, timezone
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# File lives at cron/subscriptions/ — go up 3 levels to reach project root
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from dotenv import load_dotenv
 load_dotenv('.env.local')
@@ -68,6 +69,7 @@ def expire_old_subscriptions():
                     logger.info(f"Synced user {user_id} subscription status")
 
         logger.info(f"Subscription expiry check complete: {expired_count} expired")
+        return expired_count
 
     except Exception as e:
         logger.error(f"Error in subscription expiry cron: {e}")
@@ -78,14 +80,21 @@ def expire_old_subscriptions():
 
 
 if __name__ == "__main__":
-    logger.info("=" * 50)
-    logger.info("SUBSCRIPTION EXPIRY CRON JOB STARTED")
-    logger.info("=" * 50)
+    start_time = datetime.now(timezone.utc)
+    logger.info("=" * 60)
+    logger.info(f"🕐 CRON JOB START: Subscription Expiry - {start_time}")
+    logger.info("=" * 60)
 
     try:
-        expire_old_subscriptions()
-        logger.info("Cron job completed successfully")
+        expired = expire_old_subscriptions()
+        duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+        logger.info("=" * 60)
+        logger.info(f"✅ CRON JOB COMPLETE: Subscription Expiry")
+        logger.info(f"   Duration: {duration:.2f} seconds")
+        logger.info(f"   Subscriptions expired: {expired}")
+        logger.info(f"   Users synced: {expired}")
+        logger.info("=" * 60)
         sys.exit(0)
     except Exception as e:
-        logger.error(f"Cron job failed: {e}")
+        logger.error(f"❌ CRON JOB FAILED: {e}")
         sys.exit(1)
