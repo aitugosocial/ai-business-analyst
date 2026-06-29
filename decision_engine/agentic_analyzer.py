@@ -121,6 +121,38 @@ class AgenticAnalyzer:
     # SEMANTIC TOOL SEARCH (used by Stage 3)
     # =========================================================================
 
+    async def _extract_mentioned_tools(self, what_to_do_list: list[str]) -> list[str]:
+        """Return names of software/SaaS tools explicitly cited in action plan steps."""
+        if not what_to_do_list:
+            return []
+        steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(what_to_do_list))
+        prompt = (
+            "List every named software tool, SaaS product, or platform explicitly mentioned "
+            "in these action steps. Return a JSON array of strings. Return [] if none.\n\n"
+            f"{steps_text}\n\n"
+            "Rules: only named products (e.g. Zapier, HubSpot, Notion). "
+            "Exclude generic words like 'spreadsheet', 'email', 'CRM', 'software'.\n"
+            "Output: JSON array only, no explanation."
+        )
+        try:
+            resp = await self._llm(
+                model=self.fast_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=120,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if "```" in raw:
+                raw = raw.split("```")[1].split("```")[0].strip()
+                if raw.startswith("json"):
+                    raw = raw[4:].strip()
+            parsed = _safe_json_loads(raw)
+            if isinstance(parsed, list):
+                return [str(t).strip() for t in parsed if t and str(t).strip()]
+            return []
+        except Exception:
+            return []
+
     async def _search_ai_tools(
         self, user_query: str, action_description: str, top_k: int = 3
     ) -> list[dict]:
@@ -454,14 +486,14 @@ OUTPUT FORMAT (JSON only, no markdown):
         {{
             "id": 2,
             "title": "Specific constraint name describing a structural gap or behavioral pattern (5-8 words)",
-            "description": "2 sentences MAX, strictly 30 words or fewer. Must fit in 3 display lines. Sentence 1: the structural gap and its direct causal mechanism. Sentence 2: the consequence if unaddressed."
+            "description": "2 sentences MAX, strictly 40 words or fewer. Must fit in 4 display lines. Sentence 1: the structural gap and its direct causal mechanism. Sentence 2: the consequence if unaddressed."
         }}
     ]
 }}
 
 Number constraints starting at 2 (your primary bottleneck is always #1).
 No markdown, no dashes, no bullet prefixes in any text value.
-LINE LIMIT RULE: Each description must fit in exactly 3 display lines — 30 words maximum, hard limit. Violating this breaks the UI. Do not exceed 30 words under any circumstance."""
+LINE LIMIT RULE: Each description must fit in exactly 4 display lines — 40 words maximum, hard limit. Violating this breaks the UI. Do not exceed 40 words under any circumstance."""
 
         try:
             response = await self._llm(
@@ -695,9 +727,11 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         if not needy_indices:
             return action_plans
 
-        # ── Step 1: per-plan semantic search (action-specific, not user_query-biased) ──
+        # ── Step 1: per-plan semantic search + extract tools cited in steps ──
         all_tools: dict[str, dict] = {}  # canonical tool name → tool record
         plan_candidate_names: dict[int, list[str]] = {}  # plan_idx → tool names from search
+        # plan_idx → tool names explicitly named inside what_to_do step text
+        plan_step_cited: dict[int, list[str]] = {}
 
         for plan_idx in needy_indices:
             plan = action_plans[plan_idx]
@@ -705,6 +739,7 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
             steps_text = " ".join(what_to_do_list)
             action_description = f"{plan['title']}: {steps_text}"
 
+            # Semantic DB search
             candidates = await self._search_ai_tools(
                 user_query=user_query,
                 action_description=action_description,
@@ -718,29 +753,57 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
                 names_for_plan.append(name)
             plan_candidate_names[plan_idx] = names_for_plan
 
+            # Extract tool names explicitly cited in the step text
+            cited = await self._extract_mentioned_tools(what_to_do_list)
+            plan_step_cited[plan_idx] = cited
+
+            # Inject cited tools not found by semantic search as stubs so the
+            # LLM can assign them back to this plan
+            for cited_name in cited:
+                cited_lower = cited_name.lower()
+                already_in = any(k.lower() == cited_lower for k in all_tools)
+                if not already_in:
+                    all_tools[cited_name] = {
+                        "tool_name": cited_name,
+                        "url": None,
+                        "website": None,
+                        "description": f"Tool cited by name in plan steps — assign to the plan that mentions it.",
+                        "_step_cited": True,
+                    }
+                    logger.info(f"Injected step-cited tool stub: '{cited_name}' for plan {plan_idx + 1}")
+
         if not all_tools:
             return action_plans
 
-        # ── Step 2: build a single prompt with all plans + all tools ──
+        # ── Step 2: build prompt — mark step-cited tools and hint their origin plan ──
+        # Build inverse map: tool_lower → list of plan_indices that cite it in steps
+        cited_tool_to_plans: dict[str, list[int]] = {}
+        for plan_idx, cited_list in plan_step_cited.items():
+            for name in cited_list:
+                cited_tool_to_plans.setdefault(name.lower(), []).append(plan_idx)
+
         plans_section_parts: list[str] = []
         for plan_idx in needy_indices:
             plan = action_plans[plan_idx]
             what_to_do_list = plan.get("what_to_do", []) if isinstance(plan.get("what_to_do"), list) else []
             numbered_steps = "\n".join(f"   {i+1}. {s}" for i, s in enumerate(what_to_do_list))
-            # List which tools the search returned for this plan (as a hint)
             relevant = ", ".join(plan_candidate_names.get(plan_idx, [])[:6])
+            cited_note = ""
+            if plan_step_cited.get(plan_idx):
+                cited_note = f"\n  Tools explicitly named in steps (MUST assign here): {', '.join(plan_step_cited[plan_idx])}"
             plans_section_parts.append(
                 f"PLAN {plan_idx + 1}: {plan['title']}\n"
                 f"  Steps:\n{numbered_steps}\n"
-                f"  Semantically relevant candidates for this plan: {relevant}"
+                f"  Semantically relevant candidates: {relevant}{cited_note}"
             )
         plans_section = "\n\n".join(plans_section_parts)
 
         tools_section_parts: list[str] = []
         for name, t in all_tools.items():
             url = t.get("url") or t.get("website") or "unknown"
+            step_flag = " [CITED IN STEPS]" if t.get("_step_cited") else ""
             tools_section_parts.append(
-                f"- {name} | URL: {url}\n  {t.get('description', '')[:200]}"
+                f"- {name}{step_flag} | URL: {url}\n  {t.get('description', '')[:200]}"
             )
         tools_section = "\n".join(tools_section_parts)
 
@@ -754,12 +817,14 @@ PERSONA RULE: Write "what_it_helps" in SECOND PERSON — "you", "your". Never "t
 
 GLOBAL CONSTRAINT: Each tool can be assigned to AT MOST ONE plan across the entire analysis. Once assigned, that tool is locked. If the same tool is the best match for multiple plans, assign it to the plan where it covers an "essential" automation need over a convenience feature, and among equals, to the higher-ranked plan (lower number = higher priority).
 
+STEP-CITED OVERRIDE: Any tool marked [CITED IN STEPS] is explicitly named inside that plan's instructions. If it appears in a plan's "Tools explicitly named in steps" list, you MUST assign it to that plan regardless of catalog rank. Write a what_it_helps that explains what that tool does specifically for the step that named it.
+
 USER BUSINESS CHALLENGE: "{user_query}"
 
 ACTION PLANS THAT NEED TOOLS (plans {plan_ids_str}):
 {plans_section}
 
-FULL TOOL CATALOG (from semantic search — use ONLY names from this list):
+FULL TOOL CATALOG (from semantic search + step extraction — names marked [CITED IN STEPS] were found inside the steps themselves):
 {tools_section}
 
 MATCHING PROTOCOL:
@@ -774,9 +839,9 @@ Bad: "A powerful automation platform."
 
 STEP 3 — ASSIGNMENT RULES
 1. Each tool can be assigned to AT MOST ONE plan. No repeats across the analysis.
-2. Only assign a tool if it directly addresses a named step. Do NOT assign based on general category fit.
-3. If no tool in the catalog genuinely fits a plan's specific steps, omit that plan from the assignments array.
-4. Return the tool's URL from the catalog exactly as shown.
+2. Tools marked [CITED IN STEPS] MUST be assigned to the plan that cites them — this overrides semantic ranking.
+3. Only assign non-cited tools if they directly address a named step. Do NOT assign based on general category fit.
+4. Return the tool's URL from the catalog exactly as shown (null is acceptable for step-cited stubs).
 5. Do NOT start any text value with a dash, bullet, or em dash.
 
 OUTPUT FORMAT (JSON only, no markdown):
@@ -813,6 +878,7 @@ Omit any plan where no catalog tool genuinely fits its specific steps."""
             assignments = []
 
         # ── Step 3: normalised name map + used-tool guard ──
+        # canonical_map covers both DB tools and step-cited stubs
         canonical_map: dict[str, str] = {n.strip().lower(): n for n in all_tools}
         assigned_tool_names: set[str] = set()
         assigned_plans: set[int] = set()
@@ -827,7 +893,15 @@ Omit any plan where no catalog tool genuinely fits its specific steps."""
             llm_name = (assignment.get("tool_name") or "").strip()
             canonical = canonical_map.get(llm_name.lower())
             if not canonical:
-                continue  # name didn't match any candidate
+                # LLM returned a name not in the catalog — check if it matches a
+                # step-cited tool for this plan (case-insensitive fuzzy accept)
+                cited_for_plan = [c.lower() for c in plan_step_cited.get(raw_plan_idx, [])]
+                if llm_name.lower() in cited_for_plan:
+                    canonical = llm_name  # accept as-is; it was in the steps text
+                    if canonical not in all_tools:
+                        all_tools[canonical] = {"tool_name": canonical, "url": None, "website": None, "description": ""}
+                else:
+                    continue  # genuinely unknown — skip
             if canonical in assigned_tool_names:
                 continue  # tool already used by another plan
 
