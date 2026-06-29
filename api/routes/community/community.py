@@ -490,7 +490,9 @@ async def reply_to_discussion(
         parent_reply_id=parent_reply_id,
     )
     db.add(reply)
-    d.reply_count = (d.reply_count or 0) + 1
+    # Only count top-level replies in reply_count for the discussion card
+    if parent_reply_id is None:
+        d.reply_count = (d.reply_count or 0) + 1
     current_user.total_chops = (current_user.total_chops or 0) + 5
     db.commit()
     db.refresh(reply)
