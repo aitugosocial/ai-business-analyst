@@ -143,6 +143,10 @@ class CreateReplyRequest(BaseModel):
     parent_reply_id: Optional[int] = None
 
 
+class LikeReplyRequest(BaseModel):
+    action: str  # "like" | "unlike"
+
+
 class SaveItemRequest(BaseModel):
     item_id: int
     item_type: str
@@ -486,9 +490,7 @@ async def reply_to_discussion(
         parent_reply_id=parent_reply_id,
     )
     db.add(reply)
-    # Only count top-level replies in reply_count for the discussion card
-    if parent_reply_id is None:
-        d.reply_count = (d.reply_count or 0) + 1
+    d.reply_count = (d.reply_count or 0) + 1
     current_user.total_chops = (current_user.total_chops or 0) + 5
     db.commit()
     db.refresh(reply)
@@ -500,6 +502,50 @@ async def reply_to_discussion(
         "created_at": reply.created_at.isoformat() if reply.created_at else None,
         "sub_replies": [],
     }}
+
+
+@router.post("/discussions/{discussion_id}/replies/{reply_id}/like")
+async def like_reply(
+    discussion_id: int,
+    reply_id: int,
+    body: LikeReplyRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    reply = db.query(DiscussionReply).filter_by(id=reply_id, discussion_id=discussion_id).first()
+    if not reply:
+        raise HTTPException(status_code=404, detail="Reply not found")
+    if body.action == "like":
+        reply.like_count = (reply.like_count or 0) + 1
+    else:
+        reply.like_count = max(0, (reply.like_count or 0) - 1)
+    db.commit()
+    return {"success": True, "like_count": reply.like_count}
+
+
+@router.post("/discussions/{discussion_id}/replies/{reply_id}/gift_chops")
+async def gift_chops_to_reply(
+    discussion_id: int,
+    reply_id: int,
+    body: GiftChopsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    reply = db.query(DiscussionReply).filter_by(id=reply_id, discussion_id=discussion_id).first()
+    if not reply:
+        raise HTTPException(status_code=404, detail="Reply not found")
+    if reply.user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot gift chops to yourself")
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+    if (current_user.total_chops or 0) < body.amount:
+        raise HTTPException(status_code=400, detail="Insufficient chops")
+    current_user.total_chops = (current_user.total_chops or 0) - body.amount
+    author = db.query(User).filter_by(id=reply.user_id).first()
+    if author:
+        author.total_chops = (author.total_chops or 0) + body.amount
+    db.commit()
+    return {"success": True, "remaining_chops": current_user.total_chops}
 
 
 # ─── Events ──────────────────────────────────────────────────────────────────
