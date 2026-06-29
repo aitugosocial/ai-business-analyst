@@ -37,7 +37,7 @@ from decision_engine.recommender_db import recommend_automation_stacks, recommen
 load_dotenv(".env.local")
 
 try:
-    from openai import OpenAI
+    from openai import AsyncOpenAI
 except ImportError as exc:
     raise RuntimeError(
         "openai package not installed — run: uv pip install openai"
@@ -105,17 +105,21 @@ class AgenticAnalyzer:
                 "XAI_API_KEY is not set — add it to .env.local before running analysis"
             )
 
-        self.client = OpenAI(
+        # AsyncOpenAI uses httpx.AsyncClient — every completion call is native
+        # async I/O. Unlimited concurrent callers share the same event loop without
+        # thread pool slots. max_retries=5 means the SDK automatically retries 429
+        # rate-limit responses with exponential backoff so the caller never sees them.
+        self.client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://api.x.ai/v1",
             timeout=120.0,
+            max_retries=5,
         )
-        logger.info("xAI Grok client initialized for agentic analysis")
+        logger.info("xAI Grok async client initialized for agentic analysis")
 
     async def _llm(self, **kwargs):
-        """Run a blocking OpenAI chat completion in a thread so the event loop stays free."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: self.client.chat.completions.create(**kwargs))
+        """Async LLM call — no thread pool, no blocking, truly concurrent."""
+        return await self.client.chat.completions.create(**kwargs)
 
     # =========================================================================
     # SEMANTIC TOOL SEARCH (used by Stage 3)

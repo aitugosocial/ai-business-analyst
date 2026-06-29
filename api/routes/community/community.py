@@ -20,6 +20,7 @@ from database.pg_models import (
     UserSettings, BusinessAnalysis,
 )
 from api.routes.auth.login import get_current_user
+from api.cache import get_cached, set_cached, delete_cached
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +279,11 @@ async def get_discussions(
     db: Session = Depends(get_db)
 ):
     try:
+        cache_key = f"community:discussions:user:{current_user.id}:ch:{channel_id}:lim:{limit}:off:{offset}"
+        cached = await get_cached(cache_key)
+        if cached is not None:
+            return cached
+
         q = db.query(CommunityDiscussion)
         if channel_id:
             q = q.filter_by(channel_id=channel_id)
@@ -347,7 +353,9 @@ async def get_discussions(
         except Exception as reflection_err:
             logger.warning(f"Mission reflections fetch error: {reflection_err}")
 
-        return {"success": True, "data": result}
+        response = {"success": True, "data": result}
+        await set_cached(cache_key, response, ttl_seconds=15)
+        return response
     except Exception as e:
         logger.error(f"Get discussions error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch discussions")
@@ -410,6 +418,9 @@ async def create_discussion(
     db.commit()
     db.refresh(d)
     _log_activity(db, current_user.id, "posted", d.id, "discussion", d.title)
+    # Bust the discussion list cache for this user so the new post is visible immediately
+    await delete_cached(f"community:discussions:user:{current_user.id}:ch:{body.channel_id}:lim:20:off:0")
+    await delete_cached(f"community:discussions:user:{current_user.id}:ch:None:lim:20:off:0")
     return {"success": True, "data": _discussion_dict(d, set())}
 
 

@@ -8,6 +8,7 @@ action plans, toolkits, and execution roadmaps.
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
@@ -19,6 +20,7 @@ from typing import Optional, List, Dict, Any
 from database.pg_connections import get_db
 from database.pg_models import BusinessAnalysis
 from api.routes.auth.login import get_current_user
+from api.cache import get_cached, set_cached, delete_cached
 
 logger = logging.getLogger(__name__)
 
@@ -214,102 +216,75 @@ async def analyze_business_goal(
     db: Session = Depends(get_db),
 ):
     """
-    Analyze business goal using the Agentic Analyzer.
+    Non-streaming analysis endpoint.  Prefer /analyze/stream for production
+    since that streams progress while the analysis runs.
     """
     from decision_engine.agentic_analyzer import create_analyzer
     from decision_engine.multimodal.handler import MultimodalHandler
 
     try:
         user_id = get_user_id(current_user)
-        logger.info(f"🚀 Starting agentic analysis for user {user_id}")
+        logger.info(f"🚀 Starting analysis for user {user_id}")
 
         content_type = request.headers.get("content-type", "")
-
         business_goal = ""
         files = []
 
         if "application/json" in content_type:
             body = await request.json()
-            business_goal = body.get("business_goal")
+            business_goal = body.get("business_goal", "")
         elif "multipart/form-data" in content_type:
             form_data = await request.form()
-            business_goal = form_data.get("business_goal")
+            business_goal = form_data.get("business_goal", "")
             files = form_data.getlist("files")
         else:
             raise HTTPException(status_code=400, detail="Invalid Content-Type")
 
-        # ── Deduplication guard ────────────────────────────────────────────────
-        # If the user submits the exact same business goal, return the existing
-        # analysis from the database instead of running a new 30s LLM job.
         from sqlalchemy import desc as _desc
-        
         _goal_str = business_goal or ""
         if _goal_str.strip():
             recent = (
                 db.query(BusinessAnalysis)
-                .filter(
-                    BusinessAnalysis.user_id == user_id,
-                    BusinessAnalysis.business_goal == _goal_str,
-                )
+                .filter(BusinessAnalysis.user_id == user_id, BusinessAnalysis.business_goal == _goal_str)
                 .order_by(_desc(BusinessAnalysis.created_at))
                 .first()
             )
             if recent:
-                logger.info(
-                    f"⚡ Returning existing analysis {recent.id} for user {user_id} "
-                    f"(duplicate prompt detected)"
-                )
-                return {
-                    "success": True,
-                    "message": "Analysis completed successfully",
-                    "data": format_analysis_for_frontend(recent),
-                }
+                logger.info(f"⚡ Returning existing analysis {recent.id} for user {user_id}")
+                return {"success": True, "message": "Analysis completed successfully", "data": format_analysis_for_frontend(recent)}
 
         if not business_goal and not files:
             raise HTTPException(status_code=400, detail="Business goal or a document/image upload is required")
 
         business_goal = business_goal or ""
-
-        # Process multimodal files if present
         if files:
-            image_bytes_list = []
-            document_bytes_list = []
-
+            image_bytes_list, document_bytes_list = [], []
             for file in files:
                 file_bytes = await file.read()
                 filename = getattr(file, "filename", "").lower()
-
                 if filename.endswith(('.png', '.jpg', '.jpeg', '.gif')):
                     image_bytes_list.append((file_bytes, filename))
                 elif filename.endswith(('.pdf', '.docx', '.doc', '.xlsx', '.csv', '.txt')):
                     document_bytes_list.append((file_bytes, filename))
-
             if image_bytes_list or document_bytes_list:
-                logger.info(f"Processing {len(image_bytes_list)} images and {len(document_bytes_list)} documents for user {user_id}")
                 mm_handler = MultimodalHandler(use_vision_for_images=True)
                 mm_result = mm_handler.process_multimodal_query(
-                    user_query=business_goal,
-                    image_bytes_list=image_bytes_list,
-                    document_bytes_list=document_bytes_list,
-                    enhance_with_llm=False
+                    user_query=business_goal, image_bytes_list=image_bytes_list,
+                    document_bytes_list=document_bytes_list, enhance_with_llm=False,
                 )
-                combined_context = mm_result.get("combined_context", "")
-                if combined_context:
-                    business_goal = f"{business_goal}\n\n[Additional Context from Uploaded Files]:\n{combined_context}".strip()
+                combined = mm_result.get("combined_context", "")
+                if combined:
+                    business_goal = f"{business_goal}\n\n[Additional Context from Uploaded Files]:\n{combined}".strip()
 
         if not business_goal:
             raise HTTPException(status_code=400, detail="Could not extract any content from the uploaded files to analyze.")
 
-        # Create analyzer and run analysis
         analyzer = create_analyzer(db)
-        result = await analyzer.analyze(
-            user_query=business_goal,
-            user_id=user_id
-        )
+        result = await analyzer.analyze(user_query=business_goal, user_id=user_id)
 
         logger.info(f"✅ Analysis completed: ID {result['data']['analysis_id']}")
+        await delete_cached(f"analyses:user:{user_id}")
 
-        # Schedule background enrichment of automation stacks
         _raw_stacks = result["data"].get("recommended_tool_stacks", [])
         _bottleneck_title = result["data"].get("primary_bottleneck", {}).get("title", "")
         if _raw_stacks:
@@ -321,11 +296,7 @@ async def analyze_business_goal(
                 bottleneck_title=_bottleneck_title,
             )
 
-        return {
-            "success": True,
-            "message": "Analysis completed successfully",
-            "data": result["data"]
-        }
+        return {"success": True, "message": "Analysis completed successfully", "data": result["data"]}
 
     except Exception as e:
         err_str = str(e)
@@ -337,24 +308,12 @@ async def analyze_business_goal(
                 suggestions = _ast.literal_eval(parts[2]) if len(parts) > 2 else []
             except Exception:
                 suggestions = []
-            logger.warning(f"Unsafe query blocked for user {user_id}: {reason}")
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "blocked": True,
-                    "reason": reason,
-                    "suggestions": suggestions,
-                    "message": (
-                        "Our engine can't process this request as described. "
-                        "We're built to help with legitimate business challenges."
-                    ),
-                },
-            )
+            raise HTTPException(status_code=422, detail={
+                "blocked": True, "reason": reason, "suggestions": suggestions,
+                "message": "Our engine can't process this request as described. We're built to help with legitimate business challenges.",
+            })
         logger.error(f"❌ Analysis failed: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Analysis failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 
 @router.get("/analyses")
@@ -373,6 +332,12 @@ async def get_user_analyses(
     """
     try:
         user_id = get_user_id(current_user)
+
+        cache_key = f"analyses:user:{user_id}"
+        cached = await get_cached(cache_key)
+        if cached is not None:
+            return cached
+
         logger.info(f"📋 Fetching analyses for user {user_id}, limit={limit}")
 
         analyses = (
@@ -395,11 +360,13 @@ async def get_user_analyses(
                 logger.warning(f"Failed to format analysis {analysis.id}: {e}")
                 continue
 
-        return {
+        response = {
             "success": True,
             "count": len(ui_analyses),
             "data": ui_analyses
         }
+        await set_cached(cache_key, response, ttl_seconds=30)
+        return response
 
     except Exception as e:
         logger.error(f"❌ Failed to fetch analyses: {e}", exc_info=True)
@@ -463,10 +430,13 @@ async def analyze_business_goal_stream(
     db: Session = Depends(get_db),
 ):
     """
-    SSE streaming analysis endpoint.
-    Emits progress events during analysis, then the final result.
+    SSE streaming analysis endpoint — production path used by the frontend.
+    Emits: progress {pct, msg} | result {data} | error {message} | unsafe {reason, suggestions}
 
-    Event types: progress {pct, msg} | result {data} | error {message}
+    AsyncOpenAI handles all concurrency natively: every user's analysis runs
+    truly in parallel via async I/O. Rate-limit 429s from xAI are retried
+    automatically with exponential backoff (max_retries=5 on the client).
+    No semaphores, no queues, no rejections.
     """
     from decision_engine.agentic_analyzer import create_analyzer
     from decision_engine.multimodal.handler import MultimodalHandler
@@ -476,7 +446,6 @@ async def analyze_business_goal_stream(
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 
-    # Parse request body (identical logic to /analyze)
     content_type = request.headers.get("content-type", "")
     business_goal = ""
     files = []
@@ -499,10 +468,8 @@ async def analyze_business_goal_stream(
     if not business_goal and not files:
         raise HTTPException(status_code=400, detail="Business goal or file upload required")
 
-    # Process multimodal files if present
     if files:
-        image_bytes_list = []
-        document_bytes_list = []
+        image_bytes_list, document_bytes_list = [], []
         for file in files:
             file_bytes = await file.read()
             filename = getattr(file, "filename", "").lower()
@@ -513,10 +480,8 @@ async def analyze_business_goal_stream(
         if image_bytes_list or document_bytes_list:
             mm_handler = MultimodalHandler(use_vision_for_images=True)
             mm_result = mm_handler.process_multimodal_query(
-                user_query=business_goal,
-                image_bytes_list=image_bytes_list,
-                document_bytes_list=document_bytes_list,
-                enhance_with_llm=False,
+                user_query=business_goal, image_bytes_list=image_bytes_list,
+                document_bytes_list=document_bytes_list, enhance_with_llm=False,
             )
             combined = mm_result.get("combined_context", "")
             if combined:
@@ -525,31 +490,24 @@ async def analyze_business_goal_stream(
     if not business_goal:
         raise HTTPException(status_code=400, detail="Could not extract content from uploaded files")
 
-    # Deduplication guard: if the user already analyzed this exact same goal
     from sqlalchemy import desc as _desc
-    recent = None
-    if business_goal and business_goal.strip():
+    if business_goal.strip():
         recent = (
             db.query(BusinessAnalysis)
-            .filter(
-                BusinessAnalysis.user_id == user_id,
-                BusinessAnalysis.business_goal == business_goal,
-            )
+            .filter(BusinessAnalysis.user_id == user_id, BusinessAnalysis.business_goal == business_goal)
             .order_by(_desc(BusinessAnalysis.created_at))
             .first()
         )
-
-    if recent:
-        async def _cached_stream():
-            data = format_analysis_for_frontend(recent)
-            yield f"event: progress\ndata: {json.dumps({'pct': 100, 'msg': 'Returning recent analysis'})}\n\n"
-            yield f"event: result\ndata: {json.dumps({'data': data})}\n\n"
-
-        return StreamingResponse(
-            _cached_stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        if recent:
+            async def _cached_stream():
+                data = format_analysis_for_frontend(recent)
+                yield f"event: progress\ndata: {json.dumps({'pct': 100, 'msg': 'Returning your previous analysis'})}\n\n"
+                yield f"event: result\ndata: {json.dumps({'data': data})}\n\n"
+            return StreamingResponse(
+                _cached_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
 
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -564,7 +522,6 @@ async def analyze_business_goal_stream(
                 user_id=user_id,
                 progress_callback=_progress_callback,
             )
-            # Schedule background enrichment
             _raw_stacks = result["data"].get("recommended_tool_stacks", [])
             _bottleneck_title = result["data"].get("primary_bottleneck", {}).get("title", "")
             if _raw_stacks:
@@ -575,10 +532,21 @@ async def analyze_business_goal_stream(
                     user_query=business_goal,
                     bottleneck_title=_bottleneck_title,
                 )
+            await delete_cached(f"analyses:user:{user_id}")
             await queue.put({"type": "result", "data": result["data"]})
         except Exception as exc:
             logger.error(f"SSE analysis failed: {exc}", exc_info=True)
-            await queue.put({"type": "error", "message": str(exc)})
+            err_str = str(exc)
+            if err_str.startswith("UNSAFE_QUERY::"):
+                parts = err_str.split("::", 2)
+                try:
+                    import ast as _ast
+                    suggestions = _ast.literal_eval(parts[2]) if len(parts) > 2 else []
+                except Exception:
+                    suggestions = []
+                await queue.put({"type": "unsafe", "reason": parts[1] if len(parts) > 1 else "This query cannot be processed.", "suggestions": suggestions})
+            else:
+                await queue.put({"type": "error", "message": err_str})
         finally:
             await queue.put(None)
 
@@ -589,10 +557,8 @@ async def analyze_business_goal_stream(
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=4.0)
                 except asyncio.TimeoutError:
-                    # Send a keep-alive comment to keep Railway/Cloudflare connections open
                     yield ": keepalive\n\n"
                     continue
-                    
                 if item is None:
                     break
                 event_type = item.pop("type")
