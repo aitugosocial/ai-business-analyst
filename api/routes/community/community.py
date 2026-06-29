@@ -140,6 +140,7 @@ class CreateDiscussionRequest(BaseModel):
 
 class CreateReplyRequest(BaseModel):
     content: str
+    parent_reply_id: Optional[int] = None
 
 
 class SaveItemRequest(BaseModel):
@@ -360,11 +361,20 @@ async def get_discussion(
     d.view_count = (d.view_count or 0) + 1
     db.commit()
 
-    replies = [{
-        "id": r.id, "content": r.content, "like_count": r.like_count,
-        "author": {"id": r.user.id, "name": r.user.name} if r.user else None,
-        "created_at": r.created_at.isoformat() if r.created_at else None,
-    } for r in d.replies]
+    def _serialise_reply(r) -> dict:
+        return {
+            "id": r.id,
+            "content": r.content,
+            "like_count": r.like_count,
+            "parent_reply_id": r.parent_reply_id,
+            "author": {"id": r.user.id, "name": r.user.name} if r.user else None,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "sub_replies": [_serialise_reply(sr) for sr in (r.sub_replies or [])],
+        }
+
+    # Only return top-level replies; sub_replies are nested inside each
+    top_level = [r for r in d.replies if r.parent_reply_id is None]
+    replies = [_serialise_reply(r) for r in top_level]
 
     liked = {d.id} if db.query(DiscussionLike).filter_by(user_id=current_user.id, discussion_id=d.id).first() else set()
     data = _discussion_dict(d, liked)
@@ -462,17 +472,33 @@ async def reply_to_discussion(
     if not d:
         raise HTTPException(status_code=404, detail="Discussion not found")
 
-    reply = DiscussionReply(discussion_id=discussion_id, user_id=current_user.id, content=body.content.strip())
+    # Validate parent_reply_id belongs to the same discussion
+    parent_reply_id = body.parent_reply_id
+    if parent_reply_id is not None:
+        parent = db.query(DiscussionReply).filter_by(id=parent_reply_id, discussion_id=discussion_id).first()
+        if not parent:
+            raise HTTPException(status_code=404, detail="Parent reply not found")
+
+    reply = DiscussionReply(
+        discussion_id=discussion_id,
+        user_id=current_user.id,
+        content=body.content.strip(),
+        parent_reply_id=parent_reply_id,
+    )
     db.add(reply)
-    d.reply_count = (d.reply_count or 0) + 1
+    # Only count top-level replies in reply_count for the discussion card
+    if parent_reply_id is None:
+        d.reply_count = (d.reply_count or 0) + 1
     current_user.total_chops = (current_user.total_chops or 0) + 5
     db.commit()
     db.refresh(reply)
 
     return {"success": True, "data": {
         "id": reply.id, "content": reply.content, "like_count": 0,
+        "parent_reply_id": reply.parent_reply_id,
         "author": {"id": current_user.id, "name": current_user.name},
         "created_at": reply.created_at.isoformat() if reply.created_at else None,
+        "sub_replies": [],
     }}
 
 

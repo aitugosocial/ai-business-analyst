@@ -1658,11 +1658,18 @@ class DiscussionReply(Base):
     id = Column(Integer, primary_key=True, index=True)
     discussion_id = Column(Integer, ForeignKey("community_discussions.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    parent_reply_id = Column(Integer, ForeignKey("discussion_replies.id", ondelete="CASCADE"), nullable=True)
     content = Column(Text, nullable=False)
     like_count = Column(Integer, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     discussion = relationship("CommunityDiscussion", back_populates="replies")
     user = relationship("User")
+    sub_replies = relationship(
+        "DiscussionReply",
+        foreign_keys="[DiscussionReply.parent_reply_id]",
+        backref="parent_reply",
+        cascade="all, delete-orphan",
+    )
 
 
 class DiscussionLike(Base):
