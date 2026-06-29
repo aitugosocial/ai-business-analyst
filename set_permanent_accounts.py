@@ -31,9 +31,50 @@ SUBSCRIPTIONS table (per account):
   This satisfies any dashboard queries that look for subscription history.
 """
 
+import os
 import sys
 import hashlib
 from datetime import datetime, timezone
+
+# If project dependencies (psycopg2, etc.) are missing, transparently re-exec
+# this script using the repo's venv Python so it always works with `python3`.
+def _ensure_venv():
+    try:
+        import psycopg2  # noqa: F401
+    except ImportError:
+        _root = os.path.dirname(os.path.abspath(__file__))
+        _venv_py = os.path.join(_root, "venv", "bin", "python")
+        if os.path.exists(_venv_py) and os.path.abspath(sys.executable) != os.path.abspath(_venv_py):
+            os.execv(_venv_py, [_venv_py] + sys.argv)
+        sys.exit("❌  psycopg2 not found and no venv/bin/python available. Run: venv/bin/python set_permanent_accounts.py")
+
+_ensure_venv()
+
+# Load .env / .env.local before any project imports so DATABASE_URL is available
+# regardless of whether this is run with system python or venv python.
+def _load_env():
+    _root = os.path.dirname(os.path.abspath(__file__))
+    for _name in (".env.local", ".env"):
+        _path = os.path.join(_root, _name)
+        if not os.path.exists(_path):
+            continue
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(_path, override=False)
+        except ImportError:
+            # dotenv not available — parse the file ourselves (simple k=v only)
+            with open(_path) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if not _line or _line.startswith("#") or "=" not in _line:
+                        continue
+                    _k, _, _v = _line.partition("=")
+                    _k = _k.strip()
+                    _v = _v.strip().strip("'\"")
+                    os.environ.setdefault(_k, _v)
+        break
+
+_load_env()
 
 from database.pg_connections import get_db
 from database.pg_models import User, Subscriptions
@@ -42,8 +83,8 @@ from database.pg_models import User, Subscriptions
 PERMANENT_EMAILS = [
     "wealththecreator01@gmail.com",
     "clinton@gmail.com",
-    "agadiajeffrey@gmail.com",
-    "alewibolu05@gmail.com",
+    "oparaudochukwu277@gmail.com",
+    "tfred59@gmail.com",
 ]
 
 # Date far enough in the future that it will never naturally expire

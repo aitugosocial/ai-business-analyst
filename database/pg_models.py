@@ -1667,8 +1667,14 @@ class DiscussionReply(Base):
     sub_replies = relationship(
         "DiscussionReply",
         foreign_keys="[DiscussionReply.parent_reply_id]",
-        backref="parent_reply",
+        back_populates="parent_reply",
         cascade="all, delete-orphan",
+    )
+    parent_reply = relationship(
+        "DiscussionReply",
+        foreign_keys="[DiscussionReply.parent_reply_id]",
+        back_populates="sub_replies",
+        remote_side="[DiscussionReply.id]",
     )
 
 
