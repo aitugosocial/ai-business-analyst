@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 revision: str = 'add_parent_reply_id_001'
-down_revision: Union[str, Sequence[str], None] = '80725524ba7b'
+down_revision: Union[str, Sequence[str], None] = '4a015b12472c'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
