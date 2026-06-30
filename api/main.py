@@ -118,6 +118,7 @@ _origins_base = [
     # Production frontend domains — always allowed regardless of ALLOWED_ORIGINS env var
     "https://lavooai.com",
     "https://www.lavooai.com",
+    "https://control.lavooai.com/",
 ]
 # Allow additional origins from environment (comma-separated list)
 _extra_origins = os.getenv("ALLOWED_ORIGINS", "")

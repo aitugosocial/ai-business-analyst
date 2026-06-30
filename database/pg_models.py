@@ -20,6 +20,11 @@ import enum
 from uuid import uuid4
 from typing import Optional, List, Dict
 
+class UserRole(enum.Enum):
+    """Community role for a user. Maps to User.role (stored as plain string)."""
+    NORMAL = "normal_user"
+    MODERATOR = "moderator"
+
 class User(Base):
     """
     User model for authentication and user management.
@@ -55,6 +60,11 @@ class User(Base):
     is_partner = Column(Boolean, default=False)   # partners/staff receive 50% payout; display shows 40%
     is_active = Column(Boolean, default=True)
     user_status = Column(String(20), server_default="active", nullable=False)
+
+    # Community role — distinct from is_admin (platform access vs. community standing).
+    # Valid values: UserRole.NORMAL ("normal_user"), UserRole.MODERATOR ("moderator").
+    role = Column(String(20), nullable=False, server_default=UserRole.NORMAL.value, default=UserRole.NORMAL.value)
+
     last_login = Column(DateTime(timezone=True), nullable=True)
 
     # Daily login streak (Lavoo chops): consecutive calendar days logged in.
@@ -243,6 +253,7 @@ class UserResponse(BaseModel):
     id: int
     name: str
     email: str
+    role: Optional[str] = None   # "normal_user" | "moderator" | None
     subscription_status: str
     total_chops: int
     alert_reading_chops: int
