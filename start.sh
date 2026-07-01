@@ -1,38 +1,15 @@
 #!/bin/bash
 set -e
 
-# The DB's alembic_version table can accumulate multiple rows (stale parent
-# revision alongside the actual current head) if a prior deploy partially
-# succeeded. alembic upgrade head rejects this with an "overlaps" error.
-# Fix: delete any rows that are NOT a file-level head before upgrading.
-python3 - <<'PYEOF'
-import os, sys
-try:
-    import sqlalchemy as sa
-    from alembic.config import Config
-    from alembic.script import ScriptDirectory
+# Remove the stale 4a015b12472c row from alembic_version.
+# If both 4a015b12472c and its child add_parent_reply_id_001 are present,
+# alembic upgrade head fails with an "overlaps" error. Deleting the parent
+# row leaves only the head row so upgrade head becomes a no-op.
+echo "[startup] Removing stale alembic_version row (if present)..."
+psql "${DATABASE_URL}" -c "DELETE FROM alembic_version WHERE version_num = '4a015b12472c';" 2>&1 || true
 
-    cfg = Config("alembic.ini")
-    script = ScriptDirectory.from_config(cfg)
-    file_heads = set(script.get_heads())
-
-    engine = sa.create_engine(os.environ["DATABASE_URL"])
-    with engine.connect() as conn:
-        rows = conn.execute(sa.text("SELECT version_num FROM alembic_version")).fetchall()
-        db_versions = [r[0] for r in rows]
-        if len(db_versions) > 1:
-            stale = [v for v in db_versions if v not in file_heads]
-            if stale:
-                print(f"Removing stale alembic versions: {stale}", flush=True)
-                for v in stale:
-                    conn.execute(
-                        sa.text("DELETE FROM alembic_version WHERE version_num = :v"),
-                        {"v": v},
-                    )
-                conn.commit()
-except Exception as e:
-    print(f"Warning (alembic cleanup): {e}", file=sys.stderr, flush=True)
-PYEOF
-
+echo "[startup] Running alembic upgrade head..."
 alembic upgrade head
+
+echo "[startup] Starting server..."
 exec uvicorn api.main:app --host 0.0.0.0 --port "${PORT:-8000}"
