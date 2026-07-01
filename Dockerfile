@@ -23,6 +23,8 @@ RUN uv pip install --system -r requirements.txt
 
 # Copy application code
 COPY . .
+COPY start.sh ./
+RUN chmod +x start.sh
 
 # Create non-root user for security
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
@@ -35,7 +37,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
   CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
-# Run pending database migrations, then start the application with uvicorn
-COPY start.sh ./
-RUN chmod +x start.sh
 CMD ["./start.sh"]
