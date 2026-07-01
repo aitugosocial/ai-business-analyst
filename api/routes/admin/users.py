@@ -15,13 +15,15 @@ def format_relative_time(dt: datetime) -> str:
     if not dt:
         return "Never"
 
-    now = datetime.now(timezone.utc)
+    # Normalize to naive for arithmetic
     if dt.tzinfo is not None:
         dt = dt.replace(tzinfo=None)
 
-    diff = now - dt
+    diff = datetime.utcnow() - dt
     seconds = int(diff.total_seconds())
 
+    if seconds < 0:
+        return "just now"
     if seconds < 60:
         return f"{seconds} sec{'s' if seconds != 1 else ''} ago"
     elif seconds < 3600:
@@ -35,20 +37,26 @@ def format_relative_time(dt: datetime) -> str:
         return f"{days} day{'s' if days != 1 else ''} ago"
 
 
+def to_naive_utc(dt: datetime) -> datetime:
+    """Strip timezone info so all comparisons use naive UTC — matching DB column type."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
+
+
 def is_user_inactive(user: User) -> bool:
     """Check if user is inactive (no login for 30 days)"""
     if not user.last_login and not user.updated_at:
         return True
 
-    last_activity = user.last_login or user.updated_at
-    if last_activity.tzinfo is not None:
-        last_activity = last_activity.replace(tzinfo=None)
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    last_activity = to_naive_utc(user.last_login or user.updated_at)
+    cutoff = datetime.utcnow() - timedelta(days=30)
     return last_activity < cutoff
 
 
-# ── /stats must be declared before /{user_id} to avoid route shadowing ──────
+# ── /stats must be declared before /{user_id} to avoid route shadowing ───────
 @router.get("/stats")
 async def get_user_stats(
     current_user: User = Depends(admin_required),
@@ -73,7 +81,8 @@ async def get_user_stats(
             User.is_active == False
         ).scalar()
 
-        cutoff_date = datetime.now(timezone.utc) - timedelta(days=30)
+        # ✅ naive UTC — matches the DB column type (no timezone.utc)
+        cutoff_date = datetime.utcnow() - timedelta(days=30)
         inactive_users = db.query(func.count(User.id)).filter(
             User.is_active == True,
             or_(
@@ -95,7 +104,7 @@ async def get_user_stats(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── List route (empty string = /control/users) ───────────────────────────────
+# ── List route (empty string = /control/users) ────────────────────────────────
 @router.get("")
 async def get_users(
     limit: int = 10,
@@ -116,7 +125,8 @@ async def get_users(
             (User.name.ilike(search_term)) | (User.email.ilike(search_term))
         )
 
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=30)
+    # ✅ naive UTC — matches DB column type, avoids offset-naive/aware crash
+    cutoff_date = datetime.utcnow() - timedelta(days=30)
 
     if status and status != "all":
         if status == "active":
@@ -149,7 +159,7 @@ async def get_users(
 
     total = query.count()
 
-    # ── Single joined query — eliminates the N+1 per-user DB hit ────────────
+    # ✅ Single joined query — eliminates the N+1 per-user DB hit
     analysis_counts = (
         db.query(
             BusinessAnalysis.user_id,
@@ -213,7 +223,7 @@ async def get_users(
     }
 
 
-# ── Dynamic route AFTER static routes (/stats must not be shadowed) ──────────
+# ── Dynamic route AFTER static routes (/stats must not be shadowed) ───────────
 @router.get("/{user_id}")
 async def get_user_details(
     user_id: int,
@@ -237,12 +247,9 @@ async def get_user_details(
             .first()
         )
         if first_sub and first_sub.end_date:
-            end_date = (
-                first_sub.end_date.replace(tzinfo=timezone.utc)
-                if first_sub.end_date.tzinfo is None
-                else first_sub.end_date
-            )
-            delta = end_date - datetime.now(end_date.tzinfo)
+            # ✅ Normalize both sides to naive UTC before comparing
+            end_date = to_naive_utc(first_sub.end_date)
+            delta = end_date - datetime.utcnow()
             days_remaining = max(0, delta.days)
 
     from database.pg_models import Referral
@@ -264,7 +271,7 @@ async def get_user_details(
         "name": user.name,
         "email": user.email,
         "avatar": "".join([n[0] for n in user.name.split(" ")[:2]]).upper(),
-        "joinDate": user.created_at.isoformat(),
+        "joinDate": user.created_at.isoformat() if user.created_at else None,
         "created_at": user.created_at.isoformat() if user.created_at else None,
         "lastActive": last_active,
         "last_active": last_active,
@@ -371,12 +378,9 @@ async def sync_subscription_statuses(
         if user.subscriptions:
             for sub in user.subscriptions:
                 if sub.status == "active" and sub.end_date:
-                    end_date = (
-                        sub.end_date.replace(tzinfo=None)
-                        if sub.end_date.tzinfo
-                        else sub.end_date
-                    )
-                    if end_date > datetime.now(timezone.utc):
+                    # ✅ Normalize to naive UTC before comparing
+                    end_date = to_naive_utc(sub.end_date)
+                    if end_date > datetime.utcnow():
                         active_sub = sub
                         break
                     else:
