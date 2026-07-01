@@ -43,6 +43,7 @@ tests/
 !README.md
 
 # Logs
+# Folders that shouldn't be committed
 *.log
 logs/
 ai/logs/

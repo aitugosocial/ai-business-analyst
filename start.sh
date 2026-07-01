@@ -1,16 +1,15 @@
 #!/bin/bash
 set -e
 
-# If the DB's alembic_version table has multiple rows (e.g. stale parent revision
-# left alongside the actual current head), alembic upgrade head fails with an
-# "overlaps" error. Detect this and stamp the single file-level head before upgrading.
-HEADS_IN_DB=$(alembic current 2>/dev/null | grep -c "(head)" || true)
+# Remove the stale 4a015b12472c row from alembic_version.
+# If both 4a015b12472c and its child add_parent_reply_id_001 are present,
+# alembic upgrade head fails with an "overlaps" error. Deleting the parent
+# row leaves only the head row so upgrade head becomes a no-op.
+echo "[startup] Removing stale alembic_version row (if present)..."
+psql "${DATABASE_URL}" -c "DELETE FROM alembic_version WHERE version_num = '4a015b12472c';" 2>&1 || true
 
-if [ "$HEADS_IN_DB" -gt 1 ]; then
-    FILE_HEAD=$(alembic heads 2>/dev/null | grep "(head)" | awk '{print $1}')
-    echo "Multiple heads in alembic_version ($HEADS_IN_DB). Stamping to $FILE_HEAD..."
-    alembic stamp "$FILE_HEAD"
-fi
-
+echo "[startup] Running alembic upgrade head..."
 alembic upgrade head
+
+echo "[startup] Starting server..."
 exec uvicorn api.main:app --host 0.0.0.0 --port "${PORT:-8000}"
