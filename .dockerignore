@@ -57,5 +57,6 @@ web/
 out/
 dist/
 
-# Scripts not needed in production
+# Scripts not needed in production (except startup script)
 *.sh
+!start.sh
