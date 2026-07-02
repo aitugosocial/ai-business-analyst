@@ -563,13 +563,13 @@ async def reply_to_discussion(
         parent_reply_id=parent_reply_id,
     )
     db.add(reply)
-    # Count all replies (including nested) so the comment counter is accurate
+    # Count all replies (including nested) so comment badge is accurate
     d.reply_count = (d.reply_count or 0) + 1
     current_user.total_chops = (current_user.total_chops or 0) + 5
     db.commit()
     db.refresh(reply)
 
-    # Notify the post owner (unless they replied to their own post)
+    # Notify post owner (skip when replying to own post)
     try:
         if d.user_id and d.user_id != current_user.id:
             notif = UserNotification(
@@ -829,7 +829,6 @@ async def get_user_profile(
     user = db.query(User).filter_by(id=user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-
     post_count = db.query(CommunityDiscussion).filter_by(user_id=user_id).count()
     return {"success": True, "data": {
         "id": user.id,
