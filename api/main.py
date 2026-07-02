@@ -1086,8 +1086,11 @@ async def startup_event():
             # was never migrated — every reflections fetch threw OperationalError silently.
             _sync_db.execute(text("ALTER TABLE user_mission_steps ADD COLUMN IF NOT EXISTS reflection TEXT"))
             _sync_db.execute(text("ALTER TABLE user_mission_steps ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP WITH TIME ZONE"))
-            # Backfill any NULL values left by rows created before the column existed.
             _sync_db.execute(text("UPDATE user_settings SET show_mission_comments_in_community = FALSE WHERE show_mission_comments_in_community IS NULL"))
+            # users.role: ORM model column that was never in the physical schema.
+            _sync_db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'normal_user'"))
+            # ai_tools.embedding: required for semantic tool recommendation.
+            _sync_db.execute(text("ALTER TABLE ai_tools ADD COLUMN IF NOT EXISTS embedding TEXT"))
             _sync_db.commit()
             logger.info("✓ Critical community columns ensured (synchronous)")
         except Exception as _e:
