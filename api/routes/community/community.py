@@ -2,6 +2,7 @@
 Community Feature — Channels, Discussions, Events, Leaderboard, Saved Items
 """
 import logging
+import re
 from typing import Optional, List
 from datetime import datetime
 
@@ -18,6 +19,7 @@ from database.pg_models import (
     CommunityEvent, EventRegistration,
     CommunityActivity, SavedItem,
     UserSettings, BusinessAnalysis,
+    UserNotification,
 )
 from api.routes.auth.login import get_current_user
 from api.cache import get_cached, set_cached, delete_cached
@@ -127,6 +129,24 @@ def _event_dict(ev: CommunityEvent, registered_ids: Optional[set] = None) -> dic
         "host_name": ev.host_name, "meeting_link": ev.meeting_link,
         "created_at": ev.created_at.isoformat() if ev.created_at else None,
     }
+
+
+# ─── Content moderation ─────────────────────────────────────────────────────
+
+_DEROGATORY_TERMS = {
+    "nigger", "nigga", "faggot", "fag", "retard", "retarded", "cunt",
+    "kike", "spic", "chink", "gook", "wetback", "tranny", "dyke",
+    "whore", "slut", "bitch", "bastard", "asshole", "motherfucker",
+    "fuck you", "go fuck", "piece of shit", "piece of crap",
+}
+
+def _contains_derogatory_content(text: str) -> bool:
+    lowered = text.lower()
+    for term in _DEROGATORY_TERMS:
+        pattern = r'\b' + re.escape(term) + r'\b'
+        if re.search(pattern, lowered):
+            return True
+    return False
 
 
 # ─── Pydantic Models ────────────────────────────────────────────────────────
@@ -400,6 +420,12 @@ async def create_discussion(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    if _contains_derogatory_content(body.title) or _contains_derogatory_content(body.content):
+        raise HTTPException(
+            status_code=422,
+            detail="Your post contains language that isn't allowed in the Lavoo Build Room. Please review your content and try again."
+        )
+
     ch = db.query(CommunityChannel).filter_by(id=body.channel_id).first()
     if not ch:
         raise HTTPException(status_code=404, detail="Channel not found")
@@ -418,10 +444,44 @@ async def create_discussion(
     db.commit()
     db.refresh(d)
     _log_activity(db, current_user.id, "posted", d.id, "discussion", d.title)
-    # Bust the discussion list cache for this user so the new post is visible immediately
     await delete_cached(f"community:discussions:user:{current_user.id}:ch:{body.channel_id}:lim:20:off:0")
     await delete_cached(f"community:discussions:user:{current_user.id}:ch:None:lim:20:off:0")
     return {"success": True, "data": _discussion_dict(d, set())}
+
+
+@router.delete("/discussions/{discussion_id}")
+async def delete_discussion(
+    discussion_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if d.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only delete your own posts")
+    ch = db.query(CommunityChannel).filter_by(id=d.channel_id).first()
+    if ch and ch.post_count > 0:
+        ch.post_count -= 1
+    db.delete(d)
+    db.commit()
+    await delete_cached(f"community:discussions:user:{current_user.id}:ch:{d.channel_id}:lim:20:off:0")
+    await delete_cached(f"community:discussions:user:{current_user.id}:ch:None:lim:20:off:0")
+    return {"success": True}
+
+
+@router.post("/discussions/{discussion_id}/pin")
+async def pin_discussion(
+    discussion_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Post not found")
+    d.is_pinned = not d.is_pinned
+    db.commit()
+    return {"success": True, "pinned": d.is_pinned}
 
 
 @router.post("/discussions/{discussion_id}/like")
@@ -501,12 +561,27 @@ async def reply_to_discussion(
         parent_reply_id=parent_reply_id,
     )
     db.add(reply)
-    # Only count top-level replies in reply_count for the discussion card
-    if parent_reply_id is None:
-        d.reply_count = (d.reply_count or 0) + 1
+    # Count all replies (including nested) so comment badge is accurate
+    d.reply_count = (d.reply_count or 0) + 1
     current_user.total_chops = (current_user.total_chops or 0) + 5
     db.commit()
     db.refresh(reply)
+
+    # Notify post owner (skip when replying to own post)
+    try:
+        if d.user_id and d.user_id != current_user.id:
+            notif = UserNotification(
+                user_id=d.user_id,
+                type="community_reply",
+                title=f"{current_user.name or 'Someone'} replied to your post",
+                message=body.content.strip()[:120],
+                link=f"/dashboard/community/post/{discussion_id}",
+                is_read=False,
+            )
+            db.add(notif)
+            db.commit()
+    except Exception as notif_err:
+        logger.warning(f"Notification creation failed: {notif_err}")
 
     return {"success": True, "data": {
         "id": reply.id, "content": reply.content, "like_count": 0,
@@ -741,3 +816,24 @@ async def unsave_item(
     db.delete(saved)
     db.commit()
     return {"success": True, "message": "Item unsaved"}
+
+
+@router.get("/users/{user_id}/profile")
+async def get_user_profile(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    user = db.query(User).filter_by(id=user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    post_count = db.query(CommunityDiscussion).filter_by(user_id=user_id).count()
+    return {"success": True, "data": {
+        "id": user.id,
+        "name": user.name or "Member",
+        "email": user.email if user_id == current_user.id else None,
+        "bio": getattr(user, "bio", None),
+        "total_chops": user.total_chops or 0,
+        "post_count": post_count,
+        "joined_at": user.created_at.isoformat() if getattr(user, "created_at", None) else None,
+    }}
