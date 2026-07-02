@@ -479,6 +479,8 @@ async def pin_discussion(
     d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
     if not d:
         raise HTTPException(status_code=404, detail="Post not found")
+    if d.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only pin your own posts")
     d.is_pinned = not d.is_pinned
     db.commit()
     return {"success": True, "pinned": d.is_pinned}
