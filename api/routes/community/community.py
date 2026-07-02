@@ -479,8 +479,7 @@ async def pin_discussion(
     d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
     if not d:
         raise HTTPException(status_code=404, detail="Post not found")
-    if d.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="You can only pin your own posts")
+    # Anyone can pin/unpin any post
     d.is_pinned = not d.is_pinned
     db.commit()
     return {"success": True, "pinned": d.is_pinned}
@@ -636,6 +635,26 @@ async def gift_chops_to_reply(
         author.total_chops = (author.total_chops or 0) + body.amount
     db.commit()
     return {"success": True, "remaining_chops": current_user.total_chops}
+
+
+@router.delete("/discussions/{discussion_id}/replies/{reply_id}")
+async def delete_reply(
+    discussion_id: int,
+    reply_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    r = db.query(DiscussionReply).filter_by(id=reply_id, discussion_id=discussion_id).first()
+    if not r:
+        raise HTTPException(status_code=404, detail="Reply not found")
+    if r.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only delete your own replies")
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if d and (d.reply_count or 0) > 0:
+        d.reply_count = d.reply_count - 1
+    db.delete(r)
+    db.commit()
+    return {"success": True}
 
 
 # ─── Events ──────────────────────────────────────────────────────────────────
