@@ -1076,32 +1076,28 @@ async def startup_event():
             from fastapi_cache import FastAPICache
             FastAPICache.init(InMemoryBackend(), prefix="aianalyst:")
 
-        # Critical columns needed before any request is served.
-        # Wrapped in asyncio.to_thread so blocking DDL never freezes the event
-        # loop and the /health endpoint stays reachable during startup.
-        def _run_critical_migrations():
-            _sync_db = SessionLocal()
-            try:
-                # Fail fast if any lock can't be acquired; startup continues either way.
-                _sync_db.execute(text("SET lock_timeout = '5s'"))
-                _sync_db.execute(text("ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS post_type VARCHAR(50) DEFAULT 'discussion'"))
-                _sync_db.execute(text("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS show_mission_comments_in_community BOOLEAN DEFAULT FALSE"))
-                _sync_db.execute(text("ALTER TABLE user_mission_steps ADD COLUMN IF NOT EXISTS reflection TEXT"))
-                _sync_db.execute(text("ALTER TABLE user_mission_steps ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP WITH TIME ZONE"))
-                _sync_db.execute(text("UPDATE user_settings SET show_mission_comments_in_community = FALSE WHERE show_mission_comments_in_community IS NULL"))
-                # users.role: ORM model column that was never in the physical schema.
-                _sync_db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'normal_user'"))
-                # ai_tools.embedding: required for semantic tool recommendation.
-                _sync_db.execute(text("ALTER TABLE ai_tools ADD COLUMN IF NOT EXISTS embedding TEXT"))
-                _sync_db.commit()
-                logger.info("✓ Critical columns ensured")
-            except Exception as _e:
-                logger.warning(f"Critical column migration warning (non-fatal): {_e}")
-                _sync_db.rollback()
-            finally:
-                _sync_db.close()
-
-        await asyncio.to_thread(_run_critical_migrations)
+        # Critical columns needed before any request is served — run synchronously
+        # so they exist whether or not the heavy background migration has finished.
+        _sync_db = SessionLocal()
+        try:
+            _sync_db.execute(text("ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS post_type VARCHAR(50) DEFAULT 'discussion'"))
+            _sync_db.execute(text("ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS show_mission_comments_in_community BOOLEAN DEFAULT FALSE"))
+            # user_mission_steps.reflection was added to the ORM model but the column
+            # was never migrated — every reflections fetch threw OperationalError silently.
+            _sync_db.execute(text("ALTER TABLE user_mission_steps ADD COLUMN IF NOT EXISTS reflection TEXT"))
+            _sync_db.execute(text("ALTER TABLE user_mission_steps ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP WITH TIME ZONE"))
+            _sync_db.execute(text("UPDATE user_settings SET show_mission_comments_in_community = FALSE WHERE show_mission_comments_in_community IS NULL"))
+            # users.role: ORM model column that was never in the physical schema.
+            _sync_db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'normal_user'"))
+            # ai_tools.embedding: required for semantic tool recommendation.
+            _sync_db.execute(text("ALTER TABLE ai_tools ADD COLUMN IF NOT EXISTS embedding TEXT"))
+            _sync_db.commit()
+            logger.info("✓ Critical community columns ensured (synchronous)")
+        except Exception as _e:
+            logger.warning(f"Critical column migration warning (non-fatal): {_e}")
+            _sync_db.rollback()
+        finally:
+            _sync_db.close()
 
         # Fire the *expensive* schema work (community tables, marketplace tables,
         # security_setup.sql, 30+ indexes, subscription backfills, etc.) in the
