@@ -1498,44 +1498,84 @@ OUTPUT FORMAT (JSON only, no markdown):
         automation_stack_result: Optional[Dict] = None,
     ) -> int:
         """
-        Dynamic confidence score (75–98) based on analysis completeness.
+        Dynamic confidence score (62–91) scaled by actual content depth.
 
-        Factors: bottleneck quality, action plan count, tool recommendations,
-        automation stack count, roadmap completeness.
+        Uses proportional scoring based on text lengths, plan/tool counts,
+        and roadmap completeness so identical checks don't always yield 98.
         """
-        score = 75
+        score = 58
 
         primary = primary_result.get("primary_bottleneck", {})
-        if primary.get("title") and len(primary.get("title", "")) > 10:
-            score += 5
-        if primary.get("description") and len(primary.get("description", "")) > 20:
-            score += 5
+        title_len = len(primary.get("title", ""))
+        desc_len = len(primary.get("description", ""))
 
-        if primary_result.get("strategic_priority") and len(primary_result.get("strategic_priority", "")) > 15:
+        if title_len >= 25:
+            score += 6
+        elif title_len >= 12:
+            score += 4
+        elif title_len > 0:
+            score += 1
+
+        if desc_len >= 150:
+            score += 7
+        elif desc_len >= 60:
             score += 5
+        elif desc_len >= 20:
+            score += 2
+
+        strategic = primary_result.get("strategic_priority", "")
+        strat_len = len(strategic)
+        if strat_len >= 100:
+            score += 6
+        elif strat_len >= 40:
+            score += 4
+        elif strat_len >= 15:
+            score += 2
 
         action_plans = action_plans_result.get("action_plans", [])
         num_plans = len(action_plans)
-        if num_plans >= 2:
-            score += 4
-        if 3 <= num_plans <= 4:
-            score += 2
+        if num_plans >= 4:
+            score += 7
+        elif num_plans == 3:
+            score += 5
+        elif num_plans == 2:
+            score += 3
+        elif num_plans == 1:
+            score += 1
+
+        # Depth of action plan steps
+        total_steps = sum(len(ap.get("steps", [])) for ap in action_plans)
+        if total_steps >= 12:
+            score += 5
+        elif total_steps >= 6:
+            score += 3
+        elif total_steps >= 2:
+            score += 1
 
         tools_count = len([ap for ap in action_plans if ap.get("toolkit")])
-        if tools_count > 0:
-            score += min(tools_count * 2, 5)
+        score += min(tools_count * 2, 6)
 
         stack_count = len((automation_stack_result or {}).get("recommended_tool_stacks", []))
-        if stack_count > 0:
-            score += min(stack_count * 2, 5)
+        if stack_count >= 3:
+            score += 5
+        elif stack_count >= 1:
+            score += 3
 
         roadmap = roadmap_result.get("execution_roadmap", [])
-        if len(roadmap) >= 2:
+        if len(roadmap) >= 5:
+            score += 4
+        elif len(roadmap) >= 3:
             score += 3
-        if roadmap_result.get("estimated_days", 0) > 0:
+        elif len(roadmap) >= 1:
+            score += 1
+
+        est_days = roadmap_result.get("estimated_days", 0) or 0
+        if est_days >= 60:
+            score += 3
+        elif est_days > 0:
             score += 2
 
-        return min(score, 98)
+        return max(62, min(score, 91))
 
     # =========================================================================
     # DATABASE SAVE
