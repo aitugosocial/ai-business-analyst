@@ -78,7 +78,7 @@ from api.routes.auth import login, signup, forgot_password, google_oauth
 from api.routes.decision_engine import analyzer as business_analyzer
 from api.routes.user import stats as user_stats, alerts, insights, referrals, earnings, settings as user_settings, missions as user_missions, profile as user_profile
 from api.routes.support import customer_service, reviews
-from api.routes.admin import admin, security, firewall_scanner, revenue, users, dashboard, settings, content as admin_content
+from api.routes.admin import admin, security, firewall_scanner, revenue, users, dashboard, settings, permissions, content as admin_content
 
 # Payment routes
 from subscriptions import paypal, flutterwave, stripe, commissions, stripe_connect
@@ -1152,6 +1152,8 @@ app.include_router(stripe_connect.router)  # router itself carries prefix="/api/
 app.include_router(security.router, prefix="/api")
 app.include_router(firewall_scanner.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
+app.include_router(permissions.router, prefix="/api")
+
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(admin_content.router, prefix="/api")
 app.include_router(email_service.router)
