@@ -69,7 +69,7 @@ try:
     engine = create_engine(
         DATABASE_URL,
         pool_pre_ping=True,       # Health-check connection before each use
-        pool_recycle=300,         # Railway connections are stable; 5 min recycle is safe
+        pool_recycle=600,         # Railway connections are stable; 5 min recycle is safe
         pool_timeout=20,          # Fail fast — don't block the request for 30 s
         pool_size=15,
         max_overflow=30,
