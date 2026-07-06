@@ -948,7 +948,91 @@ Omit any plan where no catalog tool genuinely fits its specific steps."""
                 f"Assigned '{canonical}' → plan {raw_plan_idx + 1} '{action_plans[raw_plan_idx]['title'][:40]}'"
             )
 
-        # Plans not assigned get an explicit null toolkit
+        # ── Step 4: backfill — a plan that lost its first-choice tool to a
+        # higher-priority plan should get the next-best UNCLAIMED tool from its
+        # own candidate list, not silently go tool-less. Only plans with no
+        # remaining usable candidate fall through to "no tool recommended".
+        unassigned_after_main_pass = [i for i in needy_indices if i not in assigned_plans]
+        backfill_pairs: list[tuple[int, str]] = []  # (plan_idx, canonical_tool_name)
+        for plan_idx in unassigned_after_main_pass:
+            for candidate_name in plan_candidate_names.get(plan_idx, []):
+                candidate_canonical = canonical_map.get(candidate_name.strip().lower())
+                if not candidate_canonical or candidate_canonical.lower() in assigned_tool_names_lower:
+                    continue
+                backfill_pairs.append((plan_idx, candidate_canonical))
+                assigned_tool_names_lower.add(candidate_canonical.lower())  # reserve immediately
+                break  # first untaken candidate is the next-best match for this plan
+
+        if backfill_pairs:
+            pairs_section = "\n\n".join(
+                f"PLAN {p + 1}: {action_plans[p]['title']}\n"
+                f"  Steps:\n" + "\n".join(
+                    f"   {i + 1}. {s}" for i, s in enumerate(
+                        action_plans[p].get("what_to_do", [])
+                        if isinstance(action_plans[p].get("what_to_do"), list) else []
+                    )
+                )
+                + f"\n  Tool to describe: {tool}"
+                for p, tool in backfill_pairs
+            )
+            backfill_prompt = f"""You are a tool-matching specialist. Each tool below was already chosen algorithmically as the next-best available match for its plan (its plan's first-choice tool had already been claimed by a higher-priority plan). Write a plan-specific "what_it_helps" for each pairing.
+
+PERSONA RULE: second person ("you", "your"). One concrete sentence naming the exact step number, describing what the tool does for that step — unique to this plan, not a generic product description.
+
+{pairs_section}
+
+OUTPUT FORMAT (JSON only, no markdown):
+{{
+  "assignments": [
+    {{"plan_index": 1, "what_it_helps": "Step N: one concrete sentence in second person."}}
+  ]
+}}
+Omit a plan only if the tool genuinely does not fit any of its steps."""
+            try:
+                response = await self._llm(
+                    model=self.fast_model,
+                    messages=[{"role": "user", "content": backfill_prompt}],
+                    temperature=0.2,
+                    max_tokens=400,
+                )
+                raw = response.choices[0].message.content.strip()
+                if "```json" in raw:
+                    raw = raw.split("```json")[1].split("```")[0].strip()
+                elif "```" in raw:
+                    raw = raw.split("```")[1].split("```")[0].strip()
+                parsed = _safe_json_loads(raw)
+                backfill_descriptions = {
+                    int(a["plan_index"]) - 1: (a.get("what_it_helps") or "").strip()
+                    for a in parsed.get("assignments", []) if a.get("plan_index")
+                }
+            except Exception as e:
+                logger.warning(f"Backfill description pass failed: {e}")
+                backfill_descriptions = {}
+
+            for plan_idx, canonical in backfill_pairs:
+                what_it_helps = backfill_descriptions.get(plan_idx, "")
+                tool_record = all_tools[canonical]
+                if not what_it_helps:
+                    is_stub = tool_record.get("_step_cited") or not tool_record.get("url")
+                    if is_stub:
+                        # No plan-specific text and no real DB description to fall
+                        # back on — release the reservation; this plan gets no tool.
+                        assigned_tool_names_lower.discard(canonical.lower())
+                        continue
+                    what_it_helps = tool_record.get("description", "")
+                assigned_plans.add(plan_idx)
+                toolkit = {
+                    "tool_name": canonical,
+                    "website": tool_record.get("url") or None,
+                    "what_it_helps": what_it_helps,
+                }
+                action_plans[plan_idx]["toolkit"] = toolkit
+                logger.info(
+                    f"Backfilled alternate tool '{canonical}' → plan {plan_idx + 1} "
+                    f"'{action_plans[plan_idx]['title'][:40]}' (first choice was already claimed)"
+                )
+
+        # Plans still without a tool after both passes get an explicit null toolkit
         for plan_idx in needy_indices:
             if plan_idx not in assigned_plans:
                 action_plans[plan_idx]["toolkit"] = None
@@ -1398,6 +1482,13 @@ OUTPUT (JSON only, no markdown):
             ap["title"]: ap.get("what_to_do", [])[:2]
             for ap in action_plans_result["action_plans"]
         }
+        # Full (unsliced) steps — the prompt only needs the first 2 per plan to
+        # stay concise, but the backfill pool below needs every real step
+        # available so it doesn't run dry after the LLM already used the first 2.
+        action_steps_full = [
+            s for ap in action_plans_result["action_plans"]
+            for s in (ap.get("what_to_do", []) if isinstance(ap.get("what_to_do"), list) else [])
+        ]
         action_list = json.dumps(action_titles)
         action_steps_json = json.dumps(action_steps)
 
@@ -1453,7 +1544,9 @@ OUTPUT FORMAT (JSON only, no markdown):
 
         # Flat pool of real action-plan steps, used only as a last-resort backfill
         # source (never fabricated text) if the LLM under-generates after retries.
-        all_step_pool = [s for steps in action_steps.values() for s in steps]
+        # Uses the FULL step lists (not the 2-per-plan slice fed to the prompt) so
+        # the pool isn't already exhausted by the time a backfill is needed.
+        all_step_pool = action_steps_full
 
         result = None
         total_tasks = 0
