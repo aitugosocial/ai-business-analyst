@@ -884,7 +884,7 @@ Omit any plan where no catalog tool genuinely fits its specific steps."""
         # ── Step 3: normalised name map + used-tool guard ──
         # canonical_map covers both DB tools and step-cited stubs
         canonical_map: dict[str, str] = {n.strip().lower(): n for n in all_tools}
-        assigned_tool_names: set[str] = set()
+        assigned_tool_names_lower: set[str] = set()
         assigned_plans: set[int] = set()
 
         for assignment in assignments:
@@ -904,22 +904,44 @@ Omit any plan where no catalog tool genuinely fits its specific steps."""
                     canonical = llm_name  # accept as-is; it was in the steps text
                     if canonical not in all_tools:
                         all_tools[canonical] = {"tool_name": canonical, "url": None, "website": None, "description": ""}
+                    # Register the canonical spelling so a later plan citing the same
+                    # tool under different casing ("Notion AI" vs "notion ai") resolves
+                    # to THIS exact string instead of slipping past the dedup check below.
+                    canonical_map[canonical.lower()] = canonical
                 else:
                     continue  # genuinely unknown — skip
-            if canonical in assigned_tool_names:
-                continue  # tool already used by another plan
+            if canonical.lower() in assigned_tool_names_lower:
+                continue  # tool already used by another plan (case-insensitive check)
 
-            assigned_tool_names.add(canonical)
+            what_it_helps = (assignment.get("what_it_helps") or "").strip()
+            if not what_it_helps:
+                tool_record = all_tools[canonical]
+                is_stub = tool_record.get("_step_cited") or not tool_record.get("url")
+                if is_stub:
+                    # No plan-specific text from the LLM and no real DB description to
+                    # fall back on — showing the internal stub placeholder would assert
+                    # a claim about the tool that can't be verified. Skip instead of guessing.
+                    logger.warning(
+                        f"Skipping '{canonical}' for plan {raw_plan_idx + 1}: "
+                        f"LLM gave no what_it_helps and tool has no real DB description"
+                    )
+                    continue
+                what_it_helps = tool_record.get("description", "")
+
+            assigned_tool_names_lower.add(canonical.lower())
             assigned_plans.add(raw_plan_idx)
 
+            # The LLM is asked to copy the URL verbatim, but "verbatim" isn't
+            # enforced by the model itself — trust the DB's own url when we have
+            # one, rather than whatever string the LLM echoed back. Only tools
+            # with no DB record (step-cited stubs) fall through to the LLM value.
+            db_url = all_tools[canonical].get("url")
             toolkit = {
                 "tool_name": canonical,
-                "website": assignment.get("website") or all_tools[canonical].get("url") or None,
-                # Prefer LLM-generated plan-specific description; fall back to DB description
-                "what_it_helps": (
-                    assignment.get("what_it_helps")
-                    or all_tools[canonical].get("description", "")
-                ),
+                "website": db_url or assignment.get("website") or None,
+                # This text is plan-specific (bound to canonical's exact assignment,
+                # never shared across plans since canonical is deduped above).
+                "what_it_helps": what_it_helps,
             }
             action_plans[raw_plan_idx]["toolkit"] = toolkit
             logger.info(
@@ -1429,62 +1451,105 @@ OUTPUT FORMAT (JSON only, no markdown):
     "motivational_quote": "A quote that speaks directly to this user's situation"
 }}"""
 
-        try:
-            response = await self._llm(
-                model=self.fast_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,   # slightly lower = fewer hallucinations, faster
-                max_tokens=600,    # 800→600: roadmap JSON is typically ~400 tokens
-            )
-            result_text = response.choices[0].message.content.strip()
+        # Flat pool of real action-plan steps, used only as a last-resort backfill
+        # source (never fabricated text) if the LLM under-generates after retries.
+        all_step_pool = [s for steps in action_steps.values() for s in steps]
 
-            if "```json" in result_text:
-                result_text = result_text.split("```json")[1].split("```")[0].strip()
-            elif "```" in result_text:
-                result_text = result_text.split("```")[1].split("```")[0].strip()
+        result = None
+        total_tasks = 0
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            attempt_prompt = prompt
+            if attempt > 1:
+                attempt_prompt += (
+                    f"\n\nRETRY NOTICE: your previous attempt produced {total_tasks} tasks, "
+                    f"not exactly 7. Recount before responding: "
+                    f"tasks_in_phase_1 + tasks_in_phase_2 + ... MUST equal 7 exactly."
+                )
+            try:
+                response = await self._llm(
+                    model=self.fast_model,
+                    messages=[{"role": "user", "content": attempt_prompt}],
+                    temperature=0.7,   # slightly lower = fewer hallucinations, faster
+                    max_tokens=600,    # 800→600: roadmap JSON is typically ~400 tokens
+                )
+                result_text = response.choices[0].message.content.strip()
 
-            result = _safe_json_loads(result_text)
+                if "```json" in result_text:
+                    result_text = result_text.split("```json")[1].split("```")[0].strip()
+                elif "```" in result_text:
+                    result_text = result_text.split("```")[1].split("```")[0].strip()
 
-            # Deduplicate tasks within each phase at the source so the frontend
-            # doesn't have to deal with LLM repetitions.
-            for phase in result.get("execution_roadmap", []):
-                seen: set = set()
-                deduped = []
-                for t in phase.get("tasks", []):
-                    key = str(t).lower().strip()[:60]
-                    if key not in seen:
-                        seen.add(key)
-                        deduped.append(t)
-                phase["tasks"] = deduped
+                result = _safe_json_loads(result_text)
 
-            # Enforce exactly 7 tasks total. Trim excess; warn on deficit but
-            # never pad synthetically — better to have 6 real tasks than 7 with
-            # a fabricated one.
-            roadmap = result.get("execution_roadmap", [])
-            total_tasks = sum(len(p.get("tasks", [])) for p in roadmap)
-            if total_tasks > 7:
-                remaining = 7
-                for phase in roadmap:
-                    tasks = phase.get("tasks", [])
-                    take = min(len(tasks), remaining)
-                    phase["tasks"] = tasks[:take]
-                    remaining -= take
-                    if remaining == 0:
-                        for later_phase in roadmap[roadmap.index(phase) + 1:]:
-                            later_phase["tasks"] = []
-                        break
-                logger.info(f"Trimmed roadmap tasks from {total_tasks} → 7")
-            elif total_tasks < 7:
-                logger.warning(f"Roadmap has {total_tasks} tasks (expected 7) — LLM under-generated")
+                # Deduplicate tasks within each phase at the source so the frontend
+                # doesn't have to deal with LLM repetitions.
+                for phase in result.get("execution_roadmap", []):
+                    seen: set = set()
+                    deduped = []
+                    for t in phase.get("tasks", []):
+                        key = str(t).lower().strip()[:60]
+                        if key not in seen:
+                            seen.add(key)
+                            deduped.append(t)
+                    phase["tasks"] = deduped
 
-            logger.info(
-                f"Created {result['total_phases']}-phase roadmap ({result['estimated_days']} days)"
-            )
-            return result
+                # Enforce exactly 7 tasks total (missions must equal the 7 days of
+                # the week — never fewer, never more). Trim excess deterministically.
+                roadmap = result.get("execution_roadmap", [])
+                total_tasks = sum(len(p.get("tasks", [])) for p in roadmap)
+                if total_tasks > 7:
+                    remaining = 7
+                    for phase in roadmap:
+                        tasks = phase.get("tasks", [])
+                        take = min(len(tasks), remaining)
+                        phase["tasks"] = tasks[:take]
+                        remaining -= take
+                        if remaining == 0:
+                            for later_phase in roadmap[roadmap.index(phase) + 1:]:
+                                later_phase["tasks"] = []
+                            break
+                    logger.info(f"Trimmed roadmap tasks from {total_tasks} → 7")
+                    total_tasks = 7
 
-        except Exception as e:
-            logger.error(f"Stage 4 failed: {e}")
-            raise
+                if total_tasks == 7:
+                    break
+                logger.warning(
+                    f"Attempt {attempt}/{max_attempts}: roadmap has {total_tasks} tasks (expected 7)"
+                )
+            except Exception as e:
+                logger.error(f"Stage 4 attempt {attempt}/{max_attempts} failed: {e}")
+                if attempt == max_attempts:
+                    raise
+
+        # If every retry still under-generated, backfill the deficit with real,
+        # unused action-plan steps (never invented text) so the count is always 7.
+        roadmap = result.get("execution_roadmap", [])
+        if total_tasks < 7 and roadmap:
+            used = {str(t).lower().strip()[:60] for p in roadmap for t in p.get("tasks", [])}
+            pool = [s for s in all_step_pool if str(s).lower().strip()[:60] not in used]
+            last_phase = roadmap[-1]
+            while total_tasks < 7 and pool:
+                candidate = pool.pop(0)
+                key = str(candidate).lower().strip()[:60]
+                if key in used:
+                    continue
+                last_phase.setdefault("tasks", []).append(candidate)
+                used.add(key)
+                total_tasks += 1
+            if total_tasks < 7:
+                logger.error(
+                    f"Roadmap still has only {total_tasks} tasks after backfill — "
+                    f"not enough distinct action-plan steps to reach 7"
+                )
+            else:
+                logger.info("Backfilled roadmap to exactly 7 tasks using real action-plan steps")
+            result["execution_roadmap"] = roadmap
+
+        logger.info(
+            f"Created {result['total_phases']}-phase roadmap ({result['estimated_days']} days)"
+        )
+        return result
 
     # =========================================================================
     # CONFIDENCE SCORE
