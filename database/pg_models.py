@@ -54,6 +54,8 @@ class User(Base):
     insight_sharing_chops = Column(Integer, default=0)
     referral_chops = Column(Integer, default=0)
     referral_count = Column(Integer, default=0)
+    signal_like_chops = Column(Integer, default=0)
+    signal_comment_chops = Column(Integer, default=0)
 
     # Admin and subscription
     is_admin = Column(Boolean, default=False)
@@ -1835,3 +1837,278 @@ class MvpFeature(Base):
     # JSON array of sub-pages: [{name, directory, is_in_mvp, ...}]
     sub_pages = Column(JSON, nullable=True, default=list)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+# ============================================================================
+# SIGNAL (BLOG) SYSTEM MODELS
+# ============================================================================
+
+class Signal(Base):
+    """
+    Signal — a moderator-authored blog post surfacing insights, trends, and
+    opportunity intelligence for the Lavoo founder community.
+
+    Only users whose role == UserRole.MODERATOR (or is_admin == True) may
+    author Signals. Regular users engage via likes and comments.
+
+    Engagement counters (like_count, comment_count, view_count) are
+    denormalised onto this table so that list queries remain cheap without
+    joining to junction tables on every request.
+    """
+    __tablename__ = "signals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    author_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    # Core content
+    title = Column(String(255), nullable=False)
+    slug = Column(String(300), unique=True, nullable=False, index=True)
+    excerpt = Column(Text, nullable=True)  # Short preview shown in cards
+    content = Column(Text, nullable=False)  # Full Markdown / HTML body
+    cover_image_url = Column(String(500), nullable=True)
+
+    # Taxonomy
+    category = Column(String(100), nullable=True, index=True)
+    tags = Column(JSON, nullable=True)  # e.g. ["AI", "automation", "growth"]
+
+    # Publishing lifecycle
+    # Valid values: "draft" | "published" | "archived"
+    status = Column(String(20), nullable=False, server_default="draft")
+    published_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Display helpers
+    read_time = Column(String(20), nullable=True)  # e.g. "5 min read"
+    is_featured = Column(Boolean, default=False)
+    is_pinned = Column(Boolean, default=False)
+
+    # Denormalised engagement counters
+    view_count = Column(Integer, default=0)
+    like_count = Column(Integer, default=0)
+    comment_count = Column(Integer, default=0)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    # Relationships
+    author = relationship("User", foreign_keys=[author_id], backref="signals")
+    likes = relationship("SignalLike", back_populates="signal", cascade="all, delete-orphan")
+    comments = relationship("SignalComment", back_populates="signal", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        # Covers the most common list query: published posts ordered by date
+        Index("idx_signals_status_published", "status", "published_at"),
+        Index("idx_signals_author", "author_id"),
+    )
+
+
+class SignalLike(Base):
+    """
+    Records a user liking a Signal post.
+
+    Business rules:
+    - One record per (user_id, signal_id) pair — enforced by unique index.
+    - On creation  -> award LIKE_CHOPS (2) to user.total_chops
+                      and user.signal_like_chops; increment signal.like_count.
+    - On deletion  -> deduct LIKE_CHOPS from both counters;
+                      decrement signal.like_count.
+    - chops_awarded is stored for auditability and potential future
+      refund logic if values change.
+    """
+    __tablename__ = "signal_likes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    signal_id = Column(Integer, ForeignKey("signals.id", ondelete="CASCADE"), nullable=False)
+    chops_awarded = Column(Integer, default=2)  # Snapshot of the reward at like-time
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    user = relationship("User")
+    signal = relationship("Signal", back_populates="likes")
+
+    __table_args__ = (
+        # Primary uniqueness guarantee — prevents duplicate likes
+        Index("idx_signal_likes_user_signal", "user_id", "signal_id", unique=True),
+    )
+
+
+class SignalComment(Base):
+    """
+    A comment on a Signal post.
+
+    Supports one level of threading: top-level comments and direct replies.
+    Replies are identified by a non-null parent_comment_id.
+
+    Business rules:
+    - On creation  -> award COMMENT_CHOPS (5) to user.total_chops
+                      and user.signal_comment_chops; increment signal.comment_count.
+    - On deletion  -> deduct COMMENT_CHOPS; decrement signal.comment_count.
+                      Soft-deleted: is_deleted flips to True and content is
+                      replaced with "[deleted]" to preserve thread structure.
+    - Authors may edit their own comments; is_edited / edited_at are updated.
+    - Moderators and admins may hard-delete any comment via the admin panel.
+    """
+    __tablename__ = "signal_comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    signal_id = Column(Integer, ForeignKey("signals.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    parent_comment_id = Column(Integer, ForeignKey("signal_comments.id", ondelete="CASCADE"), nullable=True)
+
+    content = Column(Text, nullable=False)
+    chops_awarded = Column(Integer, default=5)  # Snapshot of the reward at comment-time
+
+    # Edit tracking
+    is_edited = Column(Boolean, default=False)
+    edited_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Soft delete — preserves thread shape; content is cleared to "[deleted]"
+    is_deleted = Column(Boolean, default=False, index=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    # Relationships
+    signal = relationship("Signal", back_populates="comments")
+    user = relationship("User")
+    replies = relationship(
+        "SignalComment",
+        foreign_keys="[SignalComment.parent_comment_id]",
+        back_populates="parent_comment",
+        cascade="all, delete-orphan",
+    )
+    parent_comment = relationship(
+        "SignalComment",
+        foreign_keys="[SignalComment.parent_comment_id]",
+        back_populates="replies",
+        remote_side="[SignalComment.id]",
+    )
+
+    __table_args__ = (
+        Index("idx_signal_comments_signal", "signal_id"),
+        Index("idx_signal_comments_user", "user_id"),
+    )
+
+
+# ─── Signal Pydantic Models ──────────────────────────────────────────────────
+
+class SignalCreate(BaseModel):
+    """Request body for creating a new Signal post."""
+    title: str
+    content: str
+    excerpt: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    category: Optional[str] = None
+    tags: Optional[List[str]] = None
+    status: Optional[str] = "draft"  # "draft" | "published"
+    is_featured: Optional[bool] = False
+    is_pinned: Optional[bool] = False
+
+
+class SignalUpdate(BaseModel):
+    """Request body for updating an existing Signal post (all fields optional)."""
+    title: Optional[str] = None
+    content: Optional[str] = None
+    excerpt: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    category: Optional[str] = None
+    tags: Optional[List[str]] = None
+    status: Optional[str] = None
+    is_featured: Optional[bool] = None
+    is_pinned: Optional[bool] = None
+
+
+class SignalAuthorResponse(BaseModel):
+    """Minimal author profile embedded in Signal responses."""
+    id: int
+    name: str
+    avatar_url: Optional[str] = None
+    role: str
+
+    class Config:
+        from_attributes = True
+
+
+class SignalResponse(BaseModel):
+    """Full Signal representation returned by the API."""
+    id: int
+    title: str
+    slug: str
+    excerpt: Optional[str]
+    content: str
+    cover_image_url: Optional[str]
+    category: Optional[str]
+    tags: Optional[List[str]]
+    status: str
+    read_time: Optional[str]
+    is_featured: bool
+    is_pinned: bool
+    view_count: int
+    like_count: int
+    comment_count: int
+    published_at: Optional[datetime]
+    created_at: datetime
+    updated_at: Optional[datetime]
+    author: SignalAuthorResponse
+    has_liked: bool = False  # Resolved per-request against the auth user
+
+    class Config:
+        from_attributes = True
+
+
+class SignalListResponse(BaseModel):
+    """Paginated Signal list returned by the list endpoint."""
+    signals: List[dict]
+    total: int
+    page: int
+    limit: int
+    total_pages: int
+
+
+class SignalCommentCreate(BaseModel):
+    """Request body for posting a comment."""
+    content: str
+    parent_comment_id: Optional[int] = None
+
+
+class SignalCommentUpdate(BaseModel):
+    """Request body for editing a comment."""
+    content: str
+
+
+class SignalCommentAuthorResponse(BaseModel):
+    """Minimal author profile embedded in comment responses."""
+    id: int
+    name: str
+    avatar_url: Optional[str] = None
+    role: str
+
+    class Config:
+        from_attributes = True
+
+
+class SignalCommentResponse(BaseModel):
+    """Single comment representation, including first-level replies."""
+    id: int
+    signal_id: int
+    user_id: int
+    parent_comment_id: Optional[int]
+    content: str
+    is_edited: bool
+    edited_at: Optional[datetime]
+    is_deleted: bool
+    created_at: datetime
+    author: SignalCommentAuthorResponse
+    replies: List["SignalCommentResponse"] = []
+
+    class Config:
+        from_attributes = True
+
+
+class SignalCommentListResponse(BaseModel):
+    """Paginated comment list."""
+    comments: List[dict]
+    total: int
+    page: int
+    limit: int
+    total_pages: int
