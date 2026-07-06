@@ -93,6 +93,7 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None) ->
             "initials": name[:2].upper(),
             "gradient": _AUTHOR_GRADIENTS[d.user.id % len(_AUTHOR_GRADIENTS)],
             "role": getattr(d.user, 'role', '') or '',
+            "total_chops": d.user.total_chops or 0,
         }
 
     return {
@@ -364,6 +365,7 @@ async def get_discussions(
                                     "initials": (author.name or "M")[:2].upper(),
                                     "gradient": "from-orange-400 to-rose-400",
                                     "role": "",
+                                    "total_chops": author.total_chops or 0,
                                 },
                                 "channel": "reflections",
                                 "created_at": created_at,
@@ -399,7 +401,11 @@ async def get_discussion(
             "content": r.content,
             "like_count": r.like_count,
             "parent_reply_id": r.parent_reply_id,
-            "author": {"id": r.user.id, "name": r.user.name} if r.user else None,
+            "author": {
+                "id": r.user.id,
+                "name": r.user.name,
+                "total_chops": r.user.total_chops or 0,
+            } if r.user else None,
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "sub_replies": [_serialise_reply(sr) for sr in (r.sub_replies or [])],
         }
@@ -587,7 +593,11 @@ async def reply_to_discussion(
     return {"success": True, "data": {
         "id": reply.id, "content": reply.content, "like_count": 0,
         "parent_reply_id": reply.parent_reply_id,
-        "author": {"id": current_user.id, "name": current_user.name},
+        "author": {
+            "id": current_user.id,
+            "name": current_user.name,
+            "total_chops": current_user.total_chops or 0,
+        },
         "created_at": reply.created_at.isoformat() if reply.created_at else None,
         "sub_replies": [],
     }}
