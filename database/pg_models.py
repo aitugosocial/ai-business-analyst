@@ -375,6 +375,7 @@ class AuthResponse(BaseModel):
     name: str
     email: str
     role: str
+    is_admin: bool | None = False
     subscription_status: str | None = None
     subscription_plan: str | None = None
     referral_code: str | None = None
@@ -384,7 +385,6 @@ class AuthResponse(BaseModel):
     two_factor_enabled: bool | None = None
     email_notifications: bool | None = None
     created_at: datetime | None = None
-    # Add new fields
     is_beta_user: bool | None = False
     subscription_expires_at: datetime | None = None
     stripe_customer_id: str | None = None

@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from database.pg_connections import get_db
 from typing import Optional
-from database.pg_models import ShowUser, User, AuthResponse, FailedLoginAttempt, SecurityEvent, IPBlacklist
+from database.pg_models import ShowUser, User, UserRole, AuthResponse, FailedLoginAttempt, SecurityEvent, IPBlacklist
 from api.utils.sub_utils import sync_user_subscription
 from api.services.streak_service import update_login_streak
 
@@ -90,6 +90,48 @@ IS_PRODUCTION = os.getenv("ENVIRONMENT", "development") == "production"
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+
+
+def get_effective_role(user: User) -> str:
+    """Return the role value expected by the frontend while preserving database roles."""
+    user_role = getattr(user, "role", None)
+    if user_role in {UserRole.MODERATOR.value, UserRole.NORMAL.value}:
+        return user_role
+    return "admin" if getattr(user, "is_admin", False) else "user"
+
+
+def build_auth_response_payload(
+    user: User,
+    access_token: str = "",
+    token_type: str = "bearer",
+) -> dict:
+    """Build the shared auth payload used by login, refresh, and profile endpoints."""
+    return {
+        "access_token": access_token,
+        "token_type": token_type,
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "role": get_effective_role(user),
+        "is_admin": bool(getattr(user, "is_admin", False)),
+        "subscription_status": getattr(user, "subscription_status", None),
+        "subscription_plan": getattr(user, "subscription_plan", None),
+        "referral_code": getattr(user, "referral_code", None),
+        "department": getattr(user, "department", None),
+        "location": getattr(user, "location", None),
+        "bio": getattr(user, "bio", None),
+        "two_factor_enabled": getattr(user, "two_factor_enabled", None),
+        "email_notifications": getattr(user, "email_notifications", None),
+        "created_at": getattr(user, "created_at", None),
+        "is_beta_user": getattr(user, "is_beta_user", None),
+        "subscription_expires_at": getattr(user, "subscription_expires_at", None),
+        "stripe_customer_id": getattr(user, "stripe_customer_id", None),
+        "stripe_payment_method_id": getattr(user, "stripe_payment_method_id", None),
+        "card_last4": getattr(user, "card_last4", None),
+        "card_brand": getattr(user, "card_brand", None),
+        "card_exp_month": getattr(user, "card_exp_month", None),
+        "card_exp_year": getattr(user, "card_exp_year", None),
+    }
 
 
 def get_current_user(authorization: Optional[str] = Header(None), access_token_cookie: Optional[str] = Cookie(None), db: Session = Depends(get_db)):
@@ -197,40 +239,14 @@ def me(
             logger.error(f"Failed to auto-generate referral code: {e}")
             db.rollback()
 
-    # Helper to get user role
-    role = "user"
-    if current_user.is_admin:
-        role = "admin"
-
     # Get token from header or cookie for return
     token = authorization.split()[1] if authorization else access_token_cookie
 
-    # Return matched fields
-    return {
-        "id": current_user.id,
-        "name": current_user.name,
-        "email": current_user.email,
-        "subscription_status": current_user.subscription_status,
-        "subscription_plan": current_user.subscription_plan,
-        "role": role,
-        "referral_code": current_user.referral_code,
-        "department": current_user.department,
-        "location": current_user.location,
-        "bio": current_user.bio,
-        "two_factor_enabled": current_user.two_factor_enabled,
-        "email_notifications": current_user.email_notifications,
-        "created_at": current_user.created_at,
-        "access_token": token or "",
-        "token_type": "bearer",
-        "is_beta_user": current_user.is_beta_user,
-        "subscription_expires_at": current_user.subscription_expires_at,
-        "stripe_customer_id": current_user.stripe_customer_id,
-        "stripe_payment_method_id": current_user.stripe_payment_method_id,
-        "card_last4": current_user.card_last4,
-        "card_brand": current_user.card_brand,
-        "card_exp_month": current_user.card_exp_month,
-        "card_exp_year": current_user.card_exp_year
-    }
+    return build_auth_response_payload(
+        current_user,
+        access_token=token or "",
+        token_type="bearer",
+    )
 
 
 class UserUpdate(BaseModel):
@@ -261,7 +277,6 @@ def update_profile(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     user = current_user
-    role = "admin" if user.is_admin else "user"
 
     email_changed = False
     if update_data.email and update_data.email != user.email:
@@ -300,31 +315,11 @@ def update_profile(
     else:
         new_token = ""
 
-    return {
-        "id": user.id,
-        "name": user.name,
-        "email": user.email,
-        "role": role,
-        "subscription_status": user.subscription_status,
-        "subscription_plan": user.subscription_plan,
-        "referral_code": user.referral_code,
-        "department": user.department,
-        "location": user.location,
-        "bio": user.bio,
-        "two_factor_enabled": user.two_factor_enabled,
-        "email_notifications": user.email_notifications,
-        "created_at": user.created_at,
-        "access_token": new_token,
-        "token_type": "bearer",
-        "is_beta_user": user.is_beta_user,
-        "subscription_expires_at": user.subscription_expires_at,
-        "stripe_customer_id": user.stripe_customer_id,
-        "stripe_payment_method_id": user.stripe_payment_method_id,
-        "card_last4": user.card_last4,
-        "card_brand": user.card_brand,
-        "card_exp_month": user.card_exp_month,
-        "card_exp_year": user.card_exp_year
-    }
+    return build_auth_response_payload(
+        user,
+        access_token=new_token,
+        token_type="bearer",
+    )
 
 
 @router.post("/change-password")
@@ -472,16 +467,16 @@ def login(request: ShowUser, response: Response, fastapi_request: Request, db: S
 
     db.commit()
 
-    role = "admin" if user.is_admin else "user"
+    role = get_effective_role(user)
 
     # Generate access token with extended expiration
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.email, "role": role, "id": user.id},
+        data={"sub": user.email, "role": role, "id": user.id, "is_admin": user.is_admin},
         expires_delta=access_token_expires
     )
 
-    refresh_token = create_refresh_token({"sub": user.email, "role": role, "id": user.id})
+    refresh_token = create_refresh_token({"sub": user.email, "role": role, "id": user.id, "is_admin": user.is_admin})
 
     # Set cookies with extended max_age
     response.set_cookie(
@@ -504,25 +499,11 @@ def login(request: ShowUser, response: Response, fastapi_request: Request, db: S
 
     logger.info(f"User logged in: {user.email}, role: {role}")
 
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "id": user.id,
-        "name": user.name,
-        "email": user.email,
-        "role": role,
-        "referral_code": user.referral_code,
-        "subscription_status": user.subscription_status,
-        "subscription_plan": user.subscription_plan,
-        "is_beta_user": user.is_beta_user,
-        "subscription_expires_at": user.subscription_expires_at,
-        "stripe_customer_id": user.stripe_customer_id,
-        "stripe_payment_method_id": user.stripe_payment_method_id,
-        "card_last4": user.card_last4,
-        "card_brand": user.card_brand,
-        "card_exp_month": user.card_exp_month,
-        "card_exp_year": user.card_exp_year
-    }
+    return build_auth_response_payload(
+        user,
+        access_token=access_token,
+        token_type="bearer",
+    )
 
 
 @router.post("/refresh", response_model=AuthResponse)
@@ -547,14 +528,16 @@ def refresh_token_endpoint(refresh_token: str = Cookie(None), response: Response
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
+    role = get_effective_role(user)
+
     # Issue a new access token
     access_token = create_access_token(
-        {"sub": email, "role": role, "id": user.id},
+        {"sub": email, "role": role, "id": user.id, "is_admin": user.is_admin},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
 
     # Also issue a new refresh token
-    new_refresh_token = create_refresh_token({"sub": email, "role": role, "id": user.id})
+    new_refresh_token = create_refresh_token({"sub": email, "role": role, "id": user.id, "is_admin": user.is_admin})
 
     # Update cookies if response is provided
     if response:
@@ -575,14 +558,11 @@ def refresh_token_endpoint(refresh_token: str = Cookie(None), response: Response
             max_age=60 * 60 * 24 * 30
         )
 
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "id": user.id,
-        "name": user.name,
-        "email": user.email,
-        "role": role
-    }
+    return build_auth_response_payload(
+        user,
+        access_token=access_token,
+        token_type="bearer",
+    )
 
 
 @router.post("/token")
@@ -611,12 +591,12 @@ def login_for_swagger(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    role = "admin" if user.is_admin else "user"
+    role = get_effective_role(user)
 
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user.email, "role": role, "id": user.id},
+        data={"sub": user.email, "role": role, "id": user.id, "is_admin": user.is_admin},
         expires_delta=access_token_expires
     )
 
-    return {"access_token": access_token, "token_type": "bearer", "role": role}
+    return {"access_token": access_token, "token_type": "bearer", "role": role, "is_admin": user.is_admin}
