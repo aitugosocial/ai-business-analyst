@@ -34,7 +34,7 @@ from database.pg_models import (
     SignalCommentUpdate,
     UserRole,
 )
-from api.routes.dependencies import get_current_user, admin_required
+from api.routes.dependencies import get_current_user, get_current_user_optional, admin_required
 
 logger = logging.getLogger(__name__)
 
@@ -250,10 +250,16 @@ async def list_signals(
 async def get_signal(
     slug: str,
     db:   Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """
     Return a single published Signal by its URL slug.
     Increments the view counter on every successful request.
+
+    Uses optional auth (get_current_user_optional) so:
+      - a logged-in visitor gets an accurate `has_liked` on their own likes
+      - a logged-out visitor still gets the full post, just with
+        `has_liked: false` always (there's no session to check against)
     """
     signal = db.query(Signal).filter(
         Signal.slug   == slug,
@@ -268,7 +274,11 @@ async def get_signal(
     db.commit()
     db.refresh(signal)
 
-    return _format_signal(signal)
+    return _format_signal(
+        signal,
+        current_user_id=current_user.id if current_user else None,
+        db=db,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -772,6 +782,42 @@ async def list_all_signals_for_moderator(
         "limit":       limit,
         "total_pages": (total + limit - 1) // limit,
     }
+
+
+@router.get("/manage/{signal_id}")
+async def get_signal_for_edit(
+    signal_id:    int,
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
+):
+    """
+    Return a single Signal by id, regardless of status — for the editor.
+
+    Unlike the public GET /{slug} endpoint, this works for drafts and
+    archived posts (which have no meaningful public route) and is scoped
+    to the requester:
+      - Authors may fetch their own post in any status.
+      - Admins may fetch any post.
+      - Moderators requesting another author's post get 403, matching the
+        same ownership rule enforced on update/delete.
+
+    Registered before /manage/{signal_id}/feature and /pin below is fine —
+    FastAPI dispatches by path template, and those routes have an extra
+    path segment, so there's no ambiguity with this one.
+    """
+    _require_moderator(current_user)
+
+    signal = db.query(Signal).filter(Signal.id == signal_id).first()
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found.")
+
+    if signal.author_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only edit your own Signal posts.",
+        )
+
+    return _format_signal(signal, current_user_id=current_user.id, db=db)
 
 
 @router.patch("/manage/{signal_id}/feature")
