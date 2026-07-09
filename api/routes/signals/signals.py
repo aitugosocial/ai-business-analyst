@@ -126,6 +126,7 @@ def _format_signal(signal: Signal, current_user_id: int = None, db: Session = No
         "excerpt":         signal.excerpt,
         "content":         signal.content,
         "cover_image_url": signal.cover_image_url,
+        "cover_image_data": signal.cover_image_data,
         "category":        signal.category,
         "tags":            signal.tags,
         "status":          signal.status,
@@ -321,6 +322,7 @@ async def create_signal(
         excerpt         = payload.excerpt,
         content         = payload.content,
         cover_image_url = payload.cover_image_url,
+        cover_image_data = payload.cover_image_data,
         category        = payload.category,
         tags            = payload.tags,
         status          = payload.status or "draft",
@@ -383,6 +385,7 @@ async def update_signal(
 
     if payload.excerpt         is not None: signal.excerpt         = payload.excerpt
     if payload.cover_image_url is not None: signal.cover_image_url = payload.cover_image_url
+    if payload.cover_image_data is not None: signal.cover_image_data = payload.cover_image_data
     if payload.category        is not None: signal.category        = payload.category
     if payload.tags            is not None: signal.tags            = payload.tags
     if payload.is_featured     is not None: signal.is_featured     = payload.is_featured
