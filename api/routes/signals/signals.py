@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import desc, func, or_, cast, String
 
 from database.pg_connections import get_db
@@ -48,6 +48,12 @@ LIKE_CHOPS    = 2
 COMMENT_CHOPS = 5
 
 VALID_STATUSES = {"draft", "published", "archived"}
+
+# The featured section on the /blog homepage shows exactly this many posts
+# (1 hero + 3 grid cards). Enforced everywhere is_featured can be set, not
+# just the dedicated toggle endpoint below, so the invariant can't be
+# bypassed via a direct call to update_signal().
+MAX_FEATURED = 4
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +111,69 @@ def _require_moderator(current_user: User) -> User:
             detail="Only moderators can author Signal posts.",
         )
     return current_user
+
+
+def _apply_featured_change(
+    signal: Signal,
+    want_featured: bool,
+    db: Session,
+    replace_id: Optional[int] = None,
+) -> None:
+    """
+    Apply a change to signal.is_featured, enforcing the site-wide cap of
+    MAX_FEATURED simultaneously-featured posts. Mutates `signal` (and
+    possibly the replaced signal) in place; caller is responsible for
+    db.commit(). Does not commit or query for the acting user's permissions —
+    callers must already have authorized the request.
+
+    - Unfeaturing (want_featured=False) is always allowed.
+    - Featuring succeeds immediately if fewer than MAX_FEATURED posts are
+      currently featured.
+    - Featuring while already at the cap raises HTTP 409 with the list of
+      currently-featured posts (id/title/slug), UNLESS `replace_id` names
+      one of them — in which case that post is unfeatured and this one is
+      featured, atomically, in the same transaction.
+    """
+    if signal.is_featured == want_featured:
+        return  # already in the desired state — nothing to do
+
+    if not want_featured:
+        signal.is_featured = False
+        return
+
+    featured_posts = (
+        db.query(Signal)
+        .filter(Signal.is_featured == True, Signal.id != signal.id)  # noqa: E712
+        .order_by(desc(Signal.published_at))
+        .all()
+    )
+
+    if len(featured_posts) < MAX_FEATURED:
+        signal.is_featured = True
+        return
+
+    if replace_id is not None:
+        target = next((s for s in featured_posts if s.id == replace_id), None)
+        if not target:
+            raise HTTPException(
+                status_code=400,
+                detail="The post you selected to replace is not currently featured.",
+            )
+        target.is_featured = False
+        signal.is_featured = True
+        return
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "status":  "limit_reached",
+            "message": f"You can feature at most {MAX_FEATURED} posts at once. "
+                       f"Choose one to replace, or unfeature a post first.",
+            "featured_posts": [
+                {"id": s.id, "title": s.title, "slug": s.slug} for s in featured_posts
+            ],
+        },
+    )
 
 
 def _format_signal(signal: Signal, current_user_id: int = None, db: Session = None) -> dict:
@@ -204,7 +273,7 @@ async def list_signals(
     search across title and excerpt. Results are ordered by pinned status
     (pinned posts appear first), then by published_at descending.
     """
-    query = db.query(Signal).filter(Signal.status == "published")
+    query = db.query(Signal).options(joinedload(Signal.author)).filter(Signal.status == "published")
 
     if category:
         query = query.filter(Signal.category.ilike(f"%{category}%"))
@@ -388,7 +457,13 @@ async def update_signal(
     if payload.cover_image_data is not None: signal.cover_image_data = payload.cover_image_data
     if payload.category        is not None: signal.category        = payload.category
     if payload.tags            is not None: signal.tags            = payload.tags
-    if payload.is_featured     is not None: signal.is_featured     = payload.is_featured
+    if payload.is_featured is not None:
+        # Enforced here too (not just the dedicated /feature endpoint) so
+        # the MAX_FEATURED cap can't be bypassed via a direct edit-form
+        # save. No replace_id support on this path by design — conflicts
+        # are resolved through the dedicated toggle endpoint's UI, which
+        # can show the moderator which posts are currently featured.
+        _apply_featured_change(signal, payload.is_featured, db, replace_id=None)
     if payload.is_pinned       is not None: signal.is_pinned       = payload.is_pinned
 
     if payload.status is not None:
@@ -543,8 +618,15 @@ async def list_comments(
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found.")
 
-    # Fetch only top-level comments; replies are loaded via relationship
-    query = db.query(SignalComment).filter(
+    # Fetch only top-level comments; replies are loaded via relationship.
+    # joinedload both `user` (this comment's author) and `replies.user`
+    # (each reply's author) up front — without this, SQLAlchemy lazy-loads
+    # the author separately for every comment AND every reply individually,
+    # turning a single request into 1 + 2*N queries on a busy thread.
+    query = db.query(SignalComment).options(
+        joinedload(SignalComment.user),
+        joinedload(SignalComment.replies).joinedload(SignalComment.user),
+    ).filter(
         SignalComment.signal_id         == signal_id,
         SignalComment.parent_comment_id == None,   # noqa: E711 — SQLAlchemy requires `==`
     )
@@ -760,7 +842,7 @@ async def list_all_signals_for_moderator(
     """
     _require_moderator(current_user)
 
-    query = db.query(Signal)
+    query = db.query(Signal).options(joinedload(Signal.author))
 
     if not current_user.is_admin:
         # Moderators see only their own signals
@@ -826,21 +908,44 @@ async def get_signal_for_edit(
 @router.patch("/manage/{signal_id}/feature")
 async def toggle_featured(
     signal_id:    int,
-    current_user: User    = Depends(admin_required),
+    replace_id:   Optional[int] = Query(
+        default=None,
+        description="If the featured cap is already reached, the id of a "
+                    "currently-featured post to unfeature in the same "
+                    "request as this one is featured.",
+    ),
+    current_user: User    = Depends(get_current_user),
     db:           Session = Depends(get_db),
 ):
     """
-    Toggle the is_featured flag on any Signal.
-    Admin only — used to surface curated content on the homepage.
+    Toggle the is_featured flag on a Signal.
+
+    - Moderators may feature/unfeature their own posts; admins may do so
+      for any post — matching the ownership rule on update/delete.
+    - Unfeaturing always succeeds.
+    - Featuring while MAX_FEATURED posts are already featured returns
+      HTTP 409 with the current featured list, unless `replace_id` is
+      supplied to swap one out atomically.
     """
+    _require_moderator(current_user)
+
     signal = db.query(Signal).filter(Signal.id == signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found.")
 
-    signal.is_featured = not signal.is_featured
+    if signal.author_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only feature your own Signal posts.",
+        )
+
+    want_featured = not signal.is_featured
+    _apply_featured_change(signal, want_featured, db, replace_id=replace_id)
     db.commit()
+    db.refresh(signal)
 
     state = "featured" if signal.is_featured else "unfeatured"
+    logger.info(f"Signal {state}: id={signal.id} by user={current_user.email}")
     return {
         "status":      "success",
         "is_featured": signal.is_featured,
