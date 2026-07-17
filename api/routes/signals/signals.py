@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import desc, func, or_, cast, String
 
@@ -55,10 +55,36 @@ VALID_STATUSES = {"draft", "published", "archived"}
 # bypassed via a direct call to update_signal().
 MAX_FEATURED = 4
 
+# Server-side backstop for cover_image_data. The frontend auto-compresses
+# uploads to ~150KB raw before base64-encoding (see
+# lib/utils/imageCompression.ts), and base64 inflates that by ~33% — so a
+# correctly-compressed image lands around 200KB of text here. This cap is
+# set generously above that (not tight to 200KB) specifically so it never
+# false-rejects a legitimately compressed image; it exists purely to catch
+# someone bypassing the UI and hitting the API directly with an
+# uncompressed multi-megabyte image, which is the actual DB-cost risk this
+# whole feature is protecting against.
+MAX_COVER_IMAGE_B64_CHARS = 400_000
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _check_cover_image_size(cover_image_data: Optional[str]) -> None:
+    """
+    Raise HTTP 400 if a base64 cover image exceeds the server-side backstop.
+    See MAX_COVER_IMAGE_B64_CHARS above for why this limit is set where it
+    is — this is a safety net against bypassing the frontend's
+    auto-compression, not the primary size-shaping mechanism.
+    """
+    if cover_image_data and len(cover_image_data) > MAX_COVER_IMAGE_B64_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail="This cover image is too large. Please choose a smaller image "
+                   "— images are automatically optimized when uploaded through the editor.",
+        )
+
 
 def _generate_slug(title: str) -> str:
     """
@@ -258,6 +284,7 @@ def _format_comment(comment: SignalComment, include_replies: bool = True) -> dic
 
 @router.get("")
 async def list_signals(
+    response: Response,
     page:     int           = Query(default=1, ge=1),
     limit:    int           = Query(default=10, ge=1, le=50),
     category: Optional[str] = Query(default=None),
@@ -273,6 +300,13 @@ async def list_signals(
     search across title and excerpt. Results are ordered by pinned status
     (pinned posts appear first), then by published_at descending.
     """
+    # This list changes on every publish, feature/unfeature, and like, and
+    # is read by a plain browser fetch() with no cache-busting query
+    # param — without an explicit no-store, either the browser's own HTTP
+    # cache or an intermediate proxy/CDN can silently serve a stale copy,
+    # which only a hard refresh (bypassing HTTP cache) would reveal.
+    response.headers["Cache-Control"] = "no-store"
+
     query = db.query(Signal).options(joinedload(Signal.author)).filter(Signal.status == "published")
 
     if category:
@@ -319,6 +353,7 @@ async def list_signals(
 @router.get("/{slug}")
 async def get_signal(
     slug: str,
+    response: Response,
     db:   Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
@@ -331,6 +366,8 @@ async def get_signal(
       - a logged-out visitor still gets the full post, just with
         `has_liked: false` always (there's no session to check against)
     """
+    response.headers["Cache-Control"] = "no-store"
+
     signal = db.query(Signal).filter(
         Signal.slug   == slug,
         Signal.status == "published",
@@ -376,6 +413,8 @@ async def create_signal(
             status_code=400,
             detail=f"Invalid status. Must be one of: {', '.join(VALID_STATUSES)}.",
         )
+
+    _check_cover_image_size(payload.cover_image_data)
 
     base_slug = _generate_slug(payload.title)
     slug      = _unique_slug(base_slug, db)
@@ -442,6 +481,8 @@ async def update_signal(
             status_code=400,
             detail=f"Invalid status. Must be one of: {', '.join(VALID_STATUSES)}.",
         )
+
+    _check_cover_image_size(payload.cover_image_data)
 
     if payload.title is not None:
         base_slug    = _generate_slug(payload.title)
@@ -603,6 +644,7 @@ async def toggle_like(
 @router.get("/{signal_id}/comments")
 async def list_comments(
     signal_id: int,
+    response:  Response,
     page:      int = Query(default=1, ge=1),
     limit:     int = Query(default=20, ge=1, le=100),
     db:        Session = Depends(get_db),
@@ -614,6 +656,8 @@ async def list_comments(
     Soft-deleted comments are included so thread structure is preserved,
     but their content is replaced with "[deleted]" by the formatter.
     """
+    response.headers["Cache-Control"] = "no-store"
+
     signal = db.query(Signal).filter(Signal.id == signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found.")
@@ -828,6 +872,7 @@ async def delete_comment(
 
 @router.get("/manage/all")
 async def list_all_signals_for_moderator(
+    response: Response,
     page:   int           = Query(default=1, ge=1),
     limit:  int           = Query(default=10, ge=1, le=50),
     status: Optional[str] = Query(default=None),
@@ -840,6 +885,8 @@ async def list_all_signals_for_moderator(
     A moderator sees only their own posts across all statuses.
     An admin sees every post across all statuses.
     """
+    response.headers["Cache-Control"] = "no-store"
+
     _require_moderator(current_user)
 
     query = db.query(Signal).options(joinedload(Signal.author))
@@ -872,6 +919,7 @@ async def list_all_signals_for_moderator(
 @router.get("/manage/{signal_id}")
 async def get_signal_for_edit(
     signal_id:    int,
+    response:     Response,
     current_user: User    = Depends(get_current_user),
     db:           Session = Depends(get_db),
 ):
@@ -890,6 +938,8 @@ async def get_signal_for_edit(
     FastAPI dispatches by path template, and those routes have an extra
     path segment, so there's no ambiguity with this one.
     """
+    response.headers["Cache-Control"] = "no-store"
+
     _require_moderator(current_user)
 
     signal = db.query(Signal).filter(Signal.id == signal_id).first()
