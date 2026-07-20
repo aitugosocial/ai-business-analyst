@@ -153,21 +153,33 @@ async def health_check():
     """
     Liveness / readiness probe for Railway, Docker HEALTHCHECK, load balancers, etc.
 
-    Returns a small JSON payload containing database type and a "healthy" status
-    as long as get_db_info() succeeds. Because this is defined before the heavy
-    startup work, once the startup coroutine finishes this endpoint becomes
-    reachable.
+    Returns a small JSON payload containing database type and a "healthy" status.
+    Actually executes `SELECT 1` against the database rather than trusting local
+    pool metadata, so `database.connected` reflects real connectivity — a stale
+    or dropped connection is detected here instead of silently reporting healthy.
+    Because this is defined before the heavy startup work, once the startup
+    coroutine finishes this endpoint becomes reachable.
     """
+    db_connected = False
+    db_error = None
+    db_type = None
     try:
-        db_info = get_db_info()
-        return {
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "database": {"type": db_info.get("type"), "connected": True},
-            "version": "1.0.0",
-        }
+        db_type = get_db_info().get("type")
+        db = SessionLocal()
+        try:
+            db.execute(text("SELECT 1"))
+            db_connected = True
+        finally:
+            db.close()
     except Exception as e:
-        return {"status": "unhealthy", "timestamp": datetime.now().isoformat(), "error": str(e)}
+        db_error = str(e)
+
+    return {
+        "status": "healthy" if db_connected else "unhealthy",
+        "timestamp": datetime.now().isoformat(),
+        "database": {"type": db_type, "connected": db_connected, **({"error": db_error} if db_error else {})},
+        "version": "1.0.0",
+    }
 
 
 @app.get("/api/beta-status")
