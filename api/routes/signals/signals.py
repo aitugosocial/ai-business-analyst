@@ -18,8 +18,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import desc, func, or_, cast, String
 
 from database.pg_connections import get_db
@@ -34,7 +34,7 @@ from database.pg_models import (
     SignalCommentUpdate,
     UserRole,
 )
-from api.routes.dependencies import get_current_user, admin_required
+from api.routes.dependencies import get_current_user, get_current_user_optional, admin_required
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +49,42 @@ COMMENT_CHOPS = 5
 
 VALID_STATUSES = {"draft", "published", "archived"}
 
+# The featured section on the /blog homepage shows exactly this many posts
+# (1 hero + 3 grid cards). Enforced everywhere is_featured can be set, not
+# just the dedicated toggle endpoint below, so the invariant can't be
+# bypassed via a direct call to update_signal().
+MAX_FEATURED = 4
+
+# Server-side backstop for cover_image_data. The frontend auto-compresses
+# uploads to ~150KB raw before base64-encoding (see
+# lib/utils/imageCompression.ts), and base64 inflates that by ~33% — so a
+# correctly-compressed image lands around 200KB of text here. This cap is
+# set generously above that (not tight to 200KB) specifically so it never
+# false-rejects a legitimately compressed image; it exists purely to catch
+# someone bypassing the UI and hitting the API directly with an
+# uncompressed multi-megabyte image, which is the actual DB-cost risk this
+# whole feature is protecting against.
+MAX_COVER_IMAGE_B64_CHARS = 400_000
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _check_cover_image_size(cover_image_data: Optional[str]) -> None:
+    """
+    Raise HTTP 400 if a base64 cover image exceeds the server-side backstop.
+    See MAX_COVER_IMAGE_B64_CHARS above for why this limit is set where it
+    is — this is a safety net against bypassing the frontend's
+    auto-compression, not the primary size-shaping mechanism.
+    """
+    if cover_image_data and len(cover_image_data) > MAX_COVER_IMAGE_B64_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail="This cover image is too large. Please choose a smaller image "
+                   "— images are automatically optimized when uploaded through the editor.",
+        )
+
 
 def _generate_slug(title: str) -> str:
     """
@@ -107,6 +139,69 @@ def _require_moderator(current_user: User) -> User:
     return current_user
 
 
+def _apply_featured_change(
+    signal: Signal,
+    want_featured: bool,
+    db: Session,
+    replace_id: Optional[int] = None,
+) -> None:
+    """
+    Apply a change to signal.is_featured, enforcing the site-wide cap of
+    MAX_FEATURED simultaneously-featured posts. Mutates `signal` (and
+    possibly the replaced signal) in place; caller is responsible for
+    db.commit(). Does not commit or query for the acting user's permissions —
+    callers must already have authorized the request.
+
+    - Unfeaturing (want_featured=False) is always allowed.
+    - Featuring succeeds immediately if fewer than MAX_FEATURED posts are
+      currently featured.
+    - Featuring while already at the cap raises HTTP 409 with the list of
+      currently-featured posts (id/title/slug), UNLESS `replace_id` names
+      one of them — in which case that post is unfeatured and this one is
+      featured, atomically, in the same transaction.
+    """
+    if signal.is_featured == want_featured:
+        return  # already in the desired state — nothing to do
+
+    if not want_featured:
+        signal.is_featured = False
+        return
+
+    featured_posts = (
+        db.query(Signal)
+        .filter(Signal.is_featured == True, Signal.id != signal.id)  # noqa: E712
+        .order_by(desc(Signal.published_at))
+        .all()
+    )
+
+    if len(featured_posts) < MAX_FEATURED:
+        signal.is_featured = True
+        return
+
+    if replace_id is not None:
+        target = next((s for s in featured_posts if s.id == replace_id), None)
+        if not target:
+            raise HTTPException(
+                status_code=400,
+                detail="The post you selected to replace is not currently featured.",
+            )
+        target.is_featured = False
+        signal.is_featured = True
+        return
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "status":  "limit_reached",
+            "message": f"You can feature at most {MAX_FEATURED} posts at once. "
+                       f"Choose one to replace, or unfeature a post first.",
+            "featured_posts": [
+                {"id": s.id, "title": s.title, "slug": s.slug} for s in featured_posts
+            ],
+        },
+    )
+
+
 def _format_signal(signal: Signal, current_user_id: int = None, db: Session = None) -> dict:
     """
     Serialise a Signal ORM object to the standard API response shape.
@@ -126,6 +221,7 @@ def _format_signal(signal: Signal, current_user_id: int = None, db: Session = No
         "excerpt":         signal.excerpt,
         "content":         signal.content,
         "cover_image_url": signal.cover_image_url,
+        "cover_image_data": signal.cover_image_data,
         "category":        signal.category,
         "tags":            signal.tags,
         "status":          signal.status,
@@ -188,6 +284,7 @@ def _format_comment(comment: SignalComment, include_replies: bool = True) -> dic
 
 @router.get("")
 async def list_signals(
+    response: Response,
     page:     int           = Query(default=1, ge=1),
     limit:    int           = Query(default=10, ge=1, le=50),
     category: Optional[str] = Query(default=None),
@@ -203,7 +300,14 @@ async def list_signals(
     search across title and excerpt. Results are ordered by pinned status
     (pinned posts appear first), then by published_at descending.
     """
-    query = db.query(Signal).filter(Signal.status == "published")
+    # This list changes on every publish, feature/unfeature, and like, and
+    # is read by a plain browser fetch() with no cache-busting query
+    # param — without an explicit no-store, either the browser's own HTTP
+    # cache or an intermediate proxy/CDN can silently serve a stale copy,
+    # which only a hard refresh (bypassing HTTP cache) would reveal.
+    response.headers["Cache-Control"] = "no-store"
+
+    query = db.query(Signal).options(joinedload(Signal.author)).filter(Signal.status == "published")
 
     if category:
         query = query.filter(Signal.category.ilike(f"%{category}%"))
@@ -249,12 +353,21 @@ async def list_signals(
 @router.get("/{slug}")
 async def get_signal(
     slug: str,
+    response: Response,
     db:   Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """
     Return a single published Signal by its URL slug.
     Increments the view counter on every successful request.
+
+    Uses optional auth (get_current_user_optional) so:
+      - a logged-in visitor gets an accurate `has_liked` on their own likes
+      - a logged-out visitor still gets the full post, just with
+        `has_liked: false` always (there's no session to check against)
     """
+    response.headers["Cache-Control"] = "no-store"
+
     signal = db.query(Signal).filter(
         Signal.slug   == slug,
         Signal.status == "published",
@@ -268,7 +381,11 @@ async def get_signal(
     db.commit()
     db.refresh(signal)
 
-    return _format_signal(signal)
+    return _format_signal(
+        signal,
+        current_user_id=current_user.id if current_user else None,
+        db=db,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +414,8 @@ async def create_signal(
             detail=f"Invalid status. Must be one of: {', '.join(VALID_STATUSES)}.",
         )
 
+    _check_cover_image_size(payload.cover_image_data)
+
     base_slug = _generate_slug(payload.title)
     slug      = _unique_slug(base_slug, db)
 
@@ -311,6 +430,7 @@ async def create_signal(
         excerpt         = payload.excerpt,
         content         = payload.content,
         cover_image_url = payload.cover_image_url,
+        cover_image_data = payload.cover_image_data,
         category        = payload.category,
         tags            = payload.tags,
         status          = payload.status or "draft",
@@ -362,6 +482,8 @@ async def update_signal(
             detail=f"Invalid status. Must be one of: {', '.join(VALID_STATUSES)}.",
         )
 
+    _check_cover_image_size(payload.cover_image_data)
+
     if payload.title is not None:
         base_slug    = _generate_slug(payload.title)
         signal.slug  = _unique_slug(base_slug, db, exclude_id=signal_id)
@@ -373,9 +495,16 @@ async def update_signal(
 
     if payload.excerpt         is not None: signal.excerpt         = payload.excerpt
     if payload.cover_image_url is not None: signal.cover_image_url = payload.cover_image_url
+    if payload.cover_image_data is not None: signal.cover_image_data = payload.cover_image_data
     if payload.category        is not None: signal.category        = payload.category
     if payload.tags            is not None: signal.tags            = payload.tags
-    if payload.is_featured     is not None: signal.is_featured     = payload.is_featured
+    if payload.is_featured is not None:
+        # Enforced here too (not just the dedicated /feature endpoint) so
+        # the MAX_FEATURED cap can't be bypassed via a direct edit-form
+        # save. No replace_id support on this path by design — conflicts
+        # are resolved through the dedicated toggle endpoint's UI, which
+        # can show the moderator which posts are currently featured.
+        _apply_featured_change(signal, payload.is_featured, db, replace_id=None)
     if payload.is_pinned       is not None: signal.is_pinned       = payload.is_pinned
 
     if payload.status is not None:
@@ -515,6 +644,7 @@ async def toggle_like(
 @router.get("/{signal_id}/comments")
 async def list_comments(
     signal_id: int,
+    response:  Response,
     page:      int = Query(default=1, ge=1),
     limit:     int = Query(default=20, ge=1, le=100),
     db:        Session = Depends(get_db),
@@ -526,12 +656,21 @@ async def list_comments(
     Soft-deleted comments are included so thread structure is preserved,
     but their content is replaced with "[deleted]" by the formatter.
     """
+    response.headers["Cache-Control"] = "no-store"
+
     signal = db.query(Signal).filter(Signal.id == signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found.")
 
-    # Fetch only top-level comments; replies are loaded via relationship
-    query = db.query(SignalComment).filter(
+    # Fetch only top-level comments; replies are loaded via relationship.
+    # joinedload both `user` (this comment's author) and `replies.user`
+    # (each reply's author) up front — without this, SQLAlchemy lazy-loads
+    # the author separately for every comment AND every reply individually,
+    # turning a single request into 1 + 2*N queries on a busy thread.
+    query = db.query(SignalComment).options(
+        joinedload(SignalComment.user),
+        joinedload(SignalComment.replies).joinedload(SignalComment.user),
+    ).filter(
         SignalComment.signal_id         == signal_id,
         SignalComment.parent_comment_id == None,   # noqa: E711 — SQLAlchemy requires `==`
     )
@@ -733,6 +872,7 @@ async def delete_comment(
 
 @router.get("/manage/all")
 async def list_all_signals_for_moderator(
+    response: Response,
     page:   int           = Query(default=1, ge=1),
     limit:  int           = Query(default=10, ge=1, le=50),
     status: Optional[str] = Query(default=None),
@@ -745,9 +885,11 @@ async def list_all_signals_for_moderator(
     A moderator sees only their own posts across all statuses.
     An admin sees every post across all statuses.
     """
+    response.headers["Cache-Control"] = "no-store"
+
     _require_moderator(current_user)
 
-    query = db.query(Signal)
+    query = db.query(Signal).options(joinedload(Signal.author))
 
     if not current_user.is_admin:
         # Moderators see only their own signals
@@ -774,24 +916,86 @@ async def list_all_signals_for_moderator(
     }
 
 
-@router.patch("/manage/{signal_id}/feature")
-async def toggle_featured(
+@router.get("/manage/{signal_id}")
+async def get_signal_for_edit(
     signal_id:    int,
-    current_user: User    = Depends(admin_required),
+    response:     Response,
+    current_user: User    = Depends(get_current_user),
     db:           Session = Depends(get_db),
 ):
     """
-    Toggle the is_featured flag on any Signal.
-    Admin only — used to surface curated content on the homepage.
+    Return a single Signal by id, regardless of status — for the editor.
+
+    Unlike the public GET /{slug} endpoint, this works for drafts and
+    archived posts (which have no meaningful public route) and is scoped
+    to the requester:
+      - Authors may fetch their own post in any status.
+      - Admins may fetch any post.
+      - Moderators requesting another author's post get 403, matching the
+        same ownership rule enforced on update/delete.
+
+    Registered before /manage/{signal_id}/feature and /pin below is fine —
+    FastAPI dispatches by path template, and those routes have an extra
+    path segment, so there's no ambiguity with this one.
     """
+    response.headers["Cache-Control"] = "no-store"
+
+    _require_moderator(current_user)
+
     signal = db.query(Signal).filter(Signal.id == signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found.")
 
-    signal.is_featured = not signal.is_featured
+    if signal.author_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only edit your own Signal posts.",
+        )
+
+    return _format_signal(signal, current_user_id=current_user.id, db=db)
+
+
+@router.patch("/manage/{signal_id}/feature")
+async def toggle_featured(
+    signal_id:    int,
+    replace_id:   Optional[int] = Query(
+        default=None,
+        description="If the featured cap is already reached, the id of a "
+                    "currently-featured post to unfeature in the same "
+                    "request as this one is featured.",
+    ),
+    current_user: User    = Depends(get_current_user),
+    db:           Session = Depends(get_db),
+):
+    """
+    Toggle the is_featured flag on a Signal.
+
+    - Moderators may feature/unfeature their own posts; admins may do so
+      for any post — matching the ownership rule on update/delete.
+    - Unfeaturing always succeeds.
+    - Featuring while MAX_FEATURED posts are already featured returns
+      HTTP 409 with the current featured list, unless `replace_id` is
+      supplied to swap one out atomically.
+    """
+    _require_moderator(current_user)
+
+    signal = db.query(Signal).filter(Signal.id == signal_id).first()
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found.")
+
+    if signal.author_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only feature your own Signal posts.",
+        )
+
+    want_featured = not signal.is_featured
+    _apply_featured_change(signal, want_featured, db, replace_id=replace_id)
     db.commit()
+    db.refresh(signal)
 
     state = "featured" if signal.is_featured else "unfeatured"
+    logger.info(f"Signal {state}: id={signal.id} by user={current_user.email}")
     return {
         "status":      "success",
         "is_featured": signal.is_featured,

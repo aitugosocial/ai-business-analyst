@@ -1866,6 +1866,11 @@ class Signal(Base):
     excerpt = Column(Text, nullable=True)  # Short preview shown in cards
     content = Column(Text, nullable=False)  # Full Markdown / HTML body
     cover_image_url = Column(String(500), nullable=True)
+    # Base64-encoded data URI (e.g. "data:image/png;base64,...") for a
+    # moderator-uploaded cover image, stored directly in Postgres. Optional —
+    # cover_image_url above is kept for backward compatibility / linking an
+    # external image instead. Frontend prefers cover_image_data when present.
+    cover_image_data = Column(Text, nullable=True)
 
     # Taxonomy
     category = Column(String(100), nullable=True, index=True)
@@ -1998,6 +2003,7 @@ class SignalCreate(BaseModel):
     content: str
     excerpt: Optional[str] = None
     cover_image_url: Optional[str] = None
+    cover_image_data: Optional[str] = None
     category: Optional[str] = None
     tags: Optional[List[str]] = None
     status: Optional[str] = "draft"  # "draft" | "published"
@@ -2011,6 +2017,7 @@ class SignalUpdate(BaseModel):
     content: Optional[str] = None
     excerpt: Optional[str] = None
     cover_image_url: Optional[str] = None
+    cover_image_data: Optional[str] = None
     category: Optional[str] = None
     tags: Optional[List[str]] = None
     status: Optional[str] = None
@@ -2037,6 +2044,7 @@ class SignalResponse(BaseModel):
     excerpt: Optional[str]
     content: str
     cover_image_url: Optional[str]
+    cover_image_data: Optional[str] = None
     category: Optional[str]
     tags: Optional[List[str]]
     status: str

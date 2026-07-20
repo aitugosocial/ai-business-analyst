@@ -32,6 +32,7 @@ from api.routes.auth import login, signup, forgot_password
 from api.routes.auth.login import get_current_user
 from api.routes.decision_engine import analyzer as business_analyzer
 from api.routes.support import customer_service, reviews
+from api.routes.signals import signals
 from api.routes.user import stats as user_stats, alerts, insights, referrals, earnings, settings as user_settings, missions as user_missions
 from api.security.firewall import FirewallMiddleware, initialize_default_firewall_rules, firewall_manager
 from api.security.vulnerability_scanner import vulnerability_scanner
@@ -1165,6 +1166,7 @@ app.include_router(security.router, prefix="/api")
 app.include_router(firewall_scanner.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
 app.include_router(permissions.router, prefix="/api")
+app.include_router(signals.router, prefix="/api")
 
 app.include_router(dashboard.router, prefix="/api")
 app.include_router(admin_content.router, prefix="/api")
