@@ -9,6 +9,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import func
 
 from database.pg_connections import get_db
@@ -292,6 +293,24 @@ async def leave_channel(
 
 # ─── Discussions ─────────────────────────────────────────────────────────────
 
+def _summarize_mission_title(text: str, max_chars: int = 80) -> str:
+    """Word-bounded summary of a mission's full task text for the reflection
+    post card's title slot — caps length like the old `[:80]` slice did, but
+    never cuts a word in half."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    words = text.split()
+    out, length = [], 0
+    for w in words:
+        add = len(w) + (1 if out else 0)
+        if length + add > max_chars - 1:  # leave room for the ellipsis
+            break
+        out.append(w)
+        length += add
+    return (' '.join(out) + '…') if out else text[:max_chars - 1] + '…'
+
+
 @router.get("/discussions")
 async def get_discussions(
     channel_id: Optional[int] = Query(None),
@@ -332,6 +351,7 @@ async def get_discussions(
                     .filter(BusinessAnalysis.user_id.in_(opted_in_ids))
                     .all()
                 )
+                any_summaries_changed = False
                 for analysis, author in analyses:
                     up = analysis.user_progress or {}
                     roadmap_comments = up.get('roadmap_comments', {}) if isinstance(up, dict) else {}
@@ -343,6 +363,15 @@ async def get_discussions(
                     mission_titles = {
                         t['frontend_id']: t['text'] for t in _flatten_roadmap_tasks(analysis)
                     }
+                    # Full mission text is often too long for the post card's
+                    # title (wraps/overflows). Word-capped summaries are
+                    # computed once per task and persisted in user_progress so
+                    # they're reused on every later fetch instead of being
+                    # re-summarized on every request.
+                    task_summaries = up.get('roadmap_task_summaries')
+                    if not isinstance(task_summaries, dict):
+                        task_summaries = {}
+                    analysis_summaries_changed = False
                     for task_id, comments in roadmap_comments.items():
                         if not isinstance(comments, list):
                             continue
@@ -352,11 +381,18 @@ async def get_discussions(
                                 continue
                             created_at = comment.get('createdAt')
                             comment_id = comment.get('id', f"rc_{analysis.id}_{task_id}")
-                            mission_title = mission_titles.get(task_id)
+                            mission_title = task_summaries.get(task_id)
+                            if mission_title is None:
+                                full_title = mission_titles.get(task_id)
+                                if full_title:
+                                    mission_title = _summarize_mission_title(full_title)
+                                    task_summaries[task_id] = mission_title
+                                    any_summaries_changed = True
+                                    analysis_summaries_changed = True
                             result.append({
                                 "id": f"rc_{comment_id}",
                                 "type": "reflection",
-                                "title": mission_title[:80] if mission_title else text[:80],
+                                "title": mission_title if mission_title else text[:80],
                                 "content": text,
                                 "excerpt": text[:160],
                                 "tags": [],
@@ -380,6 +416,12 @@ async def get_discussions(
                                 "timeAgo": created_at,
                                 "updated_at": None,
                             })
+                    if analysis_summaries_changed:
+                        up['roadmap_task_summaries'] = task_summaries
+                        analysis.user_progress = up
+                        flag_modified(analysis, 'user_progress')
+                if any_summaries_changed:
+                    db.commit()
         except Exception as reflection_err:
             logger.warning(f"Mission reflections fetch error: {reflection_err}")
 

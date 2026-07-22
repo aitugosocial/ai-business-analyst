@@ -107,13 +107,16 @@ class AgenticAnalyzer:
 
         # AsyncOpenAI uses httpx.AsyncClient — every completion call is native
         # async I/O. Unlimited concurrent callers share the same event loop without
-        # thread pool slots. max_retries=5 means the SDK automatically retries 429
-        # rate-limit responses with exponential backoff so the caller never sees them.
+        # thread pool slots. max_retries automatically retries 429 rate-limit
+        # responses with exponential backoff so the caller never sees them —
+        # kept low (not the default 5) because this pipeline makes ~9-13
+        # sequential calls per analysis; a high retry count on any one of them
+        # multiplies into a very long worst-case wait for the user.
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://api.x.ai/v1",
             timeout=120.0,
-            max_retries=5,
+            max_retries=2,
         )
         logger.info("xAI Grok async client initialized for agentic analysis")
 
@@ -1556,7 +1559,10 @@ OUTPUT FORMAT (JSON only, no markdown):
 
         result = None
         total_tasks = 0
-        max_attempts = 3
+        # 3→2: the real backfill below (using unused action-plan steps, never
+        # invented text) makes a 3rd retry mostly wasted latency for a rare case
+        # that's already handled safely.
+        max_attempts = 2
         for attempt in range(1, max_attempts + 1):
             attempt_prompt = prompt
             if attempt > 1:
