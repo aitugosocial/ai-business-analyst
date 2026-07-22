@@ -9,7 +9,6 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import func
 
 from database.pg_connections import get_db
@@ -365,10 +364,11 @@ async def get_discussions(
                     }
                     # Full mission text is often too long for the post card's
                     # title (wraps/overflows). Word-capped summaries are
-                    # computed once per task and persisted in user_progress so
-                    # they're reused on every later fetch instead of being
-                    # re-summarized on every request.
-                    task_summaries = up.get('roadmap_task_summaries')
+                    # computed once per task and persisted in their own column
+                    # (business_analyses.roadmap_task_summaries) so they're
+                    # reused on every later fetch instead of being
+                    # re-summarized — and re-truncated — on every request.
+                    task_summaries = analysis.roadmap_task_summaries
                     if not isinstance(task_summaries, dict):
                         task_summaries = {}
                     analysis_summaries_changed = False
@@ -417,9 +417,7 @@ async def get_discussions(
                                 "updated_at": None,
                             })
                     if analysis_summaries_changed:
-                        up['roadmap_task_summaries'] = task_summaries
-                        analysis.user_progress = up
-                        flag_modified(analysis, 'user_progress')
+                        analysis.roadmap_task_summaries = task_summaries
                 if any_summaries_changed:
                     db.commit()
         except Exception as reflection_err:
