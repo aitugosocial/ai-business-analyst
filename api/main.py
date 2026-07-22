@@ -688,6 +688,11 @@ def run_heavy_schema_migrations():
                 logger.warning(f"Failed to add recommended_tool_stacks: {e}")
 
             try:
+                db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS roadmap_task_summaries JSON"))
+            except Exception as e:
+                logger.warning(f"Failed to add roadmap_task_summaries: {e}")
+
+            try:
                 db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS recommendation_mode VARCHAR"))
                 db.execute(text("ALTER TABLE business_analyses ADD COLUMN IF NOT EXISTS single_tool_recommendation JSON"))
             except Exception as e:
