@@ -437,6 +437,7 @@ class NotificationType(enum.Enum):
     PAYOUT_COMPLETED = "payout_completed"
     SYSTEM_ALERT = "system_alert"
     LOGIN_STREAK_REWARD = "login_streak_reward"
+    MISSION_OVERDUE = "mission_overdue"
 
 class UserNotification(Base):
     """

@@ -22,6 +22,7 @@ from database.pg_models import (
     UserNotification,
 )
 from api.routes.auth.login import get_current_user
+from api.routes.user.missions import _flatten_roadmap_tasks
 from api.cache import get_cached, set_cached, delete_cached
 
 logger = logging.getLogger(__name__)
@@ -336,6 +337,12 @@ async def get_discussions(
                     roadmap_comments = up.get('roadmap_comments', {}) if isinstance(up, dict) else {}
                     if not isinstance(roadmap_comments, dict):
                         continue
+                    # Map each task's frontend_id → its mission text, so the
+                    # reflection post title is the mission it was submitted
+                    # under, not the reflection body itself.
+                    mission_titles = {
+                        t['frontend_id']: t['text'] for t in _flatten_roadmap_tasks(analysis)
+                    }
                     for task_id, comments in roadmap_comments.items():
                         if not isinstance(comments, list):
                             continue
@@ -345,10 +352,11 @@ async def get_discussions(
                                 continue
                             created_at = comment.get('createdAt')
                             comment_id = comment.get('id', f"rc_{analysis.id}_{task_id}")
+                            mission_title = mission_titles.get(task_id)
                             result.append({
                                 "id": f"rc_{comment_id}",
                                 "type": "reflection",
-                                "title": text[:80],
+                                "title": mission_title[:80] if mission_title else text[:80],
                                 "content": text,
                                 "excerpt": text[:160],
                                 "tags": [],
