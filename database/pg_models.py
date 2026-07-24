@@ -1658,12 +1658,15 @@ class CommunityDiscussion(Base):
     reply_count = Column(Integer, default=0)
     view_count = Column(Integer, default=0)
     chops_gifted = Column(Integer, default=0)
+    spice_count = Column(Integer, default=0)
+    quoted_discussion_id = Column(Integer, ForeignKey("community_discussions.id", ondelete="SET NULL"), nullable=True)
     is_pinned = Column(Boolean, default=False)
-    post_type = Column(String(50), default="discussion")  # discussion | reflection
+    post_type = Column(String(50), default="discussion")  # discussion | reflection | spiced
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     channel = relationship("CommunityChannel", back_populates="discussions")
     user = relationship("User")
+    quoted_discussion = relationship("CommunityDiscussion", remote_side="[CommunityDiscussion.id]", foreign_keys=[quoted_discussion_id])
     replies = relationship("DiscussionReply", back_populates="discussion", cascade="all, delete-orphan")
     likes = relationship("DiscussionLike", back_populates="discussion", cascade="all, delete-orphan")
 
