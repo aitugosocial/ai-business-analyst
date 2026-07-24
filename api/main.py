@@ -117,8 +117,8 @@ _origins_base = [
     "http://localhost:5173",
     "http://localhost:8080",
     # Production frontend domains — always allowed regardless of ALLOWED_ORIGINS env var
-    "https://lavooai.com",
-    "https://www.lavooai.com",
+    "https://lavoo.io",
+    "https://www.lavoo.io",
     "https://control.lavooai.com/",
 ]
 # Allow additional origins from environment (comma-separated list)
