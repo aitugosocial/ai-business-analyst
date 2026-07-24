@@ -206,6 +206,7 @@ class BusinessAnalysis(Base):
     total_phases = Column(Integer, nullable=True)  # Number of delivery phases
     estimated_days = Column(Integer, nullable=True)  # Total days for execution
     execution_roadmap = Column(JSON, nullable=True)  # [{phase, days, title, tasks}]
+    roadmap_task_summaries = Column(JSON, nullable=True)  # {task_frontend_id: word-capped summary} — reflection post titles, computed once and cached here
     exclusions_note = Column(Text, nullable=True)  # What was excluded and why
     motivational_quote = Column(Text, nullable=True)  # LLM-generated quote
 
@@ -437,6 +438,7 @@ class NotificationType(enum.Enum):
     PAYOUT_COMPLETED = "payout_completed"
     SYSTEM_ALERT = "system_alert"
     LOGIN_STREAK_REWARD = "login_streak_reward"
+    MISSION_OVERDUE = "mission_overdue"
 
 class UserNotification(Base):
     """

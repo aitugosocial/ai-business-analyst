@@ -3,8 +3,9 @@
 Cron runner — entry point for the Railway cron service container.
 
 Schedule:
-  insights   — every 4 hours
-  cleanup    — once per day (every 24 hours)
+  insights          — every 4 hours
+  cleanup           — once per day (every 24 hours)
+  overdue missions  — every 2 hours
 """
 
 import asyncio
@@ -31,6 +32,7 @@ logger = logging.getLogger("cron_runner")
 INSIGHTS_INTERVAL_SECONDS    = 4 * 60 * 60   # 4 hours
 CLEANUP_INTERVAL_SECONDS     = 24 * 60 * 60  # 24 hours
 SUBSCRIPTION_INTERVAL_SECONDS = 12 * 60 * 60  # 12 hours
+OVERDUE_MISSIONS_INTERVAL_SECONDS = 2 * 60 * 60  # 2 hours
 
 # cron_insights.py lives in cron/, not scripts/
 CRON_DIR = Path(__file__).parent
@@ -97,12 +99,23 @@ async def run_subscription_expiry_loop():
         await asyncio.sleep(SUBSCRIPTION_INTERVAL_SECONDS)
 
 
+async def run_overdue_missions_loop():
+    while True:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, _run_script, "cron_overdue_missions.py")
+        except Exception as exc:
+            logger.error(f"Overdue missions job error: {exc}", exc_info=True)
+        logger.info(f"Next overdue missions run in {OVERDUE_MISSIONS_INTERVAL_SECONDS // 3600}h")
+        await asyncio.sleep(OVERDUE_MISSIONS_INTERVAL_SECONDS)
+
+
 async def main():
     logger.info("=" * 60)
     logger.info(f"Lavoo Cron Runner starting — {datetime.now().isoformat()}")
     logger.info(f"  Insights            : every {INSIGHTS_INTERVAL_SECONDS // 3600}h")
     logger.info(f"  Cleanup             : every {CLEANUP_INTERVAL_SECONDS // 3600}h")
     logger.info(f"  Subscription Expiry : every {SUBSCRIPTION_INTERVAL_SECONDS // 3600}h")
+    logger.info(f"  Overdue Missions    : every {OVERDUE_MISSIONS_INTERVAL_SECONDS // 3600}h")
     logger.info("=" * 60)
 
     logger.info("Running initial pass of all jobs...")
@@ -110,12 +123,14 @@ async def main():
     await asyncio.get_event_loop().run_in_executor(None, _run_script, "cron_cleanup.py")
     expiry_script = CRON_DIR / "subscriptions" / "subscription_expiry.py"
     await asyncio.get_event_loop().run_in_executor(None, _run_script_at, expiry_script)
+    await asyncio.get_event_loop().run_in_executor(None, _run_script, "cron_overdue_missions.py")
     logger.info("Initial pass complete. Entering scheduled loop.")
 
     await asyncio.gather(
         run_insights_loop(),
         run_cleanup_loop(),
         run_subscription_expiry_loop(),
+        run_overdue_missions_loop(),
     )
 
 

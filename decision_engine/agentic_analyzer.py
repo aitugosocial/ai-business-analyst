@@ -107,13 +107,16 @@ class AgenticAnalyzer:
 
         # AsyncOpenAI uses httpx.AsyncClient — every completion call is native
         # async I/O. Unlimited concurrent callers share the same event loop without
-        # thread pool slots. max_retries=5 means the SDK automatically retries 429
-        # rate-limit responses with exponential backoff so the caller never sees them.
+        # thread pool slots. max_retries automatically retries 429 rate-limit
+        # responses with exponential backoff so the caller never sees them —
+        # kept low (not the default 5) because this pipeline makes ~9-13
+        # sequential calls per analysis; a high retry count on any one of them
+        # multiplies into a very long worst-case wait for the user.
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://api.x.ai/v1",
             timeout=120.0,
-            max_retries=5,
+            max_retries=2,
         )
         logger.info("xAI Grok async client initialized for agentic analysis")
 
@@ -737,18 +740,27 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         # plan_idx → tool names explicitly named inside what_to_do step text
         plan_step_cited: dict[int, list[str]] = {}
 
-        for plan_idx in needy_indices:
+        # Per-plan search + citation-extraction are independent of each other —
+        # run them concurrently instead of one plan at a time, so the N
+        # sequential LLM round-trips collapse into one overlapped wait.
+        async def _gather_plan_data(plan_idx: int):
             plan = action_plans[plan_idx]
             what_to_do_list = plan.get("what_to_do", []) if isinstance(plan.get("what_to_do"), list) else []
             steps_text = " ".join(what_to_do_list)
             action_description = f"{plan['title']}: {steps_text}"
-
-            # Semantic DB search
-            candidates = await self._search_ai_tools(
-                user_query=user_query,
-                action_description=action_description,
-                top_k=12,
+            candidates, cited = await asyncio.gather(
+                self._search_ai_tools(
+                    user_query=user_query,
+                    action_description=action_description,
+                    top_k=12,
+                ),
+                self._extract_mentioned_tools(what_to_do_list),
             )
+            return plan_idx, candidates, cited
+
+        plan_results = await asyncio.gather(*(_gather_plan_data(idx) for idx in needy_indices))
+
+        for plan_idx, candidates, cited in plan_results:
             names_for_plan: list[str] = []
             for t in candidates:
                 name = t["tool_name"]
@@ -756,9 +768,6 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
                     all_tools[name] = t
                 names_for_plan.append(name)
             plan_candidate_names[plan_idx] = names_for_plan
-
-            # Extract tool names explicitly cited in the step text
-            cited = await self._extract_mentioned_tools(what_to_do_list)
             plan_step_cited[plan_idx] = cited
 
             # Inject cited tools not found by semantic search as stubs so the
@@ -1550,7 +1559,10 @@ OUTPUT FORMAT (JSON only, no markdown):
 
         result = None
         total_tasks = 0
-        max_attempts = 3
+        # 3→2: the real backfill below (using unused action-plan steps, never
+        # invented text) makes a 3rd retry mostly wasted latency for a rare case
+        # that's already handled safely.
+        max_attempts = 2
         for attempt in range(1, max_attempts + 1):
             attempt_prompt = prompt
             if attempt > 1:
