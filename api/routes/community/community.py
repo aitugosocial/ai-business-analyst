@@ -576,6 +576,23 @@ async def like_discussion(
     db.add(DiscussionLike(user_id=current_user.id, discussion_id=discussion_id))
     d.like_count = (d.like_count or 0) + 1
     db.commit()
+
+    # Notify post owner (skip when liking own post)
+    try:
+        if d.user_id and d.user_id != current_user.id:
+            notif = UserNotification(
+                user_id=d.user_id,
+                type="community_cooked",
+                title=f"{current_user.name or 'Someone'} cooked your post",
+                message=f"{current_user.name or 'Someone'} liked your post '{d.title[:60]}'",
+                link=f"/dashboard/community/post/{discussion_id}",
+                is_read=False,
+            )
+            db.add(notif)
+            db.commit()
+    except Exception as notif_err:
+        logger.warning(f"Cooked notification creation failed: {notif_err}")
+
     return {"success": True, "liked": True, "like_count": d.like_count}
 
 
@@ -603,6 +620,22 @@ async def gift_chops_to_discussion(
 
     d.chops_gifted = (d.chops_gifted or 0) + body.amount
     db.commit()
+
+    # Notify post owner (skip when gifting self)
+    try:
+        if d.user_id and d.user_id != current_user.id:
+            notif = UserNotification(
+                user_id=d.user_id,
+                type="community_chops",
+                title=f"{current_user.name or 'Someone'} gifted you {body.amount} Chops!",
+                message=f"You received {body.amount} Chops for your post '{d.title[:60]}'",
+                link=f"/dashboard/community/post/{discussion_id}",
+                is_read=False,
+            )
+            db.add(notif)
+            db.commit()
+    except Exception as notif_err:
+        logger.warning(f"Gift chops notification creation failed: {notif_err}")
 
     return {"success": True, "chops_gifted": d.chops_gifted, "remaining_chops": current_user.total_chops}
 
@@ -777,6 +810,23 @@ async def gift_chops_to_reply(
     if author:
         author.total_chops = (author.total_chops or 0) + body.amount
     db.commit()
+
+    # Notify reply owner (skip when gifting self)
+    try:
+        if reply.user_id and reply.user_id != current_user.id:
+            notif = UserNotification(
+                user_id=reply.user_id,
+                type="community_chops",
+                title=f"{current_user.name or 'Someone'} gifted you {body.amount} Chops!",
+                message=f"You received {body.amount} Chops for your reply",
+                link=f"/dashboard/community/post/{discussion_id}",
+                is_read=False,
+            )
+            db.add(notif)
+            db.commit()
+    except Exception as notif_err:
+        logger.warning(f"Reply gift chops notification creation failed: {notif_err}")
+
     return {"success": True, "remaining_chops": current_user.total_chops}
 
 
