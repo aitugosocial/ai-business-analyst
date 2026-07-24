@@ -71,7 +71,7 @@ _TOPIC_SLUGS = {
 }
 
 
-def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None) -> dict:
+def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, include_quoted: bool = True) -> dict:
     has_liked = d.id in liked_ids if liked_ids is not None else False
     post_type_val = getattr(d, 'post_type', None) or 'discussion'
 
@@ -96,6 +96,15 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None) ->
             "total_chops": d.user.total_chops or 0,
         }
 
+    quoted_dict = None
+    if include_quoted and getattr(d, 'quoted_discussion', None) is not None:
+        try:
+            quoted_dict = _discussion_dict(d.quoted_discussion, liked_ids=liked_ids, include_quoted=False)
+        except Exception:
+            quoted_dict = None
+
+    spice_cnt = getattr(d, 'spice_count', 0) or 0
+
     return {
         "id": d.id, "channel_id": d.channel_id, "title": d.title, "content": d.content,
         "tags": d.tags or [], "like_count": d.like_count, "reply_count": d.reply_count,
@@ -104,6 +113,9 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None) ->
         "hot": d.like_count >= 10,
         "view_count": d.view_count, "has_liked": has_liked, "liked_by_user": has_liked,
         "chops_gifted": d.chops_gifted or 0,
+        "spice_count": spice_cnt, "spiced": spice_cnt, "spices": spice_cnt,
+        "quoted_discussion_id": getattr(d, 'quoted_discussion_id', None),
+        "quoted_discussion": quoted_dict,
         "type": post_type_val,
         "author": author_obj,
         "channel": channel_display,
@@ -157,7 +169,11 @@ class CreateDiscussionRequest(BaseModel):
     content: str
     channel_id: int
     tags: Optional[List[str]] = None
-    type: Optional[str] = "discussion"  # "discussion" | "reflection"
+    type: Optional[str] = "discussion"  # "discussion" | "reflection" | "spiced"
+
+
+class SpiceDiscussionRequest(BaseModel):
+    content: str
 
 
 class CreateReplyRequest(BaseModel):
@@ -541,6 +557,75 @@ async def gift_chops_to_discussion(
     db.commit()
 
     return {"success": True, "chops_gifted": d.chops_gifted, "remaining_chops": current_user.total_chops}
+
+
+@router.post("/discussions/{discussion_id}/spice")
+async def spice_discussion(
+    discussion_id: int,
+    body: SpiceDiscussionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+
+    content_text = (body.content or "").strip()
+    if not content_text:
+        raise HTTPException(status_code=400, detail="Spice insight content cannot be empty")
+
+    if _contains_derogatory_content(content_text):
+        raise HTTPException(
+            status_code=422,
+            detail="Your spice contains language that isn't allowed in the Lavoo Build Room. Please review your content and try again."
+        )
+
+    # Increment spice count on original discussion
+    d.spice_count = (d.spice_count or 0) + 1
+
+    # Create new discussion referencing original post as a quoted post
+    spiced_post = CommunityDiscussion(
+        channel_id=d.channel_id,
+        user_id=current_user.id,
+        title=f"Spiced: {d.title[:80]}",
+        content=content_text,
+        tags=d.tags or [],
+        post_type="spiced",
+        quoted_discussion_id=d.id,
+    )
+    db.add(spiced_post)
+
+    # Award user chops for spicing / contributing insight
+    current_user.total_chops = (current_user.total_chops or 0) + 10
+    db.commit()
+    db.refresh(spiced_post)
+
+    # Notify original post owner (unless spicing own post)
+    try:
+        if d.user_id and d.user_id != current_user.id:
+            notif = UserNotification(
+                user_id=d.user_id,
+                type="community_spice",
+                title=f"{current_user.name or 'Someone'} spiced your post",
+                message=content_text[:120],
+                link=f"/dashboard/community/post/{d.id}",
+                is_read=False,
+            )
+            db.add(notif)
+            db.commit()
+    except Exception as notif_err:
+        logger.warning(f"Spice notification creation failed: {notif_err}")
+
+    _log_activity(db, current_user.id, "spiced", d.id, "discussion", d.title)
+    await delete_cached(f"community:discussions:user:{current_user.id}:ch:{d.channel_id}:lim:20:off:0")
+    await delete_cached(f"community:discussions:user:{current_user.id}:ch:None:lim:20:off:0")
+
+    liked = {spiced_post.id} if db.query(DiscussionLike).filter_by(user_id=current_user.id, discussion_id=spiced_post.id).first() else set()
+    return {
+        "success": True,
+        "data": _discussion_dict(spiced_post, liked),
+        "original_spice_count": d.spice_count,
+    }
 
 
 @router.post("/discussions/{discussion_id}/replies")

@@ -1020,6 +1020,8 @@ def run_heavy_schema_migrations():
             "CREATE INDEX IF NOT EXISTS idx_cs_user_id ON commission_summaries(user_id)",
             "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS chops_gifted INTEGER DEFAULT 0",
             "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS post_type VARCHAR(50) DEFAULT 'discussion'",
+            "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS spice_count INTEGER DEFAULT 0",
+            "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS quoted_discussion_id INTEGER REFERENCES community_discussions(id) ON DELETE SET NULL",
             "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS show_mission_comments_in_community BOOLEAN DEFAULT FALSE",
         ]
         for stmt in index_statements:
