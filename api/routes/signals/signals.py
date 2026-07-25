@@ -34,7 +34,7 @@ from database.pg_models import (
     SignalCommentUpdate,
     UserRole,
 )
-from api.routes.dependencies import get_current_user, get_current_user_optional, admin_required
+from api.routes.dependencies import get_current_user, get_current_user_optional
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +49,16 @@ COMMENT_CHOPS = 5
 
 VALID_STATUSES = {"draft", "published", "archived"}
 
-# The featured section on the /blog homepage shows exactly this many posts
-# (1 hero + 3 grid cards). Enforced everywhere is_featured can be set, not
-# just the dedicated toggle endpoint below, so the invariant can't be
-# bypassed via a direct call to update_signal().
-MAX_FEATURED = 4
+# The featured grid on the /blog homepage (the big card + 2 mini cards)
+# shows exactly this many posts. Enforced everywhere is_featured can be
+# set, not just the dedicated toggle endpoint below, so the invariant
+# can't be bypassed via a direct call to update_signal().
+MAX_FEATURED = 3
+
+# The hero slot at the top of /blog shows whichever single post is
+# pinned — at most one, ever. Same enforcement approach as MAX_FEATURED
+# above, sharing the same underlying helper (_apply_capped_flag_change).
+MAX_PINNED = 1
 
 # Server-side backstop for cover_image_data. The frontend auto-compresses
 # uploads to ~150KB raw before base64-encoding (see
@@ -139,64 +144,92 @@ def _require_moderator(current_user: User) -> User:
     return current_user
 
 
-def _apply_featured_change(
+def _apply_capped_flag_change(
     signal: Signal,
-    want_featured: bool,
+    field: str,  # "is_featured" or "is_pinned" — validated against this exact set below
+    want_value: bool,
     db: Session,
+    max_count: int,
+    noun: str,  # participle form for messages, e.g. "featured" / "pinned"
+    verb: str,  # base verb form for messages, e.g. "feature" / "pin"
     replace_id: Optional[int] = None,
 ) -> None:
     """
-    Apply a change to signal.is_featured, enforcing the site-wide cap of
-    MAX_FEATURED simultaneously-featured posts. Mutates `signal` (and
-    possibly the replaced signal) in place; caller is responsible for
-    db.commit(). Does not commit or query for the acting user's permissions —
-    callers must already have authorized the request.
+    Shared cap-enforcement for both is_featured (max MAX_FEATURED) and
+    is_pinned (max MAX_PINNED — effectively a single "hero slot"). Mutates
+    `signal` (and possibly a replaced signal) in place; caller is
+    responsible for db.commit(). Does not check the acting user's
+    permissions — callers must already have authorized the request.
 
-    - Unfeaturing (want_featured=False) is always allowed.
-    - Featuring succeeds immediately if fewer than MAX_FEATURED posts are
-      currently featured.
-    - Featuring while already at the cap raises HTTP 409 with the list of
-      currently-featured posts (id/title/slug), UNLESS `replace_id` names
-      one of them — in which case that post is unfeatured and this one is
-      featured, atomically, in the same transaction.
+    - Turning the flag off is always allowed.
+    - Turning it on succeeds immediately if fewer than `max_count` other
+      posts currently have it set.
+    - Turning it on while already at the cap raises HTTP 409 with the list
+      of posts currently holding the flag (id/title/slug), UNLESS
+      `replace_id` names one of them — in which case that post has the
+      flag cleared and this one gets it, atomically, in the same
+      transaction.
+
+    `field` is restricted to a known-safe set rather than accepting any
+    string, so a typo here fails loudly at call time instead of silently
+    no-op'ing via getattr on a nonexistent attribute. `noun`/`verb` are
+    passed separately rather than derived from one another (e.g. stripping
+    "featured" down to "feature") because that kind of string surgery is
+    exactly the sort of thing that quietly produces bad grammar in one of
+    the two branches below.
     """
-    if signal.is_featured == want_featured:
+    if field not in ("is_featured", "is_pinned"):
+        raise ValueError(f"_apply_capped_flag_change: unsupported field {field!r}")
+
+    current_value = signal.is_featured if field == "is_featured" else signal.is_pinned
+    if current_value == want_value:
         return  # already in the desired state — nothing to do
 
-    if not want_featured:
-        signal.is_featured = False
+    if not want_value:
+        if field == "is_featured":
+            signal.is_featured = False
+        else:
+            signal.is_pinned = False
         return
 
-    featured_posts = (
-        db.query(Signal)
-        .filter(Signal.is_featured == True, Signal.id != signal.id)  # noqa: E712
-        .order_by(desc(Signal.published_at))
-        .all()
-    )
+    query = db.query(Signal).filter(Signal.id != signal.id)
+    query = query.filter(Signal.is_featured == True) if field == "is_featured" else query.filter(Signal.is_pinned == True)  # noqa: E712
+    holders = query.order_by(desc(Signal.published_at)).all()
 
-    if len(featured_posts) < MAX_FEATURED:
-        signal.is_featured = True
+    if len(holders) < max_count:
+        if field == "is_featured":
+            signal.is_featured = True
+        else:
+            signal.is_pinned = True
         return
 
     if replace_id is not None:
-        target = next((s for s in featured_posts if s.id == replace_id), None)
+        target = next((s for s in holders if s.id == replace_id), None)
         if not target:
             raise HTTPException(
                 status_code=400,
-                detail="The post you selected to replace is not currently featured.",
+                detail=f"The post you selected to replace is not currently {noun}.",
             )
-        target.is_featured = False
-        signal.is_featured = True
+        if field == "is_featured":
+            target.is_featured = False
+            signal.is_featured = True
+        else:
+            target.is_pinned = False
+            signal.is_pinned = True
         return
 
+    cap_phrase = (
+        f"Only {max_count} post can be {noun} at once."
+        if max_count == 1
+        else f"You can {verb} at most {max_count} posts at once."
+    )
     raise HTTPException(
         status_code=409,
         detail={
             "status":  "limit_reached",
-            "message": f"You can feature at most {MAX_FEATURED} posts at once. "
-                       f"Choose one to replace, or unfeature a post first.",
-            "featured_posts": [
-                {"id": s.id, "title": s.title, "slug": s.slug} for s in featured_posts
+            "message": f"{cap_phrase} Choose one below to replace, or remove the {noun} status from a post first.",
+            "conflicting_posts": [
+                {"id": s.id, "title": s.title, "slug": s.slug} for s in holders
             ],
         },
     )
@@ -290,6 +323,7 @@ async def list_signals(
     category: Optional[str] = Query(default=None),
     tag:      Optional[str] = Query(default=None),
     featured: Optional[bool]= Query(default=None),
+    pinned:   Optional[bool]= Query(default=None),
     search:   Optional[str] = Query(default=None),
     db:       Session       = Depends(get_db),
 ):
@@ -321,6 +355,9 @@ async def list_signals(
 
     if featured is not None:
         query = query.filter(Signal.is_featured == featured)
+
+    if pinned is not None:
+        query = query.filter(Signal.is_pinned == pinned)
 
     if search:
         term = f"%{search}%"
@@ -504,8 +541,13 @@ async def update_signal(
         # save. No replace_id support on this path by design — conflicts
         # are resolved through the dedicated toggle endpoint's UI, which
         # can show the moderator which posts are currently featured.
-        _apply_featured_change(signal, payload.is_featured, db, replace_id=None)
-    if payload.is_pinned       is not None: signal.is_pinned       = payload.is_pinned
+        _apply_capped_flag_change(signal, "is_featured", payload.is_featured, db, MAX_FEATURED, noun="featured", verb="feature", replace_id=None)
+    if payload.is_pinned is not None:
+        # Same reasoning as is_featured above — the hero slot is a
+        # single-post cap now, not a free toggle, so this has to go
+        # through the same enforcement rather than setting the column
+        # directly.
+        _apply_capped_flag_change(signal, "is_pinned", payload.is_pinned, db, MAX_PINNED, noun="pinned", verb="pin", replace_id=None)
 
     if payload.status is not None:
         # Set published_at the first time a post goes live
@@ -990,7 +1032,10 @@ async def toggle_featured(
         )
 
     want_featured = not signal.is_featured
-    _apply_featured_change(signal, want_featured, db, replace_id=replace_id)
+    _apply_capped_flag_change(
+        signal, "is_featured", want_featured, db,
+        max_count=MAX_FEATURED, noun="featured", verb="feature", replace_id=replace_id,
+    )
     db.commit()
     db.refresh(signal)
 
@@ -1006,21 +1051,48 @@ async def toggle_featured(
 @router.patch("/manage/{signal_id}/pin")
 async def toggle_pinned(
     signal_id:    int,
-    current_user: User    = Depends(admin_required),
+    replace_id:   Optional[int] = Query(
+        default=None,
+        description="If a post is already pinned, its id — to unpin it in "
+                    "the same request as this one is pinned.",
+    ),
+    current_user: User    = Depends(get_current_user),
     db:           Session = Depends(get_db),
 ):
     """
-    Toggle the is_pinned flag on any Signal.
-    Admin only — pinned posts appear above the feed regardless of date.
+    Toggle the is_pinned flag on a Signal — the single "hero slot" shown
+    at the top of the /blog homepage.
+
+    - Moderators may pin/unpin their own posts; admins may do so for any
+      post — matching the ownership rule on update/delete. (Previously
+      admin-only; opened up to moderators as part of this feature.)
+    - Unpinning always succeeds.
+    - Pinning while a post is already pinned (MAX_PINNED = 1, so this is
+      effectively "any time another post holds the slot") returns HTTP 409
+      with that post's info, unless `replace_id` confirms swapping it out.
     """
+    _require_moderator(current_user)
+
     signal = db.query(Signal).filter(Signal.id == signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found.")
 
-    signal.is_pinned = not signal.is_pinned
+    if signal.author_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only pin your own Signal posts.",
+        )
+
+    want_pinned = not signal.is_pinned
+    _apply_capped_flag_change(
+        signal, "is_pinned", want_pinned, db,
+        max_count=MAX_PINNED, noun="pinned", verb="pin", replace_id=replace_id,
+    )
     db.commit()
+    db.refresh(signal)
 
     state = "pinned" if signal.is_pinned else "unpinned"
+    logger.info(f"Signal {state}: id={signal.id} by user={current_user.email}")
     return {
         "status":    "success",
         "is_pinned": signal.is_pinned,
