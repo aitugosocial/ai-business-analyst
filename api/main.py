@@ -1027,6 +1027,7 @@ def run_heavy_schema_migrations():
             "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS post_type VARCHAR(50) DEFAULT 'discussion'",
             "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS spice_count INTEGER DEFAULT 0",
             "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS quoted_discussion_id INTEGER REFERENCES community_discussions(id) ON DELETE SET NULL",
+            "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS ai_takeaways JSON",
             "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS show_mission_comments_in_community BOOLEAN DEFAULT FALSE",
         ]
         for stmt in index_statements:
