@@ -1733,6 +1733,18 @@ class EventRegistration(Base):
     user = relationship("User")
 
 
+class FounderInsightCard(Base):
+    __tablename__ = "founder_insight_cards"
+    id = Column(Integer, primary_key=True, index=True)
+    highlight_stat = Column(String(50), nullable=True)
+    insight_text = Column(Text, nullable=False)
+    source = Column(String(255), nullable=False)
+    category = Column(String(50), default="african_tech")
+    accent_color = Column(String(20), default="#e87a02")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class CommunityActivity(Base):
     __tablename__ = "community_activities"
     id = Column(Integer, primary_key=True, index=True)
