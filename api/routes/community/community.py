@@ -554,6 +554,7 @@ async def get_discussions(
 @router.get("/discussions/{discussion_id}")
 async def get_discussion(
     discussion_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -563,10 +564,9 @@ async def get_discussion(
     d.view_count = (d.view_count or 0) + 1
     db.commit()
 
-    # Strategy 2: On-Demand "Lazy" Generation for previous posts where ai_takeaways is NULL
+    # Strategy 2: On-Demand "Lazy" Generation in background if ai_takeaways is NULL
     if d.ai_takeaways is None:
-        generate_ai_takeaways_for_discussion(d.id, db)
-        db.refresh(d)
+        background_tasks.add_task(_async_generate_takeaways_worker, d.id)
 
     def _serialise_reply(r) -> dict:
         return {
@@ -591,6 +591,29 @@ async def get_discussion(
     data = _discussion_dict(d, liked, current_user=current_user)
     data["replies"] = replies
     return {"success": True, "data": data}
+
+
+@router.get("/discussions/{discussion_id}/takeaways")
+async def get_discussion_takeaways(
+    discussion_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+
+    is_subscribed = getattr(current_user, 'subscription_status', None) in ("active", "trialing")
+    if not is_subscribed:
+        return {"status": "locked", "has_takeaways": True, "takeaways": None}
+
+    if d.ai_takeaways and isinstance(d.ai_takeaways, list) and len(d.ai_takeaways) > 0:
+        return {"status": "ready", "takeaways": d.ai_takeaways}
+
+    # Strategy 2: On-Demand Lazy Generation (schedule in background and return status)
+    background_tasks.add_task(_async_generate_takeaways_worker, d.id)
+    return {"status": "generating", "takeaways": None}
 
 
 @router.post("/discussions")
