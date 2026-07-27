@@ -21,7 +21,7 @@ from database.pg_models import (
     CommunityEvent, EventRegistration,
     CommunityActivity, SavedItem,
     UserSettings, BusinessAnalysis,
-    UserNotification,
+    UserNotification, FounderInsightCard,
 )
 from api.routes.auth.login import get_current_user
 from api.routes.user.missions import _flatten_roadmap_tasks
@@ -542,6 +542,34 @@ async def get_discussions(
                     db.commit()
         except Exception as reflection_err:
             logger.warning(f"Mission reflections fetch error: {reflection_err}")
+
+        # Interleave Founder Insights into the discussion stream (1 insight every 4 posts)
+        try:
+            insights = db.query(FounderInsightCard).filter(FounderInsightCard.is_active == True).order_by(FounderInsightCard.created_at.desc()).all()
+            if insights and result:
+                interleaved = []
+                insight_idx = 0
+                for i, post_item in enumerate(result):
+                    interleaved.append(post_item)
+                    if (i + 1) % 4 == 0 and insight_idx < len(insights):
+                        card = insights[insight_idx % len(insights)]
+                        interleaved.append({
+                            "id": f"insight_{card.id}",
+                            "type": "founder_insight",
+                            "isStat": True,
+                            "big": card.highlight_stat or "",
+                            "highlight_stat": card.highlight_stat or "",
+                            "headline": card.insight_text,
+                            "insight_text": card.insight_text,
+                            "source": card.source,
+                            "accent": card.accent_color or "#e87a02",
+                            "accent_color": card.accent_color or "#e87a02",
+                            "created_at": card.created_at.isoformat() if card.created_at else None
+                        })
+                        insight_idx += 1
+                result = interleaved
+        except Exception as insight_err:
+            logger.warning(f"Founder insight interleaving error: {insight_err}")
 
         response = {"success": True, "data": result}
         await set_cached(cache_key, response, ttl_seconds=15)
