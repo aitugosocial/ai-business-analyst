@@ -1660,6 +1660,7 @@ class CommunityDiscussion(Base):
     chops_gifted = Column(Integer, default=0)
     spice_count = Column(Integer, default=0)
     quoted_discussion_id = Column(Integer, ForeignKey("community_discussions.id", ondelete="SET NULL"), nullable=True)
+    ai_takeaways = Column(JSON, nullable=True)
     is_pinned = Column(Boolean, default=False)
     post_type = Column(String(50), default="discussion")  # discussion | reflection | spiced
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -1730,6 +1731,18 @@ class EventRegistration(Base):
     registered_at = Column(DateTime(timezone=True), server_default=func.now())
     event = relationship("CommunityEvent", back_populates="registrations")
     user = relationship("User")
+
+
+class FounderInsightCard(Base):
+    __tablename__ = "founder_insight_cards"
+    id = Column(Integer, primary_key=True, index=True)
+    highlight_stat = Column(String(50), nullable=True)
+    insight_text = Column(Text, nullable=False)
+    source = Column(String(255), nullable=False)
+    category = Column(String(50), default="african_tech")
+    accent_color = Column(String(20), default="#e87a02")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class CommunityActivity(Base):

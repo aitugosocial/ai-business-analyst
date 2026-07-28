@@ -1027,7 +1027,9 @@ def run_heavy_schema_migrations():
             "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS post_type VARCHAR(50) DEFAULT 'discussion'",
             "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS spice_count INTEGER DEFAULT 0",
             "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS quoted_discussion_id INTEGER REFERENCES community_discussions(id) ON DELETE SET NULL",
+            "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS ai_takeaways JSON",
             "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS show_mission_comments_in_community BOOLEAN DEFAULT FALSE",
+            "CREATE TABLE IF NOT EXISTS founder_insight_cards (id SERIAL PRIMARY KEY, highlight_stat VARCHAR(50), insight_text TEXT NOT NULL, source VARCHAR(255) NOT NULL, category VARCHAR(50) DEFAULT 'african_tech', accent_color VARCHAR(20) DEFAULT '#e87a02', is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)"
         ]
         for stmt in index_statements:
             try:
@@ -1035,6 +1037,21 @@ def run_heavy_schema_migrations():
             except Exception:
                 pass
         db2.commit()
+
+        # Seed default curated founder insights if table is empty
+        try:
+            count = db2.execute(text("SELECT COUNT(*) FROM founder_insight_cards")).scalar()
+            if count == 0:
+                db2.execute(text("""
+                    INSERT INTO founder_insight_cards (highlight_stat, insight_text, source, category, accent_color) VALUES
+                    ('42%', 'of solo founders who review decisions weekly ship faster than funded teams', 'Based on Build Room founder activity', 'build_room', '#e87a02'),
+                    ('3.5x', 'faster user acquisition is achieved by African B2B startups prioritizing WhatsApp integration over custom portals.', 'Based on TechCabal African Tech Report', 'african_tech', '#2f7de1'),
+                    ('9 in 10', 'startups fail from lack of demand, not lack of effort. Validate the decision before you build it.', 'CB Insights, startup post-mortems', 'global', '#1f9d6b'),
+                    ('78%', 'of successful solo builders in West Africa pre-sell their service before writing their first line of backend code.', 'Based on Disrupt Africa Founder Survey', 'african_tech', '#7c6cf0')
+                """))
+                db2.commit()
+        except Exception as seed_err:
+            logger.warning(f"Seeding founder insights failed: {seed_err}")
         logger.info(f"✓ Performance indexes verified ({len(index_statements)} statements) (background)")
     except Exception as idx_err:
         logger.warning(f"Index creation batch failed: {idx_err}")

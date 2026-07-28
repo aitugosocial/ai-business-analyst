@@ -5,13 +5,15 @@ import logging
 import re
 from typing import Optional, List
 from datetime import datetime
+import json
+import os
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from database.pg_connections import get_db
+from database.pg_connections import get_db, SessionLocal
 from database.pg_models import (
     User,
     CommunityChannel, ChannelMember,
@@ -19,7 +21,7 @@ from database.pg_models import (
     CommunityEvent, EventRegistration,
     CommunityActivity, SavedItem,
     UserSettings, BusinessAnalysis,
-    UserNotification,
+    UserNotification, FounderInsightCard,
 )
 from api.routes.auth.login import get_current_user
 from api.routes.user.missions import _flatten_roadmap_tasks
@@ -30,12 +32,111 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/community", tags=["community"])
 
 
+def _generate_grok_takeaways(title: str, content: str) -> Optional[List[str]]:
+    """
+    Calls xAI Grok (or OpenAI API format) using XAI_API_KEY to generate 3 bullet points
+    for Decision Takeaways.
+    """
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        logger.warning("XAI_API_KEY not set in environment — skipping AI takeaway generation")
+        return None
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.x.ai/v1",
+            timeout=30.0,
+            max_retries=2,
+        )
+        prompt = (
+            f"Analyze this founder post from the Lavoo Build Room:\n\n"
+            f"Headline: {title}\n"
+            f"Content: {content}\n\n"
+            f"Extract EXACTLY 3 concise, highly actionable 'Decision Takeaways' for solo founders.\n"
+            f"Format your response as a strict JSON object: {{\"takeaways\": [\"Takeaway 1\", \"Takeaway 2\", \"Takeaway 3\"]}}"
+        )
+        models_to_try = ["grok-4-1-fast-reasoning", "grok-2-latest", "grok-4-1-fast-non-reasoning"]
+        completion = None
+        last_err = None
+
+        for m in models_to_try:
+            try:
+                completion = client.chat.completions.create(
+                    model=m,
+                    messages=[
+                        {"role": "system", "content": "You are the Lavoo Business Decision Engine AI. Extract 3 actionable decision takeaways for solo founders in strict JSON format."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3,
+                    max_tokens=300,
+                )
+                if completion and completion.choices:
+                    break
+            except Exception as err:
+                last_err = err
+                continue
+
+        if not completion or not completion.choices:
+            if last_err:
+                raise last_err
+            return None
+
+        raw_text = completion.choices[0].message.content.strip()
+        if "```" in raw_text:
+            raw_text = re.sub(r"^```(?:json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
+        parsed = json.loads(raw_text)
+        takeaways = parsed.get("takeaways", [])
+        if isinstance(takeaways, list) and len(takeaways) > 0:
+            cleaned = [re.sub(r"^[›\-*\d.\s]+", "", str(t)).strip() for t in takeaways[:3]]
+            return cleaned
+    except Exception as e:
+        logger.error(f"Grok AI takeaway generation error: {e}")
+    return None
+
+
+def generate_ai_takeaways_for_discussion(discussion_id: int, db: Session) -> Optional[List[str]]:
+    """
+    Synchronous / On-demand helper to generate and store takeaways for a discussion.
+    Used for Strategy 2 (on-demand lazy generation for previous posts).
+    """
+    try:
+        d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+        if not d:
+            return None
+        if d.ai_takeaways and isinstance(d.ai_takeaways, list) and len(d.ai_takeaways) > 0:
+            return d.ai_takeaways
+
+        takeaways = _generate_grok_takeaways(d.title, d.content)
+        if takeaways:
+            d.ai_takeaways = takeaways
+            db.add(d)
+            db.commit()
+            db.refresh(d)
+            return takeaways
+    except Exception as e:
+        logger.error(f"generate_ai_takeaways_for_discussion failed for post {discussion_id}: {e}")
+        db.rollback()
+    return None
+
+
+def _async_generate_takeaways_worker(discussion_id: int):
+    """
+    Background worker that runs after FastAPI HTTP response is sent.
+    """
+    db = SessionLocal()
+    try:
+        generate_ai_takeaways_for_discussion(discussion_id, db)
+    finally:
+        db.close()
+
+
 def _log_activity(db: Session, user_id: int, action_type: str, target_id: Optional[int] = None, target_type: Optional[str] = None, target_name: Optional[str] = None):
     try:
         db.add(CommunityActivity(user_id=user_id, action_type=action_type, target_id=target_id, target_type=target_type, target_name=target_name))
-        db.commit()
-    except Exception:
-        db.rollback()
+    except Exception as e:
+        logger.warning(f"Activity logging failed: {e}")
 
 
 def _channel_dict(ch: CommunityChannel, joined_ids: Optional[set] = None) -> dict:
@@ -57,12 +158,10 @@ class GiftChopsRequest(BaseModel):
 
 
 _AUTHOR_GRADIENTS = [
-    "from-orange-400 to-rose-400",
-    "from-blue-400 to-cyan-500",
-    "from-green-400 to-teal-500",
-    "from-violet-400 to-purple-600",
+    "from-orange-400 to-rose-500",
     "from-amber-400 to-orange-500",
-    "from-pink-400 to-rose-500",
+    "from-rose-400 to-pink-500",
+    "from-yellow-400 to-amber-500",
 ]
 
 # All valid topic slugs that can be stored as post_type
@@ -72,7 +171,7 @@ _TOPIC_SLUGS = {
 }
 
 
-def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, include_quoted: bool = True) -> dict:
+def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, include_quoted: bool = True, current_user: Optional[User] = None) -> dict:
     has_liked = d.id in liked_ids if liked_ids is not None else False
     post_type_val = getattr(d, 'post_type', None) or 'discussion'
 
@@ -100,11 +199,14 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, in
     quoted_dict = None
     if include_quoted and getattr(d, 'quoted_discussion', None) is not None:
         try:
-            quoted_dict = _discussion_dict(d.quoted_discussion, liked_ids=liked_ids, include_quoted=False)
+            quoted_dict = _discussion_dict(d.quoted_discussion, liked_ids=liked_ids, include_quoted=False, current_user=current_user)
         except Exception:
             quoted_dict = None
 
     spice_cnt = getattr(d, 'spice_count', 0) or 0
+    sub_status = getattr(current_user, 'subscription_status', None) if current_user else None
+    is_subscribed = sub_status in ('active', 'trialing')
+    raw_takeaways = getattr(d, 'ai_takeaways', None)
 
     return {
         "id": d.id, "channel_id": d.channel_id, "title": d.title, "content": d.content,
@@ -117,6 +219,8 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, in
         "spice_count": spice_cnt, "spiced": spice_cnt, "spices": spice_cnt,
         "quoted_discussion_id": getattr(d, 'quoted_discussion_id', None),
         "quoted_discussion": quoted_dict,
+        "takeaways": raw_takeaways if (is_subscribed and raw_takeaways) else None,
+        "has_takeaways": bool(raw_takeaways),
         "type": post_type_val,
         "author": author_obj,
         "channel": channel_display,
@@ -350,7 +454,7 @@ async def get_discussions(
             DiscussionLike.user_id == current_user.id,
             DiscussionLike.discussion_id.in_(discussion_ids)
         ).all()} if discussion_ids else set()
-        result = [_discussion_dict(d, liked) for d in discussions]
+        result = [_discussion_dict(d, liked, current_user=current_user) for d in discussions]
 
         # Include mission roadmap comments from users who opted in.
         # Comments live in analysis.user_progress['roadmap_comments'] (a dict of task_id → [comment, ...]).
@@ -439,6 +543,34 @@ async def get_discussions(
         except Exception as reflection_err:
             logger.warning(f"Mission reflections fetch error: {reflection_err}")
 
+        # Interleave Founder Insights into the discussion stream (1 insight every 4 posts)
+        try:
+            insights = db.query(FounderInsightCard).filter(FounderInsightCard.is_active == True).order_by(FounderInsightCard.created_at.desc()).all()
+            if insights and result:
+                interleaved = []
+                insight_idx = 0
+                for i, post_item in enumerate(result):
+                    interleaved.append(post_item)
+                    if (i + 1) % 4 == 0 and insight_idx < len(insights):
+                        card = insights[insight_idx % len(insights)]
+                        interleaved.append({
+                            "id": f"insight_{card.id}",
+                            "type": "founder_insight",
+                            "isStat": True,
+                            "big": card.highlight_stat or "",
+                            "highlight_stat": card.highlight_stat or "",
+                            "headline": card.insight_text,
+                            "insight_text": card.insight_text,
+                            "source": card.source,
+                            "accent": card.accent_color or "#e87a02",
+                            "accent_color": card.accent_color or "#e87a02",
+                            "created_at": card.created_at.isoformat() if card.created_at else None
+                        })
+                        insight_idx += 1
+                result = interleaved
+        except Exception as insight_err:
+            logger.warning(f"Founder insight interleaving error: {insight_err}")
+
         response = {"success": True, "data": result}
         await set_cached(cache_key, response, ttl_seconds=15)
         return response
@@ -450,6 +582,7 @@ async def get_discussions(
 @router.get("/discussions/{discussion_id}")
 async def get_discussion(
     discussion_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -458,6 +591,10 @@ async def get_discussion(
         raise HTTPException(status_code=404, detail="Discussion not found")
     d.view_count = (d.view_count or 0) + 1
     db.commit()
+
+    # Strategy 2: On-Demand "Lazy" Generation in background if ai_takeaways is NULL
+    if d.ai_takeaways is None:
+        background_tasks.add_task(_async_generate_takeaways_worker, d.id)
 
     def _serialise_reply(r) -> dict:
         return {
@@ -479,14 +616,38 @@ async def get_discussion(
     replies = [_serialise_reply(r) for r in top_level]
 
     liked = {d.id} if db.query(DiscussionLike).filter_by(user_id=current_user.id, discussion_id=d.id).first() else set()
-    data = _discussion_dict(d, liked)
+    data = _discussion_dict(d, liked, current_user=current_user)
     data["replies"] = replies
     return {"success": True, "data": data}
+
+
+@router.get("/discussions/{discussion_id}/takeaways")
+async def get_discussion_takeaways(
+    discussion_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+
+    is_subscribed = getattr(current_user, 'subscription_status', None) in ("active", "trialing")
+    if not is_subscribed:
+        return {"status": "locked", "has_takeaways": True, "takeaways": None}
+
+    if d.ai_takeaways and isinstance(d.ai_takeaways, list) and len(d.ai_takeaways) > 0:
+        return {"status": "ready", "takeaways": d.ai_takeaways}
+
+    # Strategy 2: On-Demand Lazy Generation (schedule in background and return status)
+    background_tasks.add_task(_async_generate_takeaways_worker, d.id)
+    return {"status": "generating", "takeaways": None}
 
 
 @router.post("/discussions")
 async def create_discussion(
     body: CreateDiscussionRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -514,9 +675,13 @@ async def create_discussion(
     db.commit()
     db.refresh(d)
     _log_activity(db, current_user.id, "posted", d.id, "discussion", d.title)
+
+    # Automatically schedule background AI generation for new posts upon creation
+    background_tasks.add_task(_async_generate_takeaways_worker, d.id)
+
     await delete_cached(f"community:discussions:user:{current_user.id}:ch:{body.channel_id}:lim:20:off:0")
     await delete_cached(f"community:discussions:user:{current_user.id}:ch:None:lim:20:off:0")
-    return {"success": True, "data": _discussion_dict(d, set())}
+    return {"success": True, "data": _discussion_dict(d, set(), current_user=current_user)}
 
 
 @router.delete("/discussions/{discussion_id}")
