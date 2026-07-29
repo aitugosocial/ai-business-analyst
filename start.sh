@@ -37,8 +37,13 @@ if [ "${NEEDS_STAMP}" -eq 1 ]; then
   # risk erroring on early non-idempotent CREATE TABLE/ADD COLUMN statements
   # against an already-populated production database, or re-applying a data
   # backfill migration a second time.
+  # --purge clears alembic_version before writing the new row. Plain
+  # `alembic stamp head` still tries to resolve a path from the CURRENT
+  # (unrecognized) revision to head and fails with the same "Can't locate
+  # revision" error we're trying to escape — --purge sidesteps that by not
+  # needing a starting point at all.
   echo "[startup] Stamping alembic_version to head (schema assumed already current)..."
-  alembic stamp head
+  alembic stamp --purge head
 fi
 
 echo "[startup] Running alembic upgrade head..."
