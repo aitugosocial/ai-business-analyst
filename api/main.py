@@ -1129,10 +1129,27 @@ async def startup_event():
                 finally:
                     _sync_db.close()
 
-            await asyncio.to_thread(_prewarm_tool_embeddings)
+            # Incident 2026-07-29: this step hung indefinitely on Railway — CPU
+            # stayed busy but the container never became healthy and never
+            # recovered on its own (confirmed via metrics: no crash/restart,
+            # just a stuck single container for the full 5-minute healthcheck
+            # window). The exact cause wasn't identified (encode() and the
+            # cache write both completed per the logs; nothing after them is
+            # expected to be expensive), but a hang here — unlike a raised
+            # exception — wasn't bounded by the try/except below at all, so it
+            # could block startup forever. A hard timeout converts a silent
+            # hang into the same caught, logged, non-fatal path a real
+            # exception already takes, so a bad run degrades to "cold cache on
+            # first request" instead of "deploy never comes up". 200s leaves
+            # margin under the 300s railway.toml healthcheckTimeout while
+            # comfortably covering the observed ~100-110s normal cost. The
+            # background thread itself isn't cancelled on timeout (Python
+            # can't force-kill a running thread) — it keeps running and will
+            # still populate the singleton cache whenever it does finish.
+            await asyncio.wait_for(asyncio.to_thread(_prewarm_tool_embeddings), timeout=200.0)
             logger.info("✓ Tool-recommendation embeddings pre-warmed")
         except Exception as e:
-            logger.error(f"⚠️ Tool embeddings pre-warm failed (non-fatal, will warm on first request): {e}")
+            logger.error(f"⚠️ Tool embeddings pre-warm failed or timed out (non-fatal, will warm on first request): {e}")
 
         # Ensure admin exists (moved to a background task so synchronous DB queries don't block the event loop)
         # It is now called at the beginning of run_heavy_schema_migrations()
