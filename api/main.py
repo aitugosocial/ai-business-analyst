@@ -1101,6 +1101,39 @@ async def startup_event():
         db_info = get_db_info()
         logger.info(f"✓ Database initialized: {db_info['type']} at {db_info['host']}")
 
+        # Tool-recommendation embeddings pre-warm — deliberately BLOCKS startup
+        # (unlike the schema migrations below, which are backgrounded) so the
+        # 90-100s SentenceTransformer.encode() cost over the full tool catalog
+        # never lands on a live user's request. Incident 2026-07-28: a
+        # cold-cache encode ran synchronously inside a request, blocked the
+        # single asyncio event loop for the whole process, and Railway's HTTP/2
+        # proxy killed every other open connection (including SSE streams) in
+        # that window. The embeddings cache also lives on local disk, which is
+        # ephemeral on Railway (wiped every deploy) — so every deploy would hit
+        # this cold path at least once without this.
+        # /health only starts returning 200 once startup_event() returns, so
+        # blocking here means Railway (or any platform) won't route traffic to
+        # this instance until the cache is genuinely warm — no fire-and-forget
+        # background task, no dependency on a persistent volume surviving
+        # across deploys. healthcheckTimeout is 300s (railway.toml), well
+        # above this cost. Failure here is logged but non-fatal — the request
+        # path already runs recommend_tools()/recommend_automation_stacks() via
+        # asyncio.to_thread (agentic_analyzer.py), so a cold cache at request
+        # time is slow but no longer capable of blocking other connections.
+        try:
+            def _prewarm_tool_embeddings():
+                from decision_engine.recommender_db import get_recommender
+                _sync_db = SessionLocal()
+                try:
+                    get_recommender(_sync_db)
+                finally:
+                    _sync_db.close()
+
+            await asyncio.to_thread(_prewarm_tool_embeddings)
+            logger.info("✓ Tool-recommendation embeddings pre-warmed")
+        except Exception as e:
+            logger.error(f"⚠️ Tool embeddings pre-warm failed (non-fatal, will warm on first request): {e}")
+
         # Ensure admin exists (moved to a background task so synchronous DB queries don't block the event loop)
         # It is now called at the beginning of run_heavy_schema_migrations()
 
