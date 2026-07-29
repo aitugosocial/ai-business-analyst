@@ -171,7 +171,15 @@ class AgenticAnalyzer:
         same top tools from the database.
         """
         try:
-            tools = recommend_tools(action_description, top_k=top_k, db_session=self.db)
+            # recommend_tools is synchronous and, on a cache miss, calls
+            # SentenceTransformer.encode() over the full tool catalog — a
+            # CPU-bound call that can take ~90s. Run it in a worker thread so
+            # it can't block the shared asyncio event loop (which would stall
+            # every other concurrent request/SSE stream in this process, not
+            # just this one — see agentic_analyzer.py incident 2026-07-28).
+            tools = await asyncio.to_thread(
+                recommend_tools, action_description, top_k=top_k, db_session=self.db
+            )
             logger.info(
                 f"Found {len(tools)} tools via semantic search for: {action_description[:60]}..."
             )
@@ -1339,7 +1347,11 @@ OUTPUT FORMAT (JSON only, no markdown fences):
                 return await self._recommend_single_tool(user_query, action_plans_for_tool)
 
             action_plans = action_plans_result.get("action_plans", []) or []
-            stacks = recommend_automation_stacks(
+            # Synchronous + potentially slow on a cache miss (full-catalog
+            # re-embedding) — see _search_ai_tools for why this must not run
+            # directly on the event loop.
+            stacks = await asyncio.to_thread(
+                recommend_automation_stacks,
                 user_query=user_query,
                 action_plans=action_plans,
                 top_k_stacks=3,
@@ -1381,7 +1393,8 @@ OUTPUT FORMAT (JSON only, no markdown fences):
         """
         from database.pg_models import AITool
         try:
-            tools = recommend_tools(user_query, top_k=3, db_session=self.db)
+            # See _search_ai_tools — must not block the event loop on a cache miss.
+            tools = await asyncio.to_thread(recommend_tools, user_query, top_k=3, db_session=self.db)
             if not tools:
                 return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
 
