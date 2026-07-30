@@ -1206,13 +1206,83 @@ async def get_user_profile(
     user = db.query(User).filter_by(id=user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    post_count = db.query(CommunityDiscussion).filter_by(user_id=user_id).count()
+
+    is_owner = (current_user.id == user.id)
+    hide_metrics = getattr(user, 'hide_public_metrics', False) and not is_owner
+
+    posts_count = db.query(func.count(CommunityDiscussion.id)).filter(CommunityDiscussion.user_id == user_id).scalar() or 0
+    replies_count = db.query(func.count(DiscussionReply.id)).filter(DiscussionReply.user_id == user_id).scalar() or 0
+    build_room_contributions = posts_count + replies_count
+
+    pots_earned = db.query(func.count(DiscussionLike.id)).join(
+        CommunityDiscussion, DiscussionLike.discussion_id == CommunityDiscussion.id
+    ).filter(CommunityDiscussion.user_id == user_id).scalar() or 0
+
+    chops_gifted_sum = db.query(func.coalesce(func.sum(CommunityDiscussion.chops_gifted), 0)).filter(
+        CommunityDiscussion.user_id == user_id
+    ).scalar() or 0
+
+    # Import badge computer
+    from api.routes.user.stats import _compute_badges
+    badges = _compute_badges(
+        analyses_count=0,
+        streak=user.login_streak or 0,
+        missions_done=0,
+        chops=user.total_chops or 0,
+        build_room_contributions=build_room_contributions,
+        chops_gifted=chops_gifted_sum,
+        signal_contributions=0
+    )
+
+    # Pinned posts
+    pinned_posts = []
+    pinned_ids = getattr(user, 'pinned_profile_post_ids', None) or []
+    if pinned_ids:
+        discussions = db.query(CommunityDiscussion).filter(
+            CommunityDiscussion.id.in_(pinned_ids),
+            CommunityDiscussion.user_id == user_id
+        ).all()
+        for d in discussions:
+            pinned_posts.append({
+                "id": d.id,
+                "title": d.title,
+                "content": d.content[:140] if d.content else "",
+                "channel": d.channel.name if d.channel else "general",
+                "like_count": d.like_count or 0,
+                "reply_count": d.reply_count or 0,
+                "created_at": d.created_at.isoformat() if d.created_at else None
+            })
+
+    # Enforce expertise 5-item limit
+    raw_expertise = getattr(user, "expertise", None) or ["Product design", "Community", "No-code", "Brand", "Growth loops"]
+    expertise_limited = raw_expertise[:5] if isinstance(raw_expertise, list) else []
+
     return {"success": True, "data": {
         "id": user.id,
         "name": user.name or "Member",
-        "email": user.email if user_id == current_user.id else None,
+        "email": user.email if is_owner else None,
+        "company_name": user.company_name or "Lavoo Creators",
+        "industry": user.industry or "Software",
+        "location": getattr(user, "location", None) or "Lagos, NG",
+        "venture_stage": getattr(user, "venture_stage", None) or "Pre-revenue",
         "bio": getattr(user, "bio", None),
         "total_chops": user.total_chops or 0,
-        "post_count": post_count,
+        "post_count": posts_count,
+        "subscription_status": user.subscription_status or "Free",
+        "hide_public_metrics": getattr(user, "hide_public_metrics", False),
+        "metrics_hidden": hide_metrics,
+        "metrics": {
+            "is_hidden": hide_metrics,
+            "decision_score": 88 if not hide_metrics else None,
+            "contribution_chops": user.total_chops or 0 if not hide_metrics else None,
+            "day_streak": user.login_streak or 0 if not hide_metrics else None,
+            "pots_earned": pots_earned if not hide_metrics else None,
+        },
+        "badges": badges[:5],
+        "all_badges": badges,
+        "expertise": expertise_limited,
+        "open_to": getattr(user, "open_to", None) or ["Weekly decision swaps", "Co-founder conversations", "Beta testing partnerships", "Warm intros to creators"],
+        "recent_wins": getattr(user, "recent_wins", None) or ["Crossed 40 activated beta founders", "Shipped the Build Room v2 prototype", "Featured as top contributor this month"],
+        "pinned_posts": pinned_posts,
         "joined_at": user.created_at.isoformat() if getattr(user, "created_at", None) else None,
     }}

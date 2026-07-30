@@ -110,6 +110,15 @@ class User(Base):
     industry = Column(String(100), nullable=True)
     avatar_url = Column(Text, nullable=True)
 
+    # Refined Profile & Privacy Fields
+    pinned_profile_post_ids = Column(JSON, nullable=True, default=list)
+    hide_public_metrics = Column(Boolean, default=False)
+    expertise = Column(JSON, nullable=True, default=list)
+    open_to = Column(JSON, nullable=True, default=list)
+    recent_wins = Column(JSON, nullable=True, default=list)
+    current_goal = Column(Text, nullable=True)
+    venture_stage = Column(String(100), nullable=True, default="Pre-revenue")
+
     # User Settings and Metadata
     user_metadata = Column(JSON, nullable=True)  # Stores user settings, preferences, and other metadata
 
