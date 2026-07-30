@@ -19,8 +19,9 @@ class ProfileUpdateRequest(BaseModel):
     name: Optional[str] = None
     company_name: Optional[str] = None
     industry: Optional[str] = None
+    location: Optional[str] = None
+    venture_stage: Optional[str] = None
     bio: Optional[str] = None
-    current_goal: Optional[str] = None
     expertise: Optional[List[str]] = None
     open_to: Optional[List[str]] = None
     recent_wins: Optional[List[str]] = None
@@ -65,8 +66,10 @@ def get_profile(
         "id": current_user.id,
         "name": current_user.name,
         "email": current_user.email,
-        "company_name": current_user.company_name,
-        "industry": current_user.industry,
+        "company_name": current_user.company_name or "Lavoo Creators",
+        "industry": current_user.industry or "Software",
+        "location": getattr(current_user, 'location', None) or "Lagos, NG",
+        "venture_stage": getattr(current_user, 'venture_stage', None) or "Pre-revenue",
         "bio": current_user.bio,
         "avatar_url": current_user.avatar_url,
         "subscription_status": current_user.subscription_status or "Free",
@@ -78,7 +81,6 @@ def get_profile(
         "expertise": getattr(current_user, 'expertise', None) or ["Product design", "Community", "No-code", "Brand", "Growth loops"],
         "open_to": getattr(current_user, 'open_to', None) or ["Weekly decision swaps", "Co-founder conversations", "Beta testing partnerships", "Warm intros to creators"],
         "recent_wins": getattr(current_user, 'recent_wins', None) or ["Crossed 40 activated beta founders", "Shipped the Build Room v2 prototype", "Featured as top contributor this month"],
-        "current_goal": getattr(current_user, 'current_goal', None) or "Ship the Build Room v2 and reach 100 activated founders before end of quarter.",
         "pinned_posts": pinned_posts,
         "pinned_ids": pinned_ids,
         "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
@@ -104,10 +106,12 @@ def update_profile(
             current_user.company_name = profile_data.company_name
         if profile_data.industry is not None:
             current_user.industry = profile_data.industry
+        if profile_data.location is not None:
+            current_user.location = profile_data.location
+        if profile_data.venture_stage is not None:
+            current_user.venture_stage = profile_data.venture_stage
         if profile_data.bio is not None:
             current_user.bio = profile_data.bio
-        if profile_data.current_goal is not None:
-            current_user.current_goal = profile_data.current_goal
         if profile_data.expertise is not None:
             current_user.expertise = profile_data.expertise
         if profile_data.open_to is not None:
@@ -127,11 +131,12 @@ def update_profile(
                 "email": current_user.email,
                 "company_name": current_user.company_name,
                 "industry": current_user.industry,
+                "location": current_user.location,
+                "venture_stage": current_user.venture_stage,
                 "bio": current_user.bio,
                 "expertise": current_user.expertise,
                 "open_to": current_user.open_to,
                 "recent_wins": current_user.recent_wins,
-                "current_goal": current_user.current_goal,
                 "subscription_status": current_user.subscription_status or "Free",
             }
         }

@@ -117,6 +117,7 @@ class User(Base):
     open_to = Column(JSON, nullable=True, default=list)
     recent_wins = Column(JSON, nullable=True, default=list)
     current_goal = Column(Text, nullable=True)
+    venture_stage = Column(String(100), nullable=True, default="Pre-revenue")
 
     # User Settings and Metadata
     user_metadata = Column(JSON, nullable=True)  # Stores user settings, preferences, and other metadata
