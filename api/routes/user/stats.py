@@ -10,7 +10,10 @@ from sqlalchemy import func, cast, Date
 from datetime import datetime, timedelta, timezone
 
 from database.pg_connections import get_db
-from database.pg_models import BusinessAnalysis, User, Commission, Referral, UserAlert, CommunityDiscussion
+from database.pg_models import (
+    BusinessAnalysis, User, Commission, Referral, UserAlert,
+    CommunityDiscussion, DiscussionReply, DiscussionLike, SignalComment, Signal
+)
 from api.routes.auth.login import get_current_user
 
 import logging
@@ -277,16 +280,62 @@ def _compute_streak(db: Session, user_id: int) -> int:
     return streak
 
 
-def _compute_badges(analyses_count: int, streak: int, missions_done: int, chops: int) -> list:
+def _compute_badges(
+    analyses_count: int,
+    streak: int,
+    missions_done: int,
+    chops: int,
+    build_room_contributions: int = 0,
+    chops_gifted: int = 0,
+    signal_contributions: int = 0,
+) -> list:
     """Return list of badge dicts with earned status based on real data."""
     all_badges = [
-        {"id": 1, "name": "First Analysis",  "icon": "Target",  "earned": analyses_count >= 1,  "color": "orange",  "description": "Complete your first analysis"},
-        {"id": 2, "name": "7-Day Streak",     "icon": "Flame",   "earned": streak >= 7,           "color": "orange",  "description": "Maintain a 7-day activity streak"},
-        {"id": 3, "name": "Closer",           "icon": "CheckCircle2", "earned": missions_done >= 3, "color": "purple", "description": "Complete 3 missions"},
-        {"id": 4, "name": "Speed Operator",   "icon": "Zap",     "earned": analyses_count >= 10,  "color": "blue",    "description": "Complete 10 analyses"},
-        {"id": 5, "name": "Strategic Thinker","icon": "Brain",   "earned": analyses_count >= 25,  "color": "indigo",  "description": "Complete 25 analyses"},
-        {"id": 6, "name": "Community Pillar", "icon": "Users",   "earned": chops >= 1000,         "color": "green",   "description": "Earn 1,000 Chops"},
-        {"id": 7, "name": "Elite Founder",    "icon": "Crown",   "earned": analyses_count >= 100, "color": "amber",   "description": "Complete 100 analyses"},
+        # 🌟 Dynamic Community Badges
+        {
+            "id": "top_contributor",
+            "name": "Top Contributor",
+            "icon": "Star",
+            "color": "#e0a100",
+            "earned": build_room_contributions >= 40,
+            "description": "Contributed 40+ posts or replies to The Build Room",
+            "progress": min(100, int((build_room_contributions / 40) * 100)) if build_room_contributions < 40 else 100
+        },
+        {
+            "id": "generous_giver",
+            "name": "Generous Giver",
+            "icon": "Star",
+            "color": "#e87a02",
+            "earned": chops_gifted >= 100,
+            "description": "Gifted 100+ Chops to fellow founders",
+            "progress": min(100, int((chops_gifted / 100) * 100)) if chops_gifted < 100 else 100
+        },
+        {
+            "id": "14_day_streak",
+            "name": "14-Day Streak",
+            "icon": "Star",
+            "color": "#2dbe6e",
+            "earned": streak >= 14,
+            "description": "Maintained a 14-day activity streak",
+            "progress": min(100, int((streak / 14) * 100)) if streak < 14 else 100
+        },
+        {
+            "id": "signal_setter",
+            "name": "Signal Setter",
+            "icon": "Star",
+            "color": "#7c6cf0",
+            "earned": signal_contributions >= 3,
+            "description": "Contributed 3+ insights or comments to The Signal",
+            "progress": min(100, int((signal_contributions / 3) * 100)) if signal_contributions < 3 else 100
+        },
+        # Preserved Achievement Badges
+        {"id": "first_analysis",   "name": "First Analysis",  "icon": "Target",       "earned": analyses_count >= 1,  "color": "orange", "description": "Complete your first analysis"},
+        {"id": "7_day_streak",     "name": "7-Day Streak",    "icon": "Flame",        "earned": streak >= 7,          "color": "orange", "description": "Maintain a 7-day activity streak"},
+        {"id": "closer",           "name": "Closer",          "icon": "CheckCircle2", "earned": missions_done >= 3, "color": "purple", "description": "Complete 3 missions"},
+        {"id": "speed_operator",   "name": "Speed Operator",  "icon": "Zap",          "earned": analyses_count >= 10, "color": "blue",   "description": "Complete 10 analyses"},
+        {"id": "strategic_thinker","name": "Strategic Thinker","icon": "Brain",       "earned": analyses_count >= 25, "color": "indigo", "description": "Complete 25 analyses"},
+        {"id": "community_pillar", "name": "Community Pillar","icon": "Users",       "earned": chops >= 1000,        "color": "green",  "description": "Earn 1,000 Chops"},
+        {"id": "elite_founder",    "name": "Elite Founder",   "icon": "Crown",       "earned": analyses_count >= 100,"color": "amber",  "description": "Complete 100 analyses"},
     ]
     return all_badges
 
@@ -323,6 +372,33 @@ async def get_user_progress(
         # Execution streak
         streak = _compute_streak(db, user_id)
 
+        # Community metrics for dynamic badges
+        posts_count = db.query(func.count(CommunityDiscussion.id)).filter(
+            CommunityDiscussion.user_id == user_id
+        ).scalar() or 0
+        replies_count = db.query(func.count(DiscussionReply.id)).filter(
+            DiscussionReply.user_id == user_id
+        ).scalar() or 0
+        build_room_contributions = posts_count + replies_count
+
+        signal_comments_count = db.query(func.count(SignalComment.id)).filter(
+            SignalComment.user_id == user_id
+        ).scalar() or 0
+        signal_authored = db.query(func.count(Signal.id)).filter(
+            Signal.author_id == user_id
+        ).scalar() or 0
+        signal_contributions = signal_comments_count + signal_authored
+
+        pots_earned = db.query(func.count(DiscussionLike.id)).join(
+            CommunityDiscussion, DiscussionLike.discussion_id == CommunityDiscussion.id
+        ).filter(
+            CommunityDiscussion.user_id == user_id
+        ).scalar() or 0
+
+        chops_gifted_sum = db.query(func.coalesce(func.sum(CommunityDiscussion.chops_gifted), 0)).filter(
+            CommunityDiscussion.user_id == user_id
+        ).scalar() or 0
+
         # Level info
         level_info = _resolve_level(chops)
 
@@ -339,7 +415,12 @@ async def get_user_progress(
             (analyses_score * 0.35)
         )
 
-        badges = _compute_badges(total_analyses, streak, analyses_30d, chops)
+        badges = _compute_badges(
+            total_analyses, streak, analyses_30d, chops,
+            build_room_contributions=build_room_contributions,
+            chops_gifted=chops_gifted_sum,
+            signal_contributions=signal_contributions
+        )
 
         return {
             "total_chops": chops,
@@ -348,6 +429,10 @@ async def get_user_progress(
             "total_analyses": total_analyses,
             "analyses_last_30_days": analyses_30d,
             "execution_score": execution_score,
+            "pots_earned": pots_earned,
+            "build_room_contributions": build_room_contributions,
+            "chops_gifted": chops_gifted_sum,
+            "signal_contributions": signal_contributions,
             "execution_metrics": [
                 {"name": "Consistency",       "score": min(100, streak_score),   "color": "bg-green-500",  "textColor": "text-green-500"},
                 {"name": "Action Completion", "score": min(100, analyses_score), "color": "bg-orange-500", "textColor": "text-orange-500"},
