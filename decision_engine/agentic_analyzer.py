@@ -716,7 +716,7 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
 
     # Deterministic pass bar applied in Python (never left to the LLM's
     # discretion) — a candidate tool is only assignable to a step if it
-    # clears the bar on at least 4 of these 5 criteria (75%). task_relevance's
+    # clears the bar on at least 4 of these 5 criteria (80%). task_relevance's
     # bar is set far higher than the rest because it is the load-bearing
     # criterion: a tool that doesn't literally perform the step's action has
     # no business being recommended for it, regardless of how cheap or easy
@@ -761,9 +761,14 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
            and enforces global uniqueness — the LLM's scores are advisory
            input, the gate is what actually decides assignment
         """
-        needy_indices = [
-            i for i, p in enumerate(action_plans) if p.get("needs_ai_tool", False)
-        ]
+        # Every plan is searched and scored — there is no upfront LLM opt-out.
+        # An earlier version let Stage 3's plan-level "needs_ai_tool" flag skip
+        # search+scoring entirely for a plan; that let a single coarse LLM
+        # judgment call veto a step before the deterministic criteria gate
+        # ever got a chance to evaluate it, which contradicts the gate's whole
+        # purpose (the gate, not LLM discretion, decides). The gate is now the
+        # only thing standing between a candidate and assignment.
+        needy_indices = list(range(len(action_plans)))
         for plan in action_plans:
             plan.pop("needs_ai_tool", None)
             what_to_do_list = plan.get("what_to_do", []) if isinstance(plan.get("what_to_do"), list) else []
@@ -831,52 +836,57 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         if not all_tools:
             return action_plans
 
-        # ── Step 2: build prompt — mark step-cited tools and hint their origin plan ──
-        # Build inverse map: tool_lower → list of plan_indices that cite it in steps
-        cited_tool_to_plans: dict[str, list[int]] = {}
-        for plan_idx, cited_list in plan_step_cited.items():
-            for name in cited_list:
-                cited_tool_to_plans.setdefault(name.lower(), []).append(plan_idx)
+        # ── Step 2: score each plan's steps against its OWN candidate pool,
+        # one LLM call per plan, all run concurrently via asyncio.gather.
+        # Cross-plan uniqueness was never actually enforced by the LLM
+        # reading everything at once anyway — Step 3 below is the real
+        # enforcement: it walks every plan/step in priority order and
+        # deterministically rejects/backfills on a collision. That doesn't
+        # change here, so splitting the scoring calls doesn't weaken it.
+        bars = self._STEP_TOOL_CRITERIA_BARS
 
-        plans_section_parts: list[str] = []
-        for plan_idx in needy_indices:
+        async def _score_plan(plan_idx: int) -> list[dict]:
             plan = action_plans[plan_idx]
             what_to_do_list = plan.get("what_to_do", []) if isinstance(plan.get("what_to_do"), list) else []
-            numbered_steps = "\n".join(f"   {i+1}. {s}" for i, s in enumerate(what_to_do_list))
-            relevant = ", ".join(plan_candidate_names.get(plan_idx, [])[:6])
+            if not what_to_do_list:
+                return []
+            numbered_steps = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(what_to_do_list))
+
+            plan_tool_names = list(dict.fromkeys(
+                plan_candidate_names.get(plan_idx, []) + plan_step_cited.get(plan_idx, [])
+            ))
+            if not plan_tool_names:
+                return []
+
+            tools_section_parts: list[str] = []
+            for name in plan_tool_names:
+                t = all_tools.get(name)
+                if not t:
+                    continue
+                url = t.get("url") or t.get("website") or "unknown"
+                step_flag = " [CITED IN STEPS]" if t.get("_step_cited") else ""
+                tools_section_parts.append(
+                    f"- {name}{step_flag} | URL: {url}\n  {t.get('description', '')[:200]}"
+                )
+            tools_section = "\n".join(tools_section_parts)
+            if not tools_section:
+                return []
+
             cited_note = ""
             if plan_step_cited.get(plan_idx):
-                cited_note = f"\n  Tools explicitly named in steps (MUST assign here): {', '.join(plan_step_cited[plan_idx])}"
-            plans_section_parts.append(
-                f"PLAN {plan_idx + 1}: {plan['title']}\n"
-                f"  Steps:\n{numbered_steps}\n"
-                f"  Semantically relevant candidates: {relevant}{cited_note}"
-            )
-        plans_section = "\n\n".join(plans_section_parts)
+                cited_note = f"\nTools explicitly named in steps (MUST assign to the step that names them): {', '.join(plan_step_cited[plan_idx])}"
 
-        tools_section_parts: list[str] = []
-        for name, t in all_tools.items():
-            url = t.get("url") or t.get("website") or "unknown"
-            step_flag = " [CITED IN STEPS]" if t.get("_step_cited") else ""
-            tools_section_parts.append(
-                f"- {name}{step_flag} | URL: {url}\n  {t.get('description', '')[:200]}"
-            )
-        tools_section = "\n".join(tools_section_parts)
+            prompt = f"""You are a tool-matching specialist operating with the precision of a technology due diligence team. You match functional capabilities to tools based on verified feature alignment — not keyword similarity, not brand recognition, not marketing claims, not popularity.
 
-        plan_ids_str = ", ".join(str(i + 1) for i in needy_indices)
+Your output appears directly on an action plan card that a solo founder will use to make decisions. Every word must be specific, concrete, and unique to the STEP it accompanies — not the plan as a whole.
 
-        bars = self._STEP_TOOL_CRITERIA_BARS
-        prompt = f"""You are a tool-matching specialist operating with the precision of a technology due diligence team. You match functional capabilities to tools based on verified feature alignment — not keyword similarity, not brand recognition, not marketing claims, not popularity.
-
-Your output appears directly on action plan cards that a solo founder will use to make decisions. Every word must be specific, concrete, and unique to the STEP it accompanies — not the plan as a whole.
-
-CRITICAL SHIFT FROM PLAN-LEVEL TO STEP-LEVEL: You are matching tools to individual STEPS inside each plan, not to plans as a whole. A plan with 4 steps may end up with 0, 1, 2, 3, or 4 tools — one per step that genuinely needs one. Steps that are manual, judgment-based, or one-time (e.g. "review the responses and decide", "call your accountant") get NO tool. Do not force a tool onto every step.
+CRITICAL: You are matching tools to individual STEPS inside ONE plan, not to the plan as a whole. A plan with {len(what_to_do_list)} steps may end up with 0 or more tools — one per step that genuinely needs one. Steps that are manual, judgment-based, or one-time (e.g. "review the responses and decide", "call your accountant") get NO tool. Do not force a tool onto every step.
 
 PERSONA RULE: Write "what_it_helps" in SECOND PERSON — "you", "your". Never "the user", "the founder", or any third-person reference.
 
-GLOBAL CONSTRAINT: Each tool can be assigned to AT MOST ONE step across the ENTIRE analysis (every plan, every step combined) — never twice, even across two different plans. Once assigned, that tool is locked. If the same tool is the best match for multiple steps, favor the step where it covers an "essential" function over a convenience feature, and among equals, the earlier plan and earlier step (lower numbers = higher priority).
+WITHIN-PLAN CONSTRAINT: Do not propose the same tool for two different steps in this plan — each tool you propose should be the best match for exactly one step here.
 
-STEP-CITED OVERRIDE: Any tool marked [CITED IN STEPS] is explicitly named inside that plan's step text. It MUST be assigned to the specific step that names it, as that step's top candidate, regardless of catalog rank.
+STEP-CITED OVERRIDE: Any tool marked [CITED IN STEPS] is explicitly named inside this plan's step text. It MUST be assigned to the specific step that names it, as that step's top candidate, regardless of catalog rank.
 
 SCORING RUBRIC — for every candidate you propose, score all 5 criteria honestly on a 0-100 scale. These numbers are checked in code against fixed pass bars, not just read by a person, so inflate nothing:
 - task_relevance (bar: {bars['task_relevance']}): does the tool's DOCUMENTED core feature literally perform the action named in THIS step? Score 90+ only if unambiguous. A tool that is merely "in the same category" or "could be adapted" scores well below 90.
@@ -889,16 +899,17 @@ Only propose a candidate for a step if you would defend task_relevance >= {bars[
 
 USER BUSINESS CHALLENGE: "{user_query}"
 
-ACTION PLANS THAT NEED TOOLS (plans {plan_ids_str}):
-{plans_section}
+PLAN: {plan['title']}
+STEPS:
+{numbered_steps}{cited_note}
 
-FULL TOOL CATALOG (from semantic search + step extraction — names marked [CITED IN STEPS] were found inside the steps themselves):
+TOOL CATALOG FOR THIS PLAN (from semantic search + step extraction — names marked [CITED IN STEPS] were found inside the steps themselves):
 {tools_section}
 
 MATCHING PROTOCOL:
 
 STEP 1 — FEATURE-LEVEL MATCH, PER STEP
-For each numbered step inside each plan, identify tools in the catalog whose DOCUMENTED CORE FUNCTION directly performs the capability that specific step names. Not "this tool is in the same category" — the tool must have a specific feature that executes the required function for THAT step.
+For each numbered step, identify tools in the catalog whose DOCUMENTED CORE FUNCTION directly performs the capability that specific step names. Not "this tool is in the same category" — the tool must have a specific feature that executes the required function for THAT step.
 
 STEP 2 — SPECIFICITY OF DESCRIPTIONS
 "what_it_helps" must name the EXACT step number and describe what the tool does for THAT step in one concrete sentence, citing the actual documented feature being used. This text appears on the plan card under that step — it must be unique to that step, not a generic product description.
@@ -909,7 +920,7 @@ STEP 3 — CANDIDATES, RANKED
 For each step you're confident about, return up to 2 candidates ordered best-first (a second one only if it is also genuinely defensible — never pad with a weak second choice). Most steps will have exactly 1 or 0 candidates.
 
 STEP 4 — ASSIGNMENT RULES
-1. Each tool can be assigned to AT MOST ONE step in the whole analysis. No repeats, even across plans.
+1. Do not propose the same tool for two different steps in this plan.
 2. Tools marked [CITED IN STEPS] MUST appear as the top candidate for the step that cites them.
 3. Only propose non-cited tools if they directly address that step's named action. Do NOT propose based on general category fit.
 4. Return the tool's URL from the catalog exactly as shown (null is acceptable for step-cited stubs).
@@ -919,7 +930,6 @@ OUTPUT FORMAT (JSON only, no markdown):
 {{
   "step_assignments": [
     {{
-      "plan_index": 1,
       "step_index": 2,
       "candidates": [
         {{
@@ -933,26 +943,31 @@ OUTPUT FORMAT (JSON only, no markdown):
   ]
 }}
 
-plan_index and step_index are both 1-based (step_index counts within that plan's own step list). Omit any step where no catalog tool genuinely fits its specific action."""
+step_index is 1-based, counting within THIS plan's own step list. Omit any step where no catalog tool genuinely fits its specific action."""
 
-        try:
-            response = await self._llm(
-                model=self.fast_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=1400,
-            )
-            raw = response.choices[0].message.content.strip()
-            if "```json" in raw:
-                raw = raw.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw:
-                raw = raw.split("```")[1].split("```")[0].strip()
-            parsed = _safe_json_loads(raw)
-            step_assignments_raw: list[dict] = parsed.get("step_assignments", []) or []
+            try:
+                response = await self._llm(
+                    model=self.fast_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_tokens=600,
+                )
+                raw = response.choices[0].message.content.strip()
+                if "```json" in raw:
+                    raw = raw.split("```json")[1].split("```")[0].strip()
+                elif "```" in raw:
+                    raw = raw.split("```")[1].split("```")[0].strip()
+                parsed = _safe_json_loads(raw)
+                entries = parsed.get("step_assignments", []) or []
+                for entry in entries:
+                    entry["plan_index"] = plan_idx + 1
+                return entries
+            except Exception as e:
+                logger.warning(f"Step-level tool assignment failed for plan {plan_idx + 1}: {e} — its steps will have no tool")
+                return []
 
-        except Exception as e:
-            logger.warning(f"Step-level tool assignment failed: {e} — steps will have no tool")
-            step_assignments_raw = []
+        per_plan_results = await asyncio.gather(*(_score_plan(idx) for idx in needy_indices))
+        step_assignments_raw: list[dict] = [entry for entries in per_plan_results for entry in entries]
 
         # ── Step 3: normalise every proposed candidate, then gate it ──
         # canonical_map covers both DB tools and step-cited stubs
@@ -1158,8 +1173,6 @@ Bad: "You will improve customer loyalty."
 "conventional": what standard advice (blogs, courses, generic consultants) would recommend.
 "why_wrong": why that advice is wrong or suboptimal for your specific situation and stage.
 
-"needs_ai_tool": true ONLY if a tool would meaningfully automate or sustain a specific step that manual execution cannot maintain beyond week 1. false for human judgment, one-time, or infrequent actions.
-
 OUTPUT FORMAT (JSON only, no markdown):
 {{
     "action_plans": [
@@ -1182,8 +1195,7 @@ OUTPUT FORMAT (JSON only, no markdown):
                 "conventional": "Standard advice would tell you to [common recommendation].",
                 "why_wrong": "That is wrong for your situation because [specific reason tied to your stage and context]."
             }},
-            "effort_level": "Low or Medium or High",
-            "needs_ai_tool": false
+            "effort_level": "Low or Medium or High"
         }}
     ],
     "exclusions_note": "Strategies considered but excluded: [name each with a concrete reason tied to your specific situation, stage, and constraints]."
