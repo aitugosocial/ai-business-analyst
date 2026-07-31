@@ -1036,6 +1036,11 @@ def run_heavy_schema_migrations():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS recent_wins JSON DEFAULT '[]'",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS current_goal TEXT",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS venture_stage VARCHAR(100) DEFAULT 'Pre-revenue'",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100)",
+            "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS tagged_user_ids JSON DEFAULT '[]'",
+            "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS visibility VARCHAR(30) DEFAULT 'public'",
+            "ALTER TABLE discussion_replies ADD COLUMN IF NOT EXISTS tagged_user_ids JSON DEFAULT '[]'",
+            "UPDATE users SET username = LOWER(REGEXP_REPLACE(name, '[^a-zA-Z0-9]', '', 'g')) WHERE username IS NULL OR username = ''",
             "CREATE TABLE IF NOT EXISTS founder_insight_cards (id SERIAL PRIMARY KEY, highlight_stat VARCHAR(50), insight_text TEXT NOT NULL, source VARCHAR(255) NOT NULL, category VARCHAR(50) DEFAULT 'african_tech', accent_color VARCHAR(20) DEFAULT '#e87a02', is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)"
         ]
         for stmt in index_statements:
