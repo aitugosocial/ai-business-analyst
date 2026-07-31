@@ -11,7 +11,7 @@ import os
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_, String
 
 from database.pg_connections import get_db, SessionLocal
 from database.pg_models import (
@@ -208,6 +208,9 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, in
     is_subscribed = sub_status in ('active', 'trialing')
     raw_takeaways = getattr(d, 'ai_takeaways', None)
 
+    tagged_ids = getattr(d, 'tagged_user_ids', None) or []
+    visibility_val = getattr(d, 'visibility', 'public') or 'public'
+
     return {
         "id": d.id, "channel_id": d.channel_id, "title": d.title, "content": d.content,
         "tags": d.tags or [], "like_count": d.like_count, "reply_count": d.reply_count,
@@ -222,6 +225,8 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, in
         "takeaways": raw_takeaways if (is_subscribed and raw_takeaways) else None,
         "has_takeaways": bool(raw_takeaways),
         "type": post_type_val,
+        "tagged_user_ids": tagged_ids,
+        "visibility": visibility_val,
         "author": author_obj,
         "channel": channel_display,
         "created_at": d.created_at.isoformat() if d.created_at else None,
@@ -275,6 +280,8 @@ class CreateDiscussionRequest(BaseModel):
     channel_id: int
     tags: Optional[List[str]] = None
     type: Optional[str] = "discussion"  # "discussion" | "reflection" | "spiced"
+    tagged_user_ids: Optional[List[int]] = None
+    visibility: Optional[str] = "public"  # "public" | "tagged_only"
 
 
 class SpiceDiscussionRequest(BaseModel):
@@ -284,6 +291,7 @@ class SpiceDiscussionRequest(BaseModel):
 class CreateReplyRequest(BaseModel):
     content: str
     parent_reply_id: Optional[int] = None
+    tagged_user_ids: Optional[List[int]] = None
 
 
 class LikeReplyRequest(BaseModel):
@@ -447,6 +455,20 @@ async def get_discussions(
         q = db.query(CommunityDiscussion)
         if channel_id:
             q = q.filter_by(channel_id=channel_id)
+
+        # Enforce Tag-Gated Visibility:
+        # If visibility == 'tagged_only', post is visible ONLY IF user is author, tagged, or moderator/admin
+        is_mod_or_admin = bool(current_user.is_admin or (getattr(current_user, 'role', '') in ('moderator', 'admin')))
+        if not is_mod_or_admin:
+            q = q.filter(
+                or_(
+                    CommunityDiscussion.visibility == 'public',
+                    CommunityDiscussion.visibility == None,
+                    CommunityDiscussion.user_id == current_user.id,
+                    func.cast(CommunityDiscussion.tagged_user_ids, String).contains(str(current_user.id))
+                )
+            )
+
         discussions = q.order_by(CommunityDiscussion.is_pinned.desc(), CommunityDiscussion.created_at.desc()).offset(offset).limit(limit).all()
         # Batch-fetch likes to avoid N+1
         discussion_ids = [d.id for d in discussions]
@@ -664,10 +686,21 @@ async def create_discussion(
     _all_valid_types = {'discussion', 'reflection'} | _TOPIC_SLUGS
     raw_type = (body.type or 'discussion').strip().lower()
     post_type = raw_type if raw_type in _all_valid_types else 'discussion'
+
+    tagged_ids = body.tagged_user_ids or []
+    if not tagged_ids:
+        found_usernames = re.findall(r'@([a-zA-Z0-9_]+)', f"{body.title} {body.content}")
+        if found_usernames:
+            matching = db.query(User.id).filter(func.lower(User.username).in_([u.lower() for u in found_usernames])).all()
+            tagged_ids = [m[0] for m in matching]
+
+    visibility_val = "tagged_only" if body.visibility == "tagged_only" else "public"
+
     d = CommunityDiscussion(
         channel_id=body.channel_id, user_id=current_user.id,
         title=body.title.strip(), content=body.content.strip(),
         tags=body.tags or [], post_type=post_type,
+        tagged_user_ids=tagged_ids, visibility=visibility_val
     )
     db.add(d)
     ch.post_count = (ch.post_count or 0) + 1
@@ -675,6 +708,23 @@ async def create_discussion(
     db.commit()
     db.refresh(d)
     _log_activity(db, current_user.id, "posted", d.id, "discussion", d.title)
+
+    # Trigger notifications for tagged users
+    if tagged_ids:
+        for tagged_id in set(tagged_ids):
+            if tagged_id != current_user.id:
+                try:
+                    n = UserNotification(
+                        user_id=tagged_id,
+                        type="user_tagged",
+                        title="You were tagged in a Build Room post!",
+                        message=f"{current_user.name} tagged you in: \"{d.title[:60]}\"",
+                        link=f"/dashboard/community?discussionId={d.id}"
+                    )
+                    db.add(n)
+                except Exception:
+                    pass
+        db.commit()
 
     # Automatically schedule background AI generation for new posts upon creation
     background_tasks.add_task(_async_generate_takeaways_worker, d.id)
@@ -892,11 +942,19 @@ async def reply_to_discussion(
         if not parent:
             raise HTTPException(status_code=404, detail="Parent reply not found")
 
+    tagged_ids = body.tagged_user_ids or []
+    if not tagged_ids:
+        found_usernames = re.findall(r'@([a-zA-Z0-9_]+)', body.content)
+        if found_usernames:
+            matching = db.query(User.id).filter(func.lower(User.username).in_([u.lower() for u in found_usernames])).all()
+            tagged_ids = [m[0] for m in matching]
+
     reply = DiscussionReply(
         discussion_id=discussion_id,
         user_id=current_user.id,
         content=body.content.strip(),
         parent_reply_id=parent_reply_id,
+        tagged_user_ids=tagged_ids
     )
     db.add(reply)
     # Count all replies (including nested) so comment badge is accurate
@@ -913,11 +971,26 @@ async def reply_to_discussion(
                 type="community_reply",
                 title=f"{current_user.name or 'Someone'} replied to your post",
                 message=body.content.strip()[:120],
-                link=f"/dashboard/community/post/{discussion_id}",
+                link=f"/dashboard/community?discussionId={discussion_id}",
                 is_read=False,
             )
             db.add(notif)
-            db.commit()
+
+        # Notify tagged users in reply
+        if tagged_ids:
+            for tagged_id in set(tagged_ids):
+                if tagged_id != current_user.id and tagged_id != d.user_id:
+                    n = UserNotification(
+                        user_id=tagged_id,
+                        type="user_tagged",
+                        title="You were tagged in a reply!",
+                        message=f"{current_user.name} tagged you in a reply on: \"{d.title[:60]}\"",
+                        link=f"/dashboard/community?discussionId={discussion_id}",
+                        is_read=False
+                    )
+                    db.add(n)
+
+        db.commit()
     except Exception as notif_err:
         logger.warning(f"Notification creation failed: {notif_err}")
 
@@ -1286,3 +1359,36 @@ async def get_user_profile(
         "pinned_posts": pinned_posts,
         "joined_at": user.created_at.isoformat() if getattr(user, "created_at", None) else None,
     }}
+
+
+@router.get("/users/search")
+async def search_community_users(
+    q: str = Query("", min_length=1),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        search_str = f"%{q.strip().lower()}%"
+        users = db.query(User).filter(
+            or_(
+                func.lower(User.name).like(search_str),
+                func.lower(User.username).like(search_str),
+                func.lower(User.email).like(search_str)
+            )
+        ).limit(10).all()
+
+        results = []
+        for u in users:
+            username_val = u.username or re.sub(r'[^a-zA-Z0-9]', '', u.name.lower() if u.name else "user")
+            results.append({
+                "id": u.id,
+                "name": u.name or "Member",
+                "username": username_val,
+                "avatar_url": u.avatar_url,
+                "company_name": u.company_name or "Lavoo Creators"
+            })
+
+        return {"success": True, "users": results}
+    except Exception as e:
+        logger.error(f"Error searching community users: {e}")
+        return {"success": True, "users": []}

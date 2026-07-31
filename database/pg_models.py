@@ -111,6 +111,7 @@ class User(Base):
     avatar_url = Column(Text, nullable=True)
 
     # Refined Profile & Privacy Fields
+    username = Column(String(100), unique=True, index=True, nullable=True)
     pinned_profile_post_ids = Column(JSON, nullable=True, default=list)
     hide_public_metrics = Column(Boolean, default=False)
     expertise = Column(JSON, nullable=True, default=list)
@@ -1672,6 +1673,8 @@ class CommunityDiscussion(Base):
     ai_takeaways = Column(JSON, nullable=True)
     is_pinned = Column(Boolean, default=False)
     post_type = Column(String(50), default="discussion")  # discussion | reflection | spiced
+    tagged_user_ids = Column(JSON, nullable=True, default=list)  # array of tagged user IDs
+    visibility = Column(String(30), default="public")  # public | tagged_only
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     channel = relationship("CommunityChannel", back_populates="discussions")
@@ -1688,6 +1691,7 @@ class DiscussionReply(Base):
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     parent_reply_id = Column(Integer, ForeignKey("discussion_replies.id", ondelete="CASCADE"), nullable=True)
     content = Column(Text, nullable=False)
+    tagged_user_ids = Column(JSON, nullable=True, default=list)  # array of tagged user IDs
     like_count = Column(Integer, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     discussion = relationship("CommunityDiscussion", back_populates="replies")

@@ -17,6 +17,7 @@ router = APIRouter(prefix="/api/profile", tags=["profile"])
 class ProfileUpdateRequest(BaseModel):
     """Profile update request model"""
     name: Optional[str] = None
+    username: Optional[str] = None
     company_name: Optional[str] = None
     industry: Optional[str] = None
     location: Optional[str] = None
@@ -62,9 +63,12 @@ def get_profile(
                 "created_at": d.created_at.isoformat() if d.created_at else None
             })
 
+    username_val = getattr(current_user, 'username', None) or re.sub(r'[^a-zA-Z0-9]', '', current_user.name.lower() if current_user.name else 'user')
+
     return {
         "id": current_user.id,
         "name": current_user.name,
+        "username": username_val,
         "email": current_user.email,
         "company_name": current_user.company_name or "Lavoo Creators",
         "industry": current_user.industry or "Software",
@@ -72,6 +76,8 @@ def get_profile(
         "venture_stage": getattr(current_user, 'venture_stage', None) or "Pre-revenue",
         "bio": current_user.bio,
         "avatar_url": current_user.avatar_url,
+        "role": getattr(current_user, 'role', 'normal_user') or 'normal_user',
+        "is_admin": bool(getattr(current_user, 'is_admin', False)),
         "subscription_status": current_user.subscription_status or "Free",
         "subscription_plan": current_user.subscription_plan,
         "is_beta_user": getattr(current_user, 'is_beta_user', False),
@@ -102,6 +108,12 @@ def update_profile(
         # Update fields if provided
         if profile_data.name is not None:
             current_user.name = profile_data.name
+        if profile_data.username is not None and profile_data.username.strip():
+            clean_username = re.sub(r'[^a-zA-Z0-9_]', '', profile_data.username.strip().lower())
+            existing = db.query(User).filter(User.username == clean_username, User.id != current_user.id).first()
+            if existing:
+                raise HTTPException(status_code=400, detail="Username is already taken.")
+            current_user.username = clean_username
         if profile_data.company_name is not None:
             current_user.company_name = profile_data.company_name
         if profile_data.industry is not None:
