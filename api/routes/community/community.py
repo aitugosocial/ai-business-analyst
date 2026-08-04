@@ -24,6 +24,7 @@ from database.pg_models import (
     UserNotification, FounderInsightCard,
 )
 from api.routes.auth.login import get_current_user
+from api.routes.dependencies import get_current_user_optional
 from api.routes.user.missions import _flatten_roadmap_tasks
 from api.cache import get_cached, set_cached, delete_cached
 
@@ -307,7 +308,7 @@ class SaveItemRequest(BaseModel):
 
 @router.get("/stats")
 async def get_community_stats(
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user_optional),
     db: Session = Depends(get_db)
 ):
     try:
@@ -315,7 +316,7 @@ async def get_community_stats(
         total_discussions = db.query(CommunityDiscussion).count()
         total_events = db.query(CommunityEvent).filter_by(is_published=True).count()
         total_members = db.query(User).count()
-        user_channels = db.query(ChannelMember).filter_by(user_id=current_user.id).count()
+        user_channels = db.query(ChannelMember).filter_by(user_id=current_user.id).count() if current_user else 0
 
         return {"success": True, "data": {
             "total_channels": total_channels,
@@ -349,20 +350,20 @@ async def get_my_channels(
 @router.get("/channels/{channel_name}")
 async def get_channel_by_name(
     channel_name: str,
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user_optional),
     db: Session = Depends(get_db)
 ):
     ch = db.query(CommunityChannel).filter_by(slug=channel_name).first()
     if not ch:
         raise HTTPException(status_code=404, detail="Channel not found")
-    joined = {m.channel_id for m in db.query(ChannelMember.channel_id).filter_by(user_id=current_user.id).all()}
+    joined = {m.channel_id for m in db.query(ChannelMember.channel_id).filter_by(user_id=current_user.id).all()} if current_user else set()
     return {"success": True, "data": _channel_dict(ch, joined)}
 
 
 @router.get("/channels")
 async def get_channels(
     category: Optional[str] = Query(None),
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user_optional),
     db: Session = Depends(get_db)
 ):
     try:
@@ -372,7 +373,7 @@ async def get_channels(
             q = q.filter(CommunityChannel.category == category)
         channels = q.order_by(CommunityChannel.member_count.desc()).all()
         # Batch-fetch memberships to avoid N+1
-        joined = {m.channel_id for m in db.query(ChannelMember.channel_id).filter_by(user_id=current_user.id).all()}
+        joined = {m.channel_id for m in db.query(ChannelMember.channel_id).filter_by(user_id=current_user.id).all()} if current_user else set()
         return {"success": True, "data": [_channel_dict(ch, joined) for ch in channels]}
     except Exception as e:
         logger.error(f"Get channels error: {e}")
@@ -443,11 +444,12 @@ async def get_discussions(
     channel_id: Optional[int] = Query(None),
     limit: int = Query(20, le=100),
     offset: int = Query(0),
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user_optional),
     db: Session = Depends(get_db)
 ):
     try:
-        cache_key = f"community:discussions:user:{current_user.id}:ch:{channel_id}:lim:{limit}:off:{offset}"
+        user_id_str = str(current_user.id) if current_user else "anon"
+        cache_key = f"community:discussions:user:{user_id_str}:ch:{channel_id}:lim:{limit}:off:{offset}"
         cached = await get_cached(cache_key)
         if cached is not None:
             return cached
@@ -458,16 +460,24 @@ async def get_discussions(
 
         # Enforce Tag-Gated Visibility:
         # If visibility == 'tagged_only', post is visible ONLY IF user is author, tagged, or moderator/admin
-        is_mod_or_admin = bool(current_user.is_admin or (getattr(current_user, 'role', '') in ('moderator', 'admin')))
+        is_mod_or_admin = bool(current_user and (current_user.is_admin or (getattr(current_user, 'role', '') in ('moderator', 'admin'))))
         if not is_mod_or_admin:
-            q = q.filter(
-                or_(
-                    CommunityDiscussion.visibility == 'public',
-                    CommunityDiscussion.visibility == None,
-                    CommunityDiscussion.user_id == current_user.id,
-                    func.cast(CommunityDiscussion.tagged_user_ids, String).contains(str(current_user.id))
+            if current_user:
+                q = q.filter(
+                    or_(
+                        CommunityDiscussion.visibility == 'public',
+                        CommunityDiscussion.visibility == None,
+                        CommunityDiscussion.user_id == current_user.id,
+                        func.cast(CommunityDiscussion.tagged_user_ids, String).contains(str(current_user.id))
+                    )
                 )
-            )
+            else:
+                q = q.filter(
+                    or_(
+                        CommunityDiscussion.visibility == 'public',
+                        CommunityDiscussion.visibility == None
+                    )
+                )
 
         discussions = q.order_by(CommunityDiscussion.is_pinned.desc(), CommunityDiscussion.created_at.desc()).offset(offset).limit(limit).all()
         # Batch-fetch likes to avoid N+1
@@ -475,7 +485,7 @@ async def get_discussions(
         liked = {l.discussion_id for l in db.query(DiscussionLike.discussion_id).filter(
             DiscussionLike.user_id == current_user.id,
             DiscussionLike.discussion_id.in_(discussion_ids)
-        ).all()} if discussion_ids else set()
+        ).all()} if (current_user and discussion_ids) else set()
         result = [_discussion_dict(d, liked, current_user=current_user) for d in discussions]
 
         # Include mission roadmap comments from users who opted in.
@@ -605,7 +615,7 @@ async def get_discussions(
 async def get_discussion(
     discussion_id: int,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user_optional),
     db: Session = Depends(get_db)
 ):
     d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
@@ -637,7 +647,7 @@ async def get_discussion(
     top_level = [r for r in d.replies if r.parent_reply_id is None]
     replies = [_serialise_reply(r) for r in top_level]
 
-    liked = {d.id} if db.query(DiscussionLike).filter_by(user_id=current_user.id, discussion_id=d.id).first() else set()
+    liked = {d.id} if (current_user and db.query(DiscussionLike).filter_by(user_id=current_user.id, discussion_id=d.id).first()) else set()
     data = _discussion_dict(d, liked, current_user=current_user)
     data["replies"] = replies
     return {"success": True, "data": data}
@@ -647,14 +657,14 @@ async def get_discussion(
 async def get_discussion_takeaways(
     discussion_id: int,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user_optional),
     db: Session = Depends(get_db)
 ):
     d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
     if not d:
         raise HTTPException(status_code=404, detail="Discussion not found")
 
-    is_subscribed = getattr(current_user, 'subscription_status', None) in ("active", "trialing")
+    is_subscribed = bool(current_user and getattr(current_user, 'subscription_status', None) in ("active", "trialing"))
     if not is_subscribed:
         return {"status": "locked", "has_takeaways": True, "takeaways": None}
 
@@ -1208,7 +1218,7 @@ async def get_my_community_profile(
 @router.get("/leaderboard")
 async def get_leaderboard(
     limit: int = Query(10, le=50),
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user_optional),
     db: Session = Depends(get_db)
 ):
     top_users = db.query(User).filter(User.is_active == True)\
@@ -1270,17 +1280,21 @@ async def unsave_item(
     return {"success": True, "message": "Item unsaved"}
 
 
-@router.get("/users/{user_id}/profile")
+@router.get("/users/{user_identifier}/profile")
 async def get_user_profile(
-    user_id: int,
-    current_user: User = Depends(get_current_user),
+    user_identifier: str,
+    current_user: Optional[User] = Depends(get_current_user_optional),
     db: Session = Depends(get_db)
 ):
-    user = db.query(User).filter_by(id=user_id).first()
+    if user_identifier.isdigit():
+        user = db.query(User).filter_by(id=int(user_identifier)).first()
+    else:
+        user = db.query(User).filter(func.lower(User.username) == user_identifier.lower()).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    is_owner = (current_user.id == user.id)
+    user_id = user.id
+    is_owner = (current_user.id == user.id) if current_user else False
     hide_metrics = getattr(user, 'hide_public_metrics', False) and not is_owner
 
     posts_count = db.query(func.count(CommunityDiscussion.id)).filter(CommunityDiscussion.user_id == user_id).scalar() or 0

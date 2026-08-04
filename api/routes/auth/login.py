@@ -94,10 +94,12 @@ pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
 def get_effective_role(user: User) -> str:
     """Return the role value expected by the frontend while preserving database roles."""
+    if getattr(user, "is_admin", False):
+        return "admin"
     user_role = getattr(user, "role", None)
     if user_role in {UserRole.MODERATOR.value, UserRole.NORMAL.value}:
         return user_role
-    return "admin" if getattr(user, "is_admin", False) else "user"
+    return "user"
 
 
 def build_auth_response_payload(
