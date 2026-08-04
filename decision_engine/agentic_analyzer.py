@@ -1707,6 +1707,13 @@ OUTPUT FORMAT (JSON only, no markdown):
                 logger.info("Backfilled roadmap to exactly 7 tasks using real action-plan steps")
             result["execution_roadmap"] = roadmap
 
+        if not result.get("motivational_quote"):
+            logger.warning("Roadmap response was missing motivational_quote — using fallback")
+            result["motivational_quote"] = (
+                "The weight you feel right now is real, but it's also proof you're finally "
+                "looking at the actual problem instead of its symptoms — that's the hardest part, and you're already past it."
+            )
+
         logger.info(
             f"Created {result['total_phases']}-phase roadmap ({result['estimated_days']} days)"
         )
