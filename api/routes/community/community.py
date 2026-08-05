@@ -805,11 +805,12 @@ async def like_discussion(
     # Notify post owner (skip when liking own post)
     try:
         if d.user_id and d.user_id != current_user.id:
+            actor_name = current_user.name or 'Someone'
             notif = UserNotification(
                 user_id=d.user_id,
                 type="community_cooked",
-                title=f"{current_user.name or 'Someone'} cooked your post",
-                message=f"{current_user.name or 'Someone'} liked your post '{d.title[:60]}'",
+                title=f"{actor_name} thinks you cooked.",
+                message=f"{actor_name} thinks you cooked with your post '{d.title[:60]}'",
                 link=f"/dashboard/community/post/{discussion_id}",
                 is_read=False,
             )
