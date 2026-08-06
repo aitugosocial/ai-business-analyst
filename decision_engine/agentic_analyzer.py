@@ -1056,8 +1056,14 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
                     if not canonical or canonical.lower() in assigned_tool_names_lower:
                         continue
 
+                    tool_record = all_tools[canonical]
+                    is_step_cited = bool(tool_record.get("_step_cited"))
+
+                    # A step-cited tool was named explicitly inside the plan's
+                    # own step text — the plan itself already decided this
+                    # tool belongs here, so task_relevance is self-evident.
                     scores = candidate.get("scores", {}) or {}
-                    if not _passes_gate(scores):
+                    if not is_step_cited and not _passes_gate(scores):
                         logger.info(
                             f"Rejected '{canonical}' for plan {plan_idx + 1} step {step_idx + 1}: "
                             f"scores {scores} did not clear {self._STEP_TOOL_PASS_THRESHOLD}/5 pass bar"
@@ -1065,9 +1071,8 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
                         continue
 
                     what_it_helps = (candidate.get("what_it_helps") or "").strip()
-                    tool_record = all_tools[canonical]
                     if not what_it_helps:
-                        is_stub = tool_record.get("_step_cited") or not tool_record.get("url")
+                        is_stub = is_step_cited or not tool_record.get("url")
                         if is_stub:
                             # No step-specific text from the LLM and no real DB
                             # description to fall back on — showing the internal
@@ -1368,15 +1373,29 @@ OUTPUT FORMAT (JSON only, no markdown fences):
         recommendation_mode: str = "automation_stack",
     ) -> Dict[str, Any]:
         """
-        Stage 3B: Compose up to 3 automation stacks (algorithmic only).
+        Stage 3B: Compose up to 3 automation stacks (algorithmic only), plus a
+        single_tool_recommendation when recommendation_mode calls for one.
+
+        Automation stacks are computed for EVERY analysis regardless of mode.
+        recommendation_mode reflects one coarse LLM judgment about the
+        analysis's single PRIMARY bottleneck — it says nothing about whether
+        an individual step elsewhere in the plans would benefit from a
+        multi-tool workflow. Gating recommend_automation_stacks on it used to
+        silently suppress the entire step-attached-automation-stack feature
+        for any analysis judged single_tool at the top level.
         LLM enrichment is deferred to a BackgroundTask in the route layer.
         """
-        try:
-            if recommendation_mode == "single_tool":
-                action_plans_for_tool = action_plans_result.get("action_plans", []) or []
-                return await self._recommend_single_tool(user_query, action_plans_for_tool)
+        action_plans = action_plans_result.get("action_plans", []) or []
 
-            action_plans = action_plans_result.get("action_plans", []) or []
+        single_tool_recommendation = None
+        if recommendation_mode == "single_tool":
+            try:
+                single_result = await self._recommend_single_tool(user_query, action_plans)
+                single_tool_recommendation = single_result.get("single_tool_recommendation")
+            except Exception as e:
+                logger.error(f"Single-tool recommendation failed: {e}", exc_info=True)
+
+        try:
             # Synchronous + potentially slow on a cache miss (full-catalog
             # re-embedding) — see _search_ai_tools for why this must not run
             # directly on the event loop.
@@ -1405,7 +1424,7 @@ OUTPUT FORMAT (JSON only, no markdown fences):
                 valid_stacks.append(stack)
 
             logger.info(f"Built {len(valid_stacks)} raw automation stacks (enrichment deferred)")
-            return {"recommended_tool_stacks": valid_stacks, "single_tool_recommendation": None}
+            return {"recommended_tool_stacks": valid_stacks, "single_tool_recommendation": single_tool_recommendation}
 
         except Exception as e:
             logger.error(f"Stage 3B failed: {e}", exc_info=True)
@@ -1413,7 +1432,7 @@ OUTPUT FORMAT (JSON only, no markdown fences):
                 self.db.rollback()
             except Exception:
                 pass
-            return {"recommended_tool_stacks": [], "single_tool_recommendation": None}
+            return {"recommended_tool_stacks": [], "single_tool_recommendation": single_tool_recommendation}
 
     async def _recommend_single_tool(self, user_query: str, action_plans: list = None) -> Dict[str, Any]:
         """
