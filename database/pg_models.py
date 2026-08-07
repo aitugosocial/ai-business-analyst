@@ -88,6 +88,7 @@ class User(Base):
     bio = Column(Text, nullable=True)
     two_factor_enabled = Column(Boolean, default=False)
     email_notifications = Column(Boolean, default=True)
+    share_reflections = Column(Boolean, default=True, server_default="true")
 
     # Beta and Stripe Columns
     is_beta_user = Column(Boolean, default=False)

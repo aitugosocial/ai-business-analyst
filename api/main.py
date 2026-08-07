@@ -617,6 +617,24 @@ async def run_new_alert_notifications_job():
             logger.error("[alert-notify-job] error: %s", exc, exc_info=True)
 
 
+async def run_scheduled_reflections_job():
+    """
+    Runs every 5 minutes in the background inside FastAPI.
+    Processes completed mission notes for users who opted in ('show_mission_comments_in_community'),
+    synthesizes catching single-sentence Reflections, and awards +50 Chops.
+    Zero external cron deployment needed!
+    """
+    while True:
+        await asyncio.sleep(5 * 60)
+        try:
+            from database.pg_connections import SessionLocal
+            from api.routes.community.community import cron_process_pending_reflections
+            with SessionLocal() as db:
+                await cron_process_pending_reflections(db=db)
+        except Exception as exc:
+            logger.error("[reflections-job] error: %s", exc)
+
+
 def run_heavy_schema_migrations():
     """
     Background task that performs all non-critical, potentially slow schema
@@ -1106,6 +1124,7 @@ async def startup_event():
     asyncio.create_task(run_scheduled_scans())
     asyncio.create_task(run_subscription_expiry_job())
     asyncio.create_task(run_new_alert_notifications_job())
+    asyncio.create_task(run_scheduled_reflections_job())
 
     try:
         # --- MINIMAL WORK REQUIRED FOR "Application startup complete" ---
