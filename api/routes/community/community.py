@@ -452,7 +452,15 @@ async def get_discussions(
         cache_key = f"community:discussions:user:{user_id_str}:ch:{channel_id}:lim:{limit}:off:{offset}"
         cached = await get_cached(cache_key)
         if cached is not None:
-            return cached
+            # Bypass stale cache if any reflection item is missing mission_task
+            has_stale_reflection = False
+            if isinstance(cached, list):
+                for item in cached:
+                    if isinstance(item, dict) and item.get("type") == "mission_reflection" and not item.get("mission_task"):
+                        has_stale_reflection = True
+                        break
+            if not has_stale_reflection:
+                return cached
 
         q = db.query(CommunityDiscussion)
         if channel_id:
@@ -529,22 +537,17 @@ async def get_discussions(
                             continue
                         for comment in comments:
                             text = comment.get('text', '').strip()
-                            if not text:
+                            # Filter out empty and trivial single-word test placeholders
+                            if not text or len(text) < 5 or text.lower().strip('.!') in ('test', 'testing', 'tes', 'tesst', 'text', 'test2', 'tessssst', 'reesss', 'done', 'testtt'):
                                 continue
                             created_at = comment.get('createdAt')
                             comment_id = comment.get('id', f"rc_{analysis.id}_{task_id}")
-                            mission_title = task_summaries.get(task_id)
-                            if mission_title is None:
-                                full_title = mission_titles.get(task_id)
-                                if full_title:
-                                    mission_title = _summarize_mission_title(full_title)
-                                    task_summaries[task_id] = mission_title
-                                    any_summaries_changed = True
-                                    analysis_summaries_changed = True
+                            full_title = mission_titles.get(task_id) or ""
                             result.append({
                                 "id": f"rc_{comment_id}",
-                                "type": "reflection",
-                                "title": mission_title if mission_title else text[:80],
+                                "type": "mission_reflection",
+                                "title": full_title if full_title else text[:80],
+                                "mission_task": full_title if full_title else text[:80],
                                 "content": text,
                                 "excerpt": text[:160],
                                 "tags": [],
@@ -575,33 +578,65 @@ async def get_discussions(
         except Exception as reflection_err:
             logger.warning(f"Mission reflections fetch error: {reflection_err}")
 
-        # Interleave Founder Insights into the discussion stream (1 insight every 4 posts)
+        # Interleave Founder Insights & Reflections into the discussion stream (4 Standard : 1 Insight : 4 Standard : 1 Reflection)
         try:
-            insights = db.query(FounderInsightCard).filter(FounderInsightCard.is_active == True).order_by(FounderInsightCard.created_at.desc()).all()
-            if insights and result:
+            insights_raw = db.query(FounderInsightCard).filter(FounderInsightCard.is_active == True).order_by(FounderInsightCard.created_at.desc()).all()
+            insight_cards = [{
+                "id": f"insight_{card.id}",
+                "type": "founder_insight",
+                "isStat": True,
+                "big": card.highlight_stat or "",
+                "highlight_stat": card.highlight_stat or "",
+                "headline": card.insight_text,
+                "insight_text": card.insight_text,
+                "source": card.source,
+                "accent": card.accent_color or "#e87a02",
+                "accent_color": card.accent_color or "#e87a02",
+                "created_at": card.created_at.isoformat() if card.created_at else None
+            } for card in insights_raw]
+
+            std_posts = [p for p in result if p.get("type") != "mission_reflection"]
+            ref_posts = sorted(
+                [p for p in result if p.get("type") == "mission_reflection"],
+                key=lambda x: str(x.get("created_at") or ""),
+                reverse=True
+            )
+
+            if (insight_cards or ref_posts) and std_posts:
                 interleaved = []
-                insight_idx = 0
-                for i, post_item in enumerate(result):
-                    interleaved.append(post_item)
-                    if (i + 1) % 4 == 0 and insight_idx < len(insights):
-                        card = insights[insight_idx % len(insights)]
-                        interleaved.append({
-                            "id": f"insight_{card.id}",
-                            "type": "founder_insight",
-                            "isStat": True,
-                            "big": card.highlight_stat or "",
-                            "highlight_stat": card.highlight_stat or "",
-                            "headline": card.insight_text,
-                            "insight_text": card.insight_text,
-                            "source": card.source,
-                            "accent": card.accent_color or "#e87a02",
-                            "accent_color": card.accent_color or "#e87a02",
-                            "created_at": card.created_at.isoformat() if card.created_at else None
-                        })
-                        insight_idx += 1
+                std_i, ins_i, ref_i = 0, 0, 0
+                cycle = 0
+
+                while std_i < len(std_posts) or ins_i < len(insight_cards) or ref_i < len(ref_posts):
+                    # 1. Add up to 4 standard posts
+                    for _ in range(4):
+                        if std_i < len(std_posts):
+                            interleaved.append(std_posts[std_i])
+                            std_i += 1
+
+                    # 2. Alternating cadence: Even cycle = Insight, Odd cycle = Reflection
+                    if cycle % 2 == 0:
+                        if ins_i < len(insight_cards):
+                            interleaved.append(insight_cards[ins_i % len(insight_cards)])
+                            ins_i += 1
+                        elif ref_i < len(ref_posts):
+                            interleaved.append(ref_posts[ref_i])
+                            ref_i += 1
+                    else:
+                        if ref_i < len(ref_posts):
+                            interleaved.append(ref_posts[ref_i])
+                            ref_i += 1
+                        elif ins_i < len(insight_cards):
+                            interleaved.append(insight_cards[ins_i % len(insight_cards)])
+                            ins_i += 1
+
+                    cycle += 1
+                    if std_i >= len(std_posts) and ins_i >= len(insight_cards) and ref_i >= len(ref_posts):
+                        break
+
                 result = interleaved
-        except Exception as insight_err:
-            logger.warning(f"Founder insight interleaving error: {insight_err}")
+        except Exception as interleave_err:
+            logger.warning(f"Feed interleaving error: {interleave_err}")
 
         response = {"success": True, "data": result}
         await set_cached(cache_key, response, ttl_seconds=15)
@@ -609,6 +644,51 @@ async def get_discussions(
     except Exception as e:
         logger.error(f"Get discussions error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch discussions")
+
+@router.post("/cron/process-reflections")
+async def cron_process_pending_reflections(db: Session = Depends(get_db)):
+    """
+    Background Cron Service: Runs every 5 minutes to process completed mission reflections,
+    respecting the user's 'show_mission_comments_in_community' preference setting.
+    """
+    try:
+        opted_in_user_ids = {
+            row[0] for row in db.query(UserSettings.user_id).filter(
+                UserSettings.show_mission_comments_in_community == True
+            ).all()
+        }
+
+        completed_analyses = db.query(BusinessAnalysis).filter(
+            BusinessAnalysis.status == "completed"
+        ).order_by(BusinessAnalysis.updated_at.desc()).limit(20).all()
+
+        published_count = 0
+        for analysis in completed_analyses:
+            if analysis.user_id not in opted_in_user_ids:
+                continue
+
+            up = analysis.user_progress or {}
+            roadmap_comments = up.get("roadmap_comments", {}) if isinstance(up, dict) else {}
+            if not isinstance(roadmap_comments, dict) or not roadmap_comments:
+                continue
+
+            for task_id, comments in roadmap_comments.items():
+                if not isinstance(comments, list):
+                    continue
+                for comment in comments:
+                    text = comment.get("text", "").strip()
+                    if not text:
+                        continue
+                    user = db.query(User).filter_by(id=analysis.user_id).first()
+                    if user:
+                        user.total_chops = (user.total_chops or 0) + 50
+                        published_count += 1
+
+        db.commit()
+        return {"success": True, "published_count": published_count}
+    except Exception as e:
+        logger.error(f"Cron process reflections error: {e}")
+        return {"success": False, "error": str(e)}
 
 
 @router.get("/discussions/{discussion_id}")
@@ -894,7 +974,7 @@ async def spice_discussion(
     spiced_post = CommunityDiscussion(
         channel_id=d.channel_id,
         user_id=current_user.id,
-        title=f"Spiced: {d.title[:80]}",
+        title=d.title[:80],
         content=content_text,
         tags=d.tags or [],
         post_type="spiced",
