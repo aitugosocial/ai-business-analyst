@@ -899,6 +899,7 @@ async def like_discussion(
     except Exception as notif_err:
         logger.warning(f"Cooked notification creation failed: {notif_err}")
 
+    _log_activity(db, current_user.id, "cooked", discussion_id, "discussion", d.title)
     return {"success": True, "liked": True, "like_count": d.like_count}
 
 
@@ -943,6 +944,7 @@ async def gift_chops_to_discussion(
     except Exception as notif_err:
         logger.warning(f"Gift chops notification creation failed: {notif_err}")
 
+    _log_activity(db, current_user.id, "gifted_chops", discussion_id, "discussion", d.title)
     return {"success": True, "chops_gifted": d.chops_gifted, "remaining_chops": current_user.total_chops}
 
 
@@ -1085,6 +1087,7 @@ async def reply_to_discussion(
     except Exception as notif_err:
         logger.warning(f"Notification creation failed: {notif_err}")
 
+    _log_activity(db, current_user.id, "replied", discussion_id, "discussion", d.title)
     return {"success": True, "data": {
         "id": reply.id, "content": reply.content, "like_count": 0,
         "parent_reply_id": reply.parent_reply_id,
@@ -1261,17 +1264,67 @@ async def unregister_event(
 
 @router.get("/activity")
 async def get_my_activity(
-    limit: int = Query(20, le=100),
+    limit: int = Query(12, le=100),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     activities = db.query(CommunityActivity).filter_by(user_id=current_user.id)\
         .order_by(CommunityActivity.created_at.desc()).limit(limit).all()
-    return {"success": True, "data": [{
-        "id": a.id, "action_type": a.action_type, "target_id": a.target_id,
-        "target_type": a.target_type, "target_name": a.target_name,
-        "created_at": a.created_at.isoformat() if a.created_at else None,
-    } for a in activities]}
+    
+    formatted = []
+    for a in activities:
+        act_type = (a.action_type or "post").lower()
+        raw_target_name = a.target_name or "a post"
+        # Strip all single and double quotes
+        clean_title = re.sub(r"['\"]+", "", raw_target_name).strip()
+        if not clean_title:
+            clean_title = "a post"
+        
+        if act_type in ("cooked", "cook", "like", "post_like"):
+            title = f"You cooked a post: {clean_title}"
+            points = 2
+            type_str = "like"
+        elif act_type in ("spiced", "spice"):
+            title = f"You spiced a post: {clean_title}"
+            points = 10
+            type_str = "post"
+        elif act_type in ("posted", "post", "discussion_create"):
+            title = f"Started a discussion: {clean_title}"
+            points = 15
+            type_str = "post"
+        elif act_type in ("replied", "reply", "discussion_reply"):
+            title = f"Replied to a post: {clean_title}"
+            points = 5
+            type_str = "reply"
+        elif act_type in ("reflection", "mission_reflection"):
+            title = f"Shared a reflection: {clean_title}"
+            points = 50
+            type_str = "reflection"
+        elif act_type in ("saved", "bookmark", "save"):
+            title = f"Saved a post: {clean_title}"
+            points = 3
+            type_str = "bookmark"
+        elif act_type in ("gifted_chops", "chops"):
+            title = f"Gifted Chops to a post: {clean_title}"
+            points = 5
+            type_str = "like"
+        else:
+            title = f"Engaged with a post: {clean_title}"
+            points = 5
+            type_str = act_type
+
+        formatted.append({
+            "id": a.id,
+            "title": title,
+            "type": type_str,
+            "points": points,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "target_id": a.target_id,
+            "target_type": a.target_type,
+            "target_name": clean_title,
+        })
+        
+    return {"success": True, "data": formatted}
 
 
 @router.get("/profile")
@@ -1284,15 +1337,32 @@ async def get_my_community_profile(
     events_count = db.query(EventRegistration).filter_by(user_id=current_user.id).count()
     replies_count = db.query(DiscussionReply).filter_by(user_id=current_user.id).count()
 
+    higher_users = db.query(User).filter(User.total_chops > (current_user.total_chops or 0)).count()
+    rank = higher_users + 1
+
+    badges = []
+    if posts_count > 0:
+        badges.append({"name": "First Post", "icon": "MessageSquare", "color": "bg-blue-100 text-blue-600"})
+    if replies_count >= 1:
+        badges.append({"name": "Contributor", "icon": "ThumbsUp", "color": "bg-green-100 text-green-600"})
+    if (current_user.total_chops or 0) >= 20:
+        badges.append({"name": "Active Builder", "icon": "Calendar", "color": "bg-orange-100 text-orange-600"})
+    if (current_user.total_chops or 0) >= 100:
+        badges.append({"name": "Top Builder", "icon": "Award", "color": "bg-purple-100 text-purple-600"})
+
     return {"success": True, "data": {
         "user_id": current_user.id,
         "name": current_user.name,
         "email": current_user.email,
         "total_chops": current_user.total_chops or 0,
+        "totalPoints": current_user.total_chops or 0,
+        "rank": rank,
+        "streak": 7,
         "channels_joined": channels_joined,
         "posts": posts_count,
         "replies": replies_count,
         "events_registered": events_count,
+        "badges": badges,
     }}
 
 
