@@ -286,7 +286,7 @@ async def set_cached(key: str, value: Any, ttl_seconds: int = 300):
 
 async def delete_cached(key: str):
     """
-    Remove a single key from the active cache backend (idempotent).
+    Remove a single key or pattern of keys (containing '*') from the active cache backend.
 
     Safe to call regardless of whether Redis or in-memory is active.
     """
@@ -295,10 +295,25 @@ async def delete_cached(key: str):
     full_key = f"aianalyst:{key}"
 
     try:
-        if redis_client:
-            await redis_client.delete(full_key)
+        if "*" in key:
+            if redis_client:
+                keys = []
+                async for k in redis_client.scan_iter(match=full_key):
+                    keys.append(k)
+                if keys:
+                    await redis_client.delete(*keys)
+                    logger.debug(f"Invalidated {len(keys)} Redis keys for '{key}'")
+            else:
+                import fnmatch
+                to_delete = [k for k in list(_memory_cache.keys()) if fnmatch.fnmatch(k, full_key)]
+                for k in to_delete:
+                    _memory_cache.pop(k, None)
+                logger.debug(f"Invalidated {len(to_delete)} memory keys for '{key}'")
         else:
-            _memory_cache.pop(full_key, None)
+            if redis_client:
+                await redis_client.delete(full_key)
+            else:
+                _memory_cache.pop(full_key, None)
 
         logger.debug(f"Deleted cache key '{key}'")
     except Exception as e:
