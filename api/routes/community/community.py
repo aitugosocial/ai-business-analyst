@@ -17,7 +17,7 @@ from database.pg_connections import get_db, SessionLocal
 from database.pg_models import (
     User,
     CommunityChannel, ChannelMember,
-    CommunityDiscussion, DiscussionReply, DiscussionLike,
+    CommunityDiscussion, DiscussionReply, DiscussionLike, DiscussionBookmark,
     CommunityEvent, EventRegistration,
     CommunityActivity, SavedItem,
     UserSettings, BusinessAnalysis,
@@ -220,7 +220,7 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, sa
         "pinned": d.is_pinned, "is_pinned": d.is_pinned,
         "hot": d.like_count >= 10,
         "view_count": d.view_count, "has_liked": has_liked, "liked_by_user": has_liked,
-        "isBookmarked": has_saved, "is_saved": has_saved, "saved_by_user": has_saved,
+        "isBookmarked": has_saved, "is_saved": has_saved, "saved_by_user": has_saved, "bookmarked": has_saved,
         "chops_gifted": d.chops_gifted or 0,
         "spice_count": spice_cnt, "spiced": spice_cnt, "spices": spice_cnt,
         "quoted_discussion_id": getattr(d, 'quoted_discussion_id', None),
@@ -466,14 +466,19 @@ async def get_discussions(
                 if current_user and isinstance(cached, list):
                     post_ids = [i.get("id") for i in cached if isinstance(i, dict) and isinstance(i.get("id"), int)]
                     if post_ids:
-                        user_likes = {l.discussion_id for l in db.query(DiscussionLike.discussion_id).filter(
+                        user_likes = {row[0] for row in db.query(DiscussionLike.discussion_id).filter(
                             DiscussionLike.user_id == current_user.id,
                             DiscussionLike.discussion_id.in_(post_ids)
                         ).all()}
-                        user_saves = {s.item_id for s in db.query(SavedItem.item_id).filter(
+                        bm_saves = {row[0] for row in db.query(DiscussionBookmark.discussion_id).filter(
+                            DiscussionBookmark.user_id == current_user.id,
+                            DiscussionBookmark.discussion_id.in_(post_ids)
+                        ).all()}
+                        tbl_saves = {row[0] for row in db.query(SavedItem.item_id).filter(
                             SavedItem.user_id == current_user.id,
                             SavedItem.item_id.in_(post_ids)
                         ).all()}
+                        user_saves = bm_saves.union(tbl_saves)
                         for item in cached:
                             if isinstance(item, dict) and isinstance(item.get("id"), int):
                                 pid = item["id"]
@@ -482,6 +487,7 @@ async def get_discussions(
                                 item["isBookmarked"] = pid in user_saves
                                 item["is_saved"] = pid in user_saves
                                 item["saved_by_user"] = pid in user_saves
+                                item["bookmarked"] = pid in user_saves
                 return cached
 
         q = db.query(CommunityDiscussion)
@@ -512,15 +518,22 @@ async def get_discussions(
         discussions = q.order_by(CommunityDiscussion.is_pinned.desc(), CommunityDiscussion.created_at.desc()).offset(offset).limit(limit).all()
         # Batch-fetch likes and bookmarks to avoid N+1
         discussion_ids = [d.id for d in discussions]
-        liked = {l.discussion_id for l in db.query(DiscussionLike.discussion_id).filter(
+        liked = {row[0] for row in db.query(DiscussionLike.discussion_id).filter(
             DiscussionLike.user_id == current_user.id,
             DiscussionLike.discussion_id.in_(discussion_ids)
         ).all()} if (current_user and discussion_ids) else set()
 
-        saved = {s.item_id for s in db.query(SavedItem.item_id).filter(
+        bm_saved = {row[0] for row in db.query(DiscussionBookmark.discussion_id).filter(
+            DiscussionBookmark.user_id == current_user.id,
+            DiscussionBookmark.discussion_id.in_(discussion_ids)
+        ).all()} if (current_user and discussion_ids) else set()
+
+        tbl_saved = {row[0] for row in db.query(SavedItem.item_id).filter(
             SavedItem.user_id == current_user.id,
             SavedItem.item_id.in_(discussion_ids)
         ).all()} if (current_user and discussion_ids) else set()
+
+        saved = bm_saved.union(tbl_saved)
 
         result = [_discussion_dict(d, liked_ids=liked, saved_ids=saved, current_user=current_user) for d in discussions]
 
@@ -756,7 +769,8 @@ async def get_discussion(
     replies = [_serialise_reply(r) for r in top_level]
 
     liked = {d.id} if (current_user and db.query(DiscussionLike).filter_by(user_id=current_user.id, discussion_id=d.id).first()) else set()
-    data = _discussion_dict(d, liked, current_user=current_user)
+    saved = {d.id} if (current_user and db.query(SavedItem).filter_by(user_id=current_user.id, item_id=d.id).first()) else set()
+    data = _discussion_dict(d, liked_ids=liked, saved_ids=saved, current_user=current_user)
     data["replies"] = replies
     return {"success": True, "data": data}
 
@@ -1297,77 +1311,173 @@ async def get_my_activity(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    q = db.query(CommunityActivity).filter_by(user_id=current_user.id)
-    
-    if type_filter and type_filter != "all":
-        tf = type_filter.lower().strip()
-        if tf in ("post", "discussions"):
-            q = q.filter(CommunityActivity.action_type.in_(["posted", "post", "discussion_create", "spiced", "spice"]))
-        elif tf in ("reply", "replies"):
-            q = q.filter(CommunityActivity.action_type.in_(["replied", "reply", "discussion_reply"]))
-        elif tf in ("like", "cooked", "cook"):
-            q = q.filter(CommunityActivity.action_type.in_(["cooked", "cook", "like", "post_like"]))
-        elif tf in ("reflection", "reflections"):
-            q = q.filter(CommunityActivity.action_type.in_(["reflection", "mission_reflection"]))
-        elif tf in ("bookmark", "bookmarks", "save", "saved"):
-            q = q.filter(CommunityActivity.action_type.in_(["saved", "bookmark", "save"]))
+    tf = type_filter.lower().strip() if type_filter else "all"
+    all_events = []
 
-    activities = q.order_by(CommunityActivity.created_at.desc()).limit(limit).all()
-    
-    formatted = []
-    for a in activities:
-        act_type = (a.action_type or "post").lower()
-        raw_target_name = a.target_name or "a post"
-        # Strip all single and double quotes
-        clean_title = re.sub(r"['\"]+", "", raw_target_name).strip()
-        if not clean_title:
-            clean_title = "a post"
-        
-        if act_type in ("cooked", "cook", "like", "post_like"):
-            title = f"You cooked a post: {clean_title}"
-            points = 2
-            type_str = "like"
-        elif act_type in ("spiced", "spice"):
-            title = f"You spiced a post: {clean_title}"
-            points = 10
-            type_str = "post"
-        elif act_type in ("posted", "post", "discussion_create"):
-            title = f"Started a discussion: {clean_title}"
-            points = 15
-            type_str = "post"
-        elif act_type in ("replied", "reply", "discussion_reply"):
-            title = f"Replied to a post: {clean_title}"
-            points = 5
-            type_str = "reply"
-        elif act_type in ("reflection", "mission_reflection"):
-            title = f"Shared a reflection: {clean_title}"
-            points = 50
-            type_str = "reflection"
-        elif act_type in ("saved", "bookmark", "save"):
-            title = f"Saved a post: {clean_title}"
-            points = 3
-            type_str = "bookmark"
-        elif act_type in ("gifted_chops", "chops"):
-            title = f"Gifted Chops to a post: {clean_title}"
-            points = 5
-            type_str = "like"
-        else:
-            title = f"Engaged with a post: {clean_title}"
-            points = 5
-            type_str = act_type
+    def clean_t(txt: Optional[str]) -> str:
+        if not txt:
+            return "a post"
+        cleaned = re.sub(r"['\"]+", "", txt).strip()
+        return cleaned if cleaned else "a post"
 
-        formatted.append({
-            "id": a.id,
-            "title": title,
-            "type": type_str,
-            "points": points,
-            "created_at": a.created_at.isoformat() if a.created_at else None,
-            "target_id": a.target_id,
-            "target_type": a.target_type,
-            "target_name": clean_title,
-        })
+    # 1. Fetch User's Discussions (Posts & Reflections)
+    if tf in ("all", "post", "discussions", "reflection", "reflections"):
+        discs = db.query(CommunityDiscussion).filter_by(user_id=current_user.id).all()
+        for d in discs:
+            post_type_val = getattr(d, 'post_type', None) or 'discussion'
+            title_text = clean_t(d.title or d.content[:80])
+            
+            if post_type_val == 'reflection':
+                if tf not in ("all", "reflection", "reflections"):
+                    continue
+                action_title = f"Shared a reflection: {title_text}"
+                type_str = "reflection"
+                points = 50
+            else:
+                if tf not in ("all", "post", "discussions"):
+                    continue
+                action_title = f"Started a discussion: {title_text}"
+                type_str = "post"
+                points = 15
+
+            all_events.append({
+                "id": f"disc_{d.id}",
+                "title": action_title,
+                "type": type_str,
+                "points": points,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+                "dt": d.created_at or datetime.min,
+                "target_id": d.id,
+                "target_type": "discussion",
+                "target_name": title_text,
+            })
+
+    # 2. Fetch User's Replies
+    if tf in ("all", "reply", "replies"):
+        replies = db.query(DiscussionReply, CommunityDiscussion)\
+            .join(CommunityDiscussion, DiscussionReply.discussion_id == CommunityDiscussion.id)\
+            .filter(DiscussionReply.user_id == current_user.id).all()
         
-    return {"success": True, "data": formatted}
+        for reply, d in replies:
+            title_text = clean_t(d.title)
+            all_events.append({
+                "id": f"reply_{reply.id}",
+                "title": f"Replied to a post: {title_text}",
+                "type": "reply",
+                "points": 5,
+                "created_at": reply.created_at.isoformat() if reply.created_at else None,
+                "dt": reply.created_at or datetime.min,
+                "target_id": d.id,
+                "target_type": "discussion",
+                "target_name": title_text,
+            })
+
+    # 3. Fetch User's Cooked Posts (Likes)
+    if tf in ("all", "like", "cooked", "cook"):
+        likes = db.query(DiscussionLike, CommunityDiscussion)\
+            .join(CommunityDiscussion, DiscussionLike.discussion_id == CommunityDiscussion.id)\
+            .filter(DiscussionLike.user_id == current_user.id).all()
+
+        for like, d in likes:
+            title_text = clean_t(d.title)
+            all_events.append({
+                "id": f"like_{like.id}",
+                "title": f"You cooked a post: {title_text}",
+                "type": "like",
+                "points": 2,
+                "created_at": like.created_at.isoformat() if like.created_at else None,
+                "dt": like.created_at or datetime.min,
+                "target_id": d.id,
+                "target_type": "discussion",
+                "target_name": title_text,
+            })
+
+    # 4. Fetch User's Bookmarks (DiscussionBookmark & SavedItem)
+    if tf in ("all", "bookmark", "bookmarks", "save", "saved"):
+        direct_bms = db.query(DiscussionBookmark, CommunityDiscussion)\
+            .join(CommunityDiscussion, DiscussionBookmark.discussion_id == CommunityDiscussion.id)\
+            .filter(DiscussionBookmark.user_id == current_user.id).all()
+
+        for bm, d in direct_bms:
+            title_text = clean_t(d.title)
+            all_events.append({
+                "id": f"bm_{bm.id}",
+                "title": f"Saved a post: {title_text}",
+                "type": "bookmark",
+                "points": 3,
+                "created_at": bm.created_at.isoformat() if bm.created_at else None,
+                "dt": bm.created_at or datetime.min,
+                "target_id": d.id,
+                "target_type": "discussion",
+                "target_name": title_text,
+            })
+
+        saved_items = db.query(SavedItem).filter_by(user_id=current_user.id).all()
+        for item in saved_items:
+            title_text = f"Saved item #{item.item_id}"
+            target_id = item.item_id
+            if item.item_type in ("discussion", "post"):
+                d = db.query(CommunityDiscussion).filter_by(id=item.item_id).first()
+                if d and d.title:
+                    title_text = clean_t(d.title)
+                    target_id = d.id
+
+            all_events.append({
+                "id": f"saved_{item.id}",
+                "title": f"Saved a post: {title_text}",
+                "type": "bookmark",
+                "points": 3,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+                "dt": item.created_at or datetime.min,
+                "target_id": target_id,
+                "target_type": item.item_type,
+                "target_name": title_text,
+            })
+
+    # 5. Fetch CommunityActivities for additional events (e.g. spiced)
+    if tf in ("all", "post", "discussions"):
+        activities = db.query(CommunityActivity).filter(
+            CommunityActivity.user_id == current_user.id,
+            CommunityActivity.action_type.in_(["spiced", "spice", "gifted_chops", "chops"])
+        ).all()
+
+        for a in activities:
+            title_text = clean_t(a.target_name)
+            act_type = (a.action_type or "post").lower()
+
+            if act_type in ("spiced", "spice"):
+                act_title = f"You spiced a post: {title_text}"
+                pts = 10
+            else:
+                act_title = f"Gifted Chops to a post: {title_text}"
+                pts = 5
+
+            all_events.append({
+                "id": f"act_{a.id}",
+                "title": act_title,
+                "type": "post",
+                "points": pts,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+                "dt": a.created_at or datetime.min,
+                "target_id": a.target_id,
+                "target_type": a.target_type or "discussion",
+                "target_name": title_text,
+            })
+
+    seen = set()
+    unique_events = []
+    for ev in all_events:
+        key = (ev["type"], ev["target_id"], ev["title"])
+        if key not in seen:
+            seen.add(key)
+            unique_events.append(ev)
+
+    unique_events.sort(key=lambda x: x["dt"], reverse=True)
+
+    for ev in unique_events:
+        ev.pop("dt", None)
+
+    return {"success": True, "data": unique_events[:limit]}
 
 
 @router.get("/profile")
@@ -1435,11 +1545,33 @@ async def get_saved_items(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    bms = db.query(DiscussionBookmark, CommunityDiscussion)\
+        .join(CommunityDiscussion, DiscussionBookmark.discussion_id == CommunityDiscussion.id)\
+        .filter(DiscussionBookmark.user_id == current_user.id)\
+        .order_by(DiscussionBookmark.created_at.desc()).all()
+
+    formatted = []
+    seen_ids = set()
+
+    for bm, d in bms:
+        seen_ids.add(d.id)
+        clean_t = re.sub(r"['\"]+", "", d.title).strip() if d.title else "a post"
+        ch_name = d.channel.name or d.channel.slug if d.channel else "community"
+        formatted.append({
+            "id": f"bm_{bm.id}",
+            "item_id": d.id,
+            "item_type": "discussion",
+            "title": clean_t,
+            "channel": ch_name,
+            "created_at": bm.created_at.isoformat() if bm.created_at else None,
+        })
+
     items = db.query(SavedItem).filter_by(user_id=current_user.id)\
         .order_by(SavedItem.created_at.desc()).all()
     
-    formatted = []
     for item in items:
+        if item.item_id in seen_ids:
+            continue
         title = f"Saved item #{item.item_id}"
         channel = "community"
         if item.item_type in ("discussion", "post"):
@@ -1457,6 +1589,7 @@ async def get_saved_items(
             "channel": channel,
             "created_at": item.created_at.isoformat() if item.created_at else None,
         })
+
     return {"success": True, "data": formatted}
 
 
@@ -1479,6 +1612,11 @@ async def save_item(
 
     saved = SavedItem(user_id=current_user.id, item_id=body.item_id, item_type=body.item_type)
     db.add(saved)
+    
+    bm_existing = db.query(DiscussionBookmark).filter_by(user_id=current_user.id, discussion_id=body.item_id).first()
+    if not bm_existing and body.item_type in ("discussion", "post"):
+        db.add(DiscussionBookmark(user_id=current_user.id, discussion_id=body.item_id))
+
     db.commit()
     db.refresh(saved)
 
@@ -1489,6 +1627,7 @@ async def save_item(
             target_title = d.title
 
     _log_activity(db, current_user.id, "saved", body.item_id, body.item_type, target_title)
+    await delete_cached(f"community:discussions:user:{current_user.id}:*")
     return {"success": True, "data": {"id": saved.id, "item_id": saved.item_id, "item_type": saved.item_type}}
 
 
@@ -1502,10 +1641,19 @@ async def unsave_item(
         SavedItem.user_id == current_user.id,
         or_(SavedItem.id == item_id, SavedItem.item_id == item_id)
     ).first()
-    if not saved:
-        return {"success": True, "message": "Item unsaved"}
-    db.delete(saved)
+
+    bm = db.query(DiscussionBookmark).filter(
+        DiscussionBookmark.user_id == current_user.id,
+        DiscussionBookmark.discussion_id == item_id
+    ).first()
+    if bm:
+        db.delete(bm)
+
+    if saved:
+        db.delete(saved)
+
     db.commit()
+    await delete_cached(f"community:discussions:user:{current_user.id}:*")
     return {"success": True, "message": "Item unsaved"}
 
 

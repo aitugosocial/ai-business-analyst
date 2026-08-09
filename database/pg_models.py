@@ -1683,6 +1683,7 @@ class CommunityDiscussion(Base):
     quoted_discussion = relationship("CommunityDiscussion", remote_side="[CommunityDiscussion.id]", foreign_keys=[quoted_discussion_id])
     replies = relationship("DiscussionReply", back_populates="discussion", cascade="all, delete-orphan")
     likes = relationship("DiscussionLike", back_populates="discussion", cascade="all, delete-orphan")
+    bookmarks = relationship("DiscussionBookmark", back_populates="discussion", cascade="all, delete-orphan")
 
 
 class DiscussionReply(Base):
@@ -1718,6 +1719,15 @@ class DiscussionLike(Base):
     discussion_id = Column(Integer, ForeignKey("community_discussions.id", ondelete="CASCADE"), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     discussion = relationship("CommunityDiscussion", back_populates="likes")
+
+
+class DiscussionBookmark(Base):
+    __tablename__ = "discussion_bookmarks"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    discussion_id = Column(Integer, ForeignKey("community_discussions.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    discussion = relationship("CommunityDiscussion", back_populates="bookmarks")
 
 
 class CommunityEvent(Base):
