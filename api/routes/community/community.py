@@ -172,8 +172,9 @@ _TOPIC_SLUGS = {
 }
 
 
-def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, include_quoted: bool = True, current_user: Optional[User] = None) -> dict:
+def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, saved_ids: Optional[set] = None, include_quoted: bool = True, current_user: Optional[User] = None) -> dict:
     has_liked = d.id in liked_ids if liked_ids is not None else False
+    has_saved = d.id in saved_ids if saved_ids is not None else False
     post_type_val = getattr(d, 'post_type', None) or 'discussion'
 
     # Return topic slug as a plain string so the frontend can filter by it directly.
@@ -200,7 +201,7 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, in
     quoted_dict = None
     if include_quoted and getattr(d, 'quoted_discussion', None) is not None:
         try:
-            quoted_dict = _discussion_dict(d.quoted_discussion, liked_ids=liked_ids, include_quoted=False, current_user=current_user)
+            quoted_dict = _discussion_dict(d.quoted_discussion, liked_ids=liked_ids, saved_ids=saved_ids, include_quoted=False, current_user=current_user)
         except Exception:
             quoted_dict = None
 
@@ -219,6 +220,7 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, in
         "pinned": d.is_pinned, "is_pinned": d.is_pinned,
         "hot": d.like_count >= 10,
         "view_count": d.view_count, "has_liked": has_liked, "liked_by_user": has_liked,
+        "isBookmarked": has_saved, "is_saved": has_saved, "saved_by_user": has_saved,
         "chops_gifted": d.chops_gifted or 0,
         "spice_count": spice_cnt, "spiced": spice_cnt, "spices": spice_cnt,
         "quoted_discussion_id": getattr(d, 'quoted_discussion_id', None),
@@ -460,6 +462,26 @@ async def get_discussions(
                         has_stale_reflection = True
                         break
             if not has_stale_reflection:
+                # Dynamically inject current user's real-time liked & bookmarked status
+                if current_user and isinstance(cached, list):
+                    post_ids = [i.get("id") for i in cached if isinstance(i, dict) and isinstance(i.get("id"), int)]
+                    if post_ids:
+                        user_likes = {l.discussion_id for l in db.query(DiscussionLike.discussion_id).filter(
+                            DiscussionLike.user_id == current_user.id,
+                            DiscussionLike.discussion_id.in_(post_ids)
+                        ).all()}
+                        user_saves = {s.item_id for s in db.query(SavedItem.item_id).filter(
+                            SavedItem.user_id == current_user.id,
+                            SavedItem.item_id.in_(post_ids)
+                        ).all()}
+                        for item in cached:
+                            if isinstance(item, dict) and isinstance(item.get("id"), int):
+                                pid = item["id"]
+                                item["has_liked"] = pid in user_likes
+                                item["liked_by_user"] = pid in user_likes
+                                item["isBookmarked"] = pid in user_saves
+                                item["is_saved"] = pid in user_saves
+                                item["saved_by_user"] = pid in user_saves
                 return cached
 
         q = db.query(CommunityDiscussion)
@@ -488,13 +510,19 @@ async def get_discussions(
                 )
 
         discussions = q.order_by(CommunityDiscussion.is_pinned.desc(), CommunityDiscussion.created_at.desc()).offset(offset).limit(limit).all()
-        # Batch-fetch likes to avoid N+1
+        # Batch-fetch likes and bookmarks to avoid N+1
         discussion_ids = [d.id for d in discussions]
         liked = {l.discussion_id for l in db.query(DiscussionLike.discussion_id).filter(
             DiscussionLike.user_id == current_user.id,
             DiscussionLike.discussion_id.in_(discussion_ids)
         ).all()} if (current_user and discussion_ids) else set()
-        result = [_discussion_dict(d, liked, current_user=current_user) for d in discussions]
+
+        saved = {s.item_id for s in db.query(SavedItem.item_id).filter(
+            SavedItem.user_id == current_user.id,
+            SavedItem.item_id.in_(discussion_ids)
+        ).all()} if (current_user and discussion_ids) else set()
+
+        result = [_discussion_dict(d, liked_ids=liked, saved_ids=saved, current_user=current_user) for d in discussions]
 
         # Include mission roadmap comments from users who opted in.
         # Comments live in analysis.user_progress['roadmap_comments'] (a dict of task_id → [comment, ...]).
@@ -1265,11 +1293,26 @@ async def unregister_event(
 @router.get("/activity")
 async def get_my_activity(
     limit: int = Query(12, le=100),
+    type_filter: Optional[str] = Query(None, alias="type"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    activities = db.query(CommunityActivity).filter_by(user_id=current_user.id)\
-        .order_by(CommunityActivity.created_at.desc()).limit(limit).all()
+    q = db.query(CommunityActivity).filter_by(user_id=current_user.id)
+    
+    if type_filter and type_filter != "all":
+        tf = type_filter.lower().strip()
+        if tf in ("post", "discussions"):
+            q = q.filter(CommunityActivity.action_type.in_(["posted", "post", "discussion_create", "spiced", "spice"]))
+        elif tf in ("reply", "replies"):
+            q = q.filter(CommunityActivity.action_type.in_(["replied", "reply", "discussion_reply"]))
+        elif tf in ("like", "cooked", "cook"):
+            q = q.filter(CommunityActivity.action_type.in_(["cooked", "cook", "like", "post_like"]))
+        elif tf in ("reflection", "reflections"):
+            q = q.filter(CommunityActivity.action_type.in_(["reflection", "mission_reflection"]))
+        elif tf in ("bookmark", "bookmarks", "save", "saved"):
+            q = q.filter(CommunityActivity.action_type.in_(["saved", "bookmark", "save"]))
+
+    activities = q.order_by(CommunityActivity.created_at.desc()).limit(limit).all()
     
     formatted = []
     for a in activities:
@@ -1394,10 +1437,27 @@ async def get_saved_items(
 ):
     items = db.query(SavedItem).filter_by(user_id=current_user.id)\
         .order_by(SavedItem.created_at.desc()).all()
-    return {"success": True, "data": [{
-        "id": item.id, "item_id": item.item_id, "item_type": item.item_type,
-        "created_at": item.created_at.isoformat() if item.created_at else None,
-    } for item in items]}
+    
+    formatted = []
+    for item in items:
+        title = f"Saved item #{item.item_id}"
+        channel = "community"
+        if item.item_type in ("discussion", "post"):
+            d = db.query(CommunityDiscussion).filter_by(id=item.item_id).first()
+            if d and d.title:
+                clean_t = re.sub(r"['\"]+", "", d.title).strip()
+                title = clean_t if clean_t else "a post"
+                if d.channel:
+                    channel = d.channel.name or d.channel.slug
+        formatted.append({
+            "id": item.id,
+            "item_id": item.item_id,
+            "item_type": item.item_type,
+            "title": title,
+            "channel": channel,
+            "created_at": item.created_at.isoformat() if item.created_at else None,
+        })
+    return {"success": True, "data": formatted}
 
 
 @router.post("/saved")
@@ -1406,6 +1466,13 @@ async def save_item(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    is_subscribed = bool(current_user and getattr(current_user, 'subscription_status', None) in ("active", "trialing"))
+    if not is_subscribed:
+        raise HTTPException(
+            status_code=403,
+            detail="Bookmarking posts is a premium feature. Upgrade to Lavoo Pro to save posts to your personal library."
+        )
+
     existing = db.query(SavedItem).filter_by(user_id=current_user.id, item_id=body.item_id, item_type=body.item_type).first()
     if existing:
         return {"success": True, "message": "Already saved", "id": existing.id}
@@ -1414,6 +1481,14 @@ async def save_item(
     db.add(saved)
     db.commit()
     db.refresh(saved)
+
+    target_title = "a post"
+    if body.item_type in ("discussion", "post"):
+        d = db.query(CommunityDiscussion).filter_by(id=body.item_id).first()
+        if d and d.title:
+            target_title = d.title
+
+    _log_activity(db, current_user.id, "saved", body.item_id, body.item_type, target_title)
     return {"success": True, "data": {"id": saved.id, "item_id": saved.item_id, "item_type": saved.item_type}}
 
 
@@ -1423,9 +1498,12 @@ async def unsave_item(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    saved = db.query(SavedItem).filter_by(id=item_id, user_id=current_user.id).first()
+    saved = db.query(SavedItem).filter(
+        SavedItem.user_id == current_user.id,
+        or_(SavedItem.id == item_id, SavedItem.item_id == item_id)
+    ).first()
     if not saved:
-        raise HTTPException(status_code=404, detail="Saved item not found")
+        return {"success": True, "message": "Item unsaved"}
     db.delete(saved)
     db.commit()
     return {"success": True, "message": "Item unsaved"}
