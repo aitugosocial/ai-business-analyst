@@ -5,7 +5,7 @@ This file contains all ORM models for the application.
 """
 
 from pydantic import BaseModel, ConfigDict, EmailStr
-from sqlalchemy import Column, Date, DateTime, Float, Integer, String, Text, ForeignKey, JSON, Boolean, DECIMAL, Enum, Numeric, Index
+from sqlalchemy import Column, Date, DateTime, Float, Integer, String, Text, ForeignKey, JSON, Boolean, DECIMAL, Enum, Numeric, Index, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, INET, JSONB
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import relationship, synonym
@@ -1673,9 +1673,10 @@ class CommunityDiscussion(Base):
     quoted_discussion_id = Column(Integer, ForeignKey("community_discussions.id", ondelete="SET NULL"), nullable=True)
     ai_takeaways = Column(JSON, nullable=True)
     is_pinned = Column(Boolean, default=False)
-    post_type = Column(String(50), default="discussion")  # discussion | reflection | spiced
+    post_type = Column(String(50), default="discussion")  # discussion | reflection | spiced | poll
     tagged_user_ids = Column(JSON, nullable=True, default=list)  # array of tagged user IDs
     visibility = Column(String(30), default="public")  # public | tagged_only
+    poll_data = Column(JSON, nullable=True)  # poll options and metadata
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     channel = relationship("CommunityChannel", back_populates="discussions")
@@ -1684,6 +1685,21 @@ class CommunityDiscussion(Base):
     replies = relationship("DiscussionReply", back_populates="discussion", cascade="all, delete-orphan")
     likes = relationship("DiscussionLike", back_populates="discussion", cascade="all, delete-orphan")
     bookmarks = relationship("DiscussionBookmark", back_populates="discussion", cascade="all, delete-orphan")
+    poll_votes = relationship("DiscussionPollVote", back_populates="discussion", cascade="all, delete-orphan")
+
+
+class DiscussionPollVote(Base):
+    __tablename__ = "discussion_poll_votes"
+    __table_args__ = (UniqueConstraint("discussion_id", "user_id", name="uq_discussion_user_vote"),)
+    id = Column(Integer, primary_key=True, index=True)
+    discussion_id = Column(Integer, ForeignKey("community_discussions.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    option_index = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    discussion = relationship("CommunityDiscussion", back_populates="poll_votes")
+    user = relationship("User")
+
 
 
 class DiscussionReply(Base):

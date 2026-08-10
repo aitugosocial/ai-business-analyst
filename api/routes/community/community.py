@@ -168,8 +168,58 @@ _AUTHOR_GRADIENTS = [
 # All valid topic slugs that can be stored as post_type
 _TOPIC_SLUGS = {
     'what-worked', 'tool-recommendations', 'collaboration-offers',
-    'questions', 'shared-wins', 'resources', 'reflections',
+    'questions', 'shared-wins', 'resources', 'reflections', 'poll',
 }
+
+
+def _get_poll_payload(d: CommunityDiscussion, current_user: Optional[User] = None, db: Optional[Session] = None) -> Optional[dict]:
+    poll_data = getattr(d, 'poll_data', None)
+    if not poll_data or not isinstance(poll_data, dict):
+        return None
+    raw_options = poll_data.get("options", [])
+    if not raw_options or not isinstance(raw_options, list):
+        return None
+
+    votes = getattr(d, 'poll_votes', None)
+    if votes is None or not isinstance(votes, list) or len(votes) == 0:
+        if db:
+            votes = db.query(DiscussionPollVote).filter_by(discussion_id=d.id).all()
+        else:
+            try:
+                from database.pg_connections import SessionLocal
+                with SessionLocal() as s:
+                    votes = s.query(DiscussionPollVote).filter_by(discussion_id=d.id).all()
+            except Exception:
+                votes = []
+
+    total_votes = len(votes)
+    counts = {}
+    user_voted_idx = None
+
+    for v in votes:
+        opt_idx = getattr(v, 'option_index', 0)
+        counts[opt_idx] = counts.get(opt_idx, 0) + 1
+        if current_user and getattr(v, 'user_id', None) == current_user.id:
+            user_voted_idx = opt_idx
+
+    formatted_options = []
+    for idx, opt in enumerate(raw_options):
+        text = opt if isinstance(opt, str) else (opt.get("text", "") if isinstance(opt, dict) else str(opt))
+        cnt = counts.get(idx, 0)
+        pct = round((cnt / total_votes * 100), 1) if total_votes > 0 else 0.0
+        formatted_options.append({
+            "id": idx,
+            "text": text,
+            "votes": cnt,
+            "count": cnt,
+            "percentage": pct,
+        })
+
+    return {
+        "options": formatted_options,
+        "total_votes": total_votes,
+        "user_voted_option": user_voted_idx,
+    }
 
 
 def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, saved_ids: Optional[set] = None, include_quoted: bool = True, current_user: Optional[User] = None) -> dict:
@@ -230,6 +280,7 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, sa
         "type": post_type_val,
         "tagged_user_ids": tagged_ids,
         "visibility": visibility_val,
+        "poll": _get_poll_payload(d, current_user=current_user),
         "author": author_obj,
         "channel": channel_display,
         "created_at": d.created_at.isoformat() if d.created_at else None,
@@ -282,9 +333,14 @@ class CreateDiscussionRequest(BaseModel):
     content: str
     channel_id: int
     tags: Optional[List[str]] = None
-    type: Optional[str] = "discussion"  # "discussion" | "reflection" | "spiced"
+    type: Optional[str] = "discussion"  # "discussion" | "reflection" | "spiced" | "poll"
     tagged_user_ids: Optional[List[int]] = None
     visibility: Optional[str] = "public"  # "public" | "tagged_only"
+    poll_options: Optional[List[str]] = None
+
+
+class VotePollRequest(BaseModel):
+    option_index: int
 
 
 class SpiceDiscussionRequest(BaseModel):
@@ -488,6 +544,18 @@ async def get_discussions(
                                 item["is_saved"] = pid in user_saves
                                 item["saved_by_user"] = pid in user_saves
                                 item["bookmarked"] = pid in user_saves
+
+                    # Rehydrate poll state in real-time for all cached items
+                    poll_pids = [
+                        i["id"] for i in cached
+                        if isinstance(i, dict) and isinstance(i.get("id"), int) and (i.get("type") == "poll" or i.get("poll") is not None)
+                    ]
+                    if poll_pids:
+                        poll_discussions = db.query(CommunityDiscussion).filter(CommunityDiscussion.id.in_(poll_pids)).all()
+                        poll_map = {p.id: _get_poll_payload(p, current_user=current_user) for p in poll_discussions}
+                        for item in cached:
+                            if isinstance(item, dict) and item.get("id") in poll_map:
+                                item["poll"] = poll_map[item["id"]]
                 return cached
 
         q = db.query(CommunityDiscussion)
@@ -828,17 +896,26 @@ async def create_discussion(
 
     visibility_val = "tagged_only" if body.visibility == "tagged_only" else "public"
 
+    poll_payload = None
+    clean_options = [o.strip() for o in (body.poll_options or []) if isinstance(o, str) and o.strip()]
+    if post_type == 'poll' or len(clean_options) >= 2:
+        if len(clean_options) >= 2:
+            post_type = 'poll'
+            poll_payload = {"options": clean_options}
+
     d = CommunityDiscussion(
         channel_id=body.channel_id, user_id=current_user.id,
         title=body.title.strip(), content=body.content.strip(),
         tags=body.tags or [], post_type=post_type,
-        tagged_user_ids=tagged_ids, visibility=visibility_val
+        tagged_user_ids=tagged_ids, visibility=visibility_val,
+        poll_data=poll_payload
     )
     db.add(d)
     ch.post_count = (ch.post_count or 0) + 1
     current_user.total_chops = (current_user.total_chops or 0) + 10
     db.commit()
     db.refresh(d)
+    
     _log_activity(db, current_user.id, "posted", d.id, "discussion", d.title)
 
     # Trigger notifications for tagged users
@@ -861,9 +938,46 @@ async def create_discussion(
     # Automatically schedule background AI generation for new posts upon creation
     background_tasks.add_task(_async_generate_takeaways_worker, d.id)
 
-    await delete_cached(f"community:discussions:user:{current_user.id}:ch:{body.channel_id}:lim:20:off:0")
-    await delete_cached(f"community:discussions:user:{current_user.id}:ch:None:lim:20:off:0")
     return {"success": True, "data": _discussion_dict(d, set(), current_user=current_user)}
+
+
+@router.post("/discussions/{discussion_id}/poll/vote")
+async def vote_poll(
+    discussion_id: int,
+    body: VotePollRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    if not d.poll_data or not isinstance(d.poll_data, dict):
+        raise HTTPException(status_code=400, detail="This discussion is not a poll")
+
+    raw_options = d.poll_data.get("options", [])
+    if body.option_index < 0 or body.option_index >= len(raw_options):
+        raise HTTPException(status_code=422, detail="Invalid poll option index")
+
+    # Strictly enforce EXACTLY ONE VOTE per user: delete any existing vote row for this user & discussion
+    db.query(DiscussionPollVote).filter_by(
+        discussion_id=discussion_id, user_id=current_user.id
+    ).delete(synchronize_session=False)
+
+    vote = DiscussionPollVote(
+        discussion_id=discussion_id,
+        user_id=current_user.id,
+        option_index=body.option_index
+    )
+    db.add(vote)
+    db.commit()
+    db.expire_all()
+    await delete_cached("community:discussions:*")
+
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    return {
+        "status": "success",
+        "poll": _get_poll_payload(d, current_user=current_user, db=db)
+    }
 
 
 @router.delete("/discussions/{discussion_id}")
