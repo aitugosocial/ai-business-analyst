@@ -32,7 +32,11 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
-from decision_engine.recommender_db import recommend_automation_stacks, recommend_tools
+from decision_engine.recommender_db import (
+    _safe_parse_text_list,
+    recommend_automation_stacks,
+    recommend_tools,
+)
 
 load_dotenv(".env.local")
 
@@ -876,9 +880,23 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
                     continue
                 url = t.get("url") or t.get("website") or "unknown"
                 step_flag = " [CITED IN STEPS]" if t.get("_step_cited") else ""
-                tools_section_parts.append(
-                    f"- {name}{step_flag} | URL: {url}\n  {t.get('description', '')[:200]}"
-                )
+                block = f"- {name}{step_flag} | URL: {url}\n  Description: {t.get('description', '')[:200]}"
+                # Documented feature/audience/integration data — the same
+                # fields already used to steer this tool's retrieval embedding
+                # (see recommender_db.py::_load_tools) but previously never
+                # reached this scoring prompt, leaving the LLM nothing
+                # concrete to defend a task_relevance score against. Omits
+                # pricing by design.
+                features = _safe_parse_text_list(t.get("key_features"))
+                if features:
+                    block += f"\n  Key Features: {', '.join(features[:6])}"
+                who = _safe_parse_text_list(t.get("who_should_use"))
+                if who:
+                    block += f"\n  Built For: {', '.join(who[:4])}"
+                integrations = _safe_parse_text_list(t.get("compatibility_integration"))
+                if integrations:
+                    block += f"\n  Integrates With: {', '.join(integrations[:6])}"
+                tools_section_parts.append(block)
             tools_section = "\n".join(tools_section_parts)
             if not tools_section:
                 return []
@@ -898,9 +916,14 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
 
 Your output appears directly on an action plan card that a solo founder will use to make decisions. Every word must be specific, concrete, and unique to the STEP it accompanies — not the plan as a whole.
 
-CRITICAL: You are matching tools to individual STEPS inside ONE plan, not to the plan as a whole. A plan with {len(what_to_do_list)} steps may end up with 0 or more tools — one per step that genuinely needs one. Steps that are manual, judgment-based, or one-time (e.g. "review the responses and decide", "call your accountant") get NO tool. Do not force a tool onto every step.
+GLOBAL QUALITY STANDARDS — every "what_it_helps" you write must pass ALL of these:
+1. PERSONA: Second person only — "you", "your". Never "the user", "the founder", or any third-person reference.
+2. SPECIFICITY: Passes the intern test — a smart person with zero context about the tool can tell exactly what feature does what, for this exact step, on first read.
+3. GROUNDING: Name the actual Key Feature / integration from the catalog block below, not a paraphrase of the generic description. If the catalog gives you nothing concrete enough to name, that candidate is not a 90+ task_relevance and should not be proposed.
+4. COMMITMENT: Never hedge with "can help", "may assist", "is useful for", or "could be used to". State plainly what it does — "sends", "generates", "tracks" — not what it might do.
+5. FORMATTING: Do NOT start any text value with a dash, bullet, or em dash.
 
-PERSONA RULE: Write "what_it_helps" in SECOND PERSON — "you", "your". Never "the user", "the founder", or any third-person reference.
+CRITICAL: You are matching tools to individual STEPS inside ONE plan, not to the plan as a whole. A plan with {len(what_to_do_list)} steps may end up with 0 or more tools — one per step that genuinely needs one. Steps that are manual, judgment-based, or one-time (e.g. "review the responses and decide", "call your accountant") get NO tool. Do not force a tool onto every step.
 
 WITHIN-PLAN CONSTRAINT: Do not propose the same tool for two different steps in this plan — each tool you propose should be the best match for exactly one step here.
 
@@ -927,12 +950,12 @@ TOOL CATALOG FOR THIS PLAN (from semantic search + step extraction — names mar
 MATCHING PROTOCOL:
 
 STEP 1 — FEATURE-LEVEL MATCH, PER STEP
-For each numbered step, identify tools in the catalog whose DOCUMENTED CORE FUNCTION directly performs the capability that specific step names. Not "this tool is in the same category" — the tool must have a specific feature that executes the required function for THAT step.
+For each numbered step, identify tools in the catalog whose Key Features / Integrates With entries directly perform the capability that specific step names. Not "this tool is in the same category" — a listed feature or integration must literally execute the required function for THAT step. If a candidate has no Key Features/Integrates With line at all, treat its description alone as insufficient to clear task_relevance >= {bars['task_relevance']}.
 
 STEP 2 — SPECIFICITY OF DESCRIPTIONS
-"what_it_helps" must name the EXACT step number and describe what the tool does for THAT step in one concrete sentence, citing the actual documented feature being used. This text appears on the plan card under that step — it must be unique to that step, not a generic product description.
-Good: "Step 2: This tool sends your weekly re-engagement sequence automatically, personalised with each contact's last action, so you never manually write or send a follow-up again."
-Bad: "A powerful automation platform."
+"what_it_helps" must name the EXACT step number and describe what the tool does for THAT step in one concrete sentence, naming the specific Key Feature or integration from the catalog block that makes it a match. This text appears on the plan card under that step — it must be unique to that step, not a generic product description.
+Good: "Step 2: Its automated re-engagement sequences feature sends a personalised follow-up based on each contact's last action, so you never manually write or send one again."
+Bad: "A powerful automation platform that can help with re-engagement."
 
 STEP 3 — CANDIDATES, RANKED
 For each step you're confident about, return up to 2 candidates ordered best-first (a second one only if it is also genuinely defensible — never pad with a weak second choice). Most steps will have exactly 1 or 0 candidates.
@@ -940,9 +963,8 @@ For each step you're confident about, return up to 2 candidates ordered best-fir
 STEP 4 — ASSIGNMENT RULES
 1. Do not propose the same tool for two different steps in this plan.
 2. Tools marked [CITED IN STEPS] MUST appear as the top candidate for the step that cites them.
-3. Only propose non-cited tools if they directly address that step's named action. Do NOT propose based on general category fit.
+3. Only propose non-cited tools if they directly address that step's named action, grounded in a specific Key Feature or integration. Do NOT propose based on general category fit.
 4. Return the tool's URL from the catalog exactly as shown (null is acceptable for step-cited stubs).
-5. Do NOT start any text value with a dash, bullet, or em dash.
 
 OUTPUT FORMAT (JSON only, no markdown):
 {{
