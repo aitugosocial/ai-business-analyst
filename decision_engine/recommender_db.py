@@ -281,6 +281,15 @@ class AIToolRecommender:
                         "similarity_score": top_scores[idx],
                         "description": tool["description"],
                         "url": tool.get("url", ""),
+                        # Already loaded into tools_df and already used to build
+                        # this tool's retrieval embedding (see _load_tools) —
+                        # surfacing them here too lets a downstream scoring LLM
+                        # (agentic_analyzer.py::_score_plan) defend a relevance
+                        # score against real documented features instead of a
+                        # bare description. Deliberately excludes pricing.
+                        "key_features": tool.get("key_features"),
+                        "who_should_use": tool.get("who_should_use"),
+                        "compatibility_integration": tool.get("compatibility_integration"),
                     }
                 )
 
