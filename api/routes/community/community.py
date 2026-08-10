@@ -17,7 +17,7 @@ from database.pg_connections import get_db, SessionLocal
 from database.pg_models import (
     User,
     CommunityChannel, ChannelMember,
-    CommunityDiscussion, DiscussionReply, DiscussionLike, DiscussionBookmark,
+    CommunityDiscussion, DiscussionReply, DiscussionLike, DiscussionBookmark, DiscussionPollVote,
     CommunityEvent, EventRegistration,
     CommunityActivity, SavedItem,
     UserSettings, BusinessAnalysis,
