@@ -35,16 +35,16 @@ try:
 
     if os.path.exists(env_local):
         load_dotenv(env_local)
-        print(f"✓ Loaded environment from {env_local}")
+        print(f"[ENV] Loaded environment from {env_local}")
     elif os.path.exists(env_file):
         load_dotenv(env_file)
-        print(f"✓ Loaded environment from {env_file}")
+        print(f"[ENV] Loaded environment from {env_file}")
     else:
         load_dotenv()  # Try loading from default locations
-        print("✓ Loaded environment from default location")
+        print("[ENV] Loaded environment from default location")
 except ImportError:
     # python-dotenv not installed, will use system environment variables
-    print("⚠️  python-dotenv not installed, using system environment variables")
+    print("[ENV] python-dotenv not installed, using system environment variables")
     pass
 
 # Base class for all ORM models
@@ -54,12 +54,12 @@ Base = declarative_base()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    print("❌ ERROR: DATABASE_URL environment variable not set!")
+    print("[DB ERROR] DATABASE_URL environment variable not set!")
     print("Please set DATABASE_URL in your .env file or environment")
     print("Format: postgresql://user:password@host:port/database")
     sys.exit(1)
 
-print("✓ Connecting to PostgreSQL database...")
+print("[DB] Connecting to PostgreSQL database...")
 
 try:
     # Create PostgreSQL engine
@@ -88,7 +88,7 @@ try:
 
     # Test the connection
     with engine.connect() as conn:
-        print("✓ Successfully connected to PostgreSQL!")
+        print("[DB] Successfully connected to PostgreSQL!")
 
     # Attach an event listener to silence harmless "SSL connection has been closed unexpectedly" errors
     # during connection pool check-ins.
@@ -112,10 +112,10 @@ try:
             raise
 
 except Exception as e:
-    print("❌ Failed to connect to PostgreSQL database!")
+    print("[DB ERROR] Failed to connect to PostgreSQL database!")
     error_msg = str(e)
     if "could not translate host name" in error_msg or "Temporary failure in name resolution" in error_msg:
-        print("\n⚠️  DIAGNOSIS: DNS RESOLUTION ERROR DETECTED")
+        print("\n[DB DIAGNOSIS] DNS RESOLUTION ERROR DETECTED")
         print("This is likely a WSL2 networking issue. Try restarting WSL:")
         print(" PowerShell (Admin): wsl --shutdown")
         print(" Then restart your backend.")
@@ -134,7 +134,7 @@ def init_db():
     Creates all tables defined in the models.
     """
     Base.metadata.create_all(bind=engine)
-    print("✓ Database tables created successfully")
+    print("[DB] Database tables created successfully")
 
 
 def get_db_info():
