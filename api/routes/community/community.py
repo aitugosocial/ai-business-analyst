@@ -4,7 +4,7 @@ Community Feature — Channels, Discussions, Events, Leaderboard, Saved Items
 import logging
 import re
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import os
 
@@ -215,10 +215,46 @@ def _get_poll_payload(d: CommunityDiscussion, current_user: Optional[User] = Non
             "percentage": pct,
         })
 
+    # Calculate expiration status
+    expires_at_raw = poll_data.get("expires_at")
+    duration_val = poll_data.get("duration", "none")
+    is_closed = False
+    time_remaining_str = None
+
+    if expires_at_raw:
+        try:
+            expires_dt = datetime.fromisoformat(expires_at_raw)
+            now = datetime.now(timezone.utc)
+            if expires_dt.tzinfo is None:
+                expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+            
+            diff = expires_dt - now
+            if diff.total_seconds() <= 0:
+                is_closed = True
+                time_remaining_str = "Final results · Poll closed"
+            else:
+                secs = int(diff.total_seconds())
+                days = secs // 86400
+                hours = (secs % 86400) // 3600
+                mins = (secs % 3600) // 60
+                if days > 0:
+                    time_remaining_str = f"{days}d {hours}h left" if hours > 0 else f"{days}d left"
+                elif hours > 0:
+                    time_remaining_str = f"{hours}h {mins}m left"
+                else:
+                    time_remaining_str = f"{max(1, mins)}m left"
+        except Exception:
+            is_closed = False
+            time_remaining_str = None
+
     return {
         "options": formatted_options,
         "total_votes": total_votes,
         "user_voted_option": user_voted_idx,
+        "is_closed": is_closed,
+        "expires_at": expires_at_raw,
+        "duration": duration_val,
+        "time_remaining": time_remaining_str,
     }
 
 
@@ -337,6 +373,7 @@ class CreateDiscussionRequest(BaseModel):
     tagged_user_ids: Optional[List[int]] = None
     visibility: Optional[str] = "public"  # "public" | "tagged_only"
     poll_options: Optional[List[str]] = None
+    poll_duration: Optional[str] = "none"  # "none" | "24h" | "3d" | "7d"
 
 
 class VotePollRequest(BaseModel):
@@ -901,7 +938,24 @@ async def create_discussion(
     if post_type == 'poll' or len(clean_options) >= 2:
         if len(clean_options) >= 2:
             post_type = 'poll'
-            poll_payload = {"options": clean_options}
+            duration_str = (body.poll_duration or "none").strip().lower()
+            expires_at_iso = None
+            
+            now = datetime.now(timezone.utc)
+            if duration_str == "24h" or duration_str == "1d":
+                expires_at_iso = (now + timedelta(days=1)).isoformat()
+            elif duration_str == "3d":
+                expires_at_iso = (now + timedelta(days=3)).isoformat()
+            elif duration_str == "7d":
+                expires_at_iso = (now + timedelta(days=7)).isoformat()
+            else:
+                duration_str = "none"
+
+            poll_payload = {
+                "options": clean_options,
+                "duration": duration_str,
+                "expires_at": expires_at_iso
+            }
 
     d = CommunityDiscussion(
         channel_id=body.channel_id, user_id=current_user.id,
@@ -957,6 +1011,10 @@ async def vote_poll(
     raw_options = d.poll_data.get("options", [])
     if body.option_index < 0 or body.option_index >= len(raw_options):
         raise HTTPException(status_code=422, detail="Invalid poll option index")
+
+    poll_payload = _get_poll_payload(d, current_user=current_user, db=db)
+    if poll_payload and poll_payload.get("is_closed"):
+        raise HTTPException(status_code=400, detail="This poll has closed and is no longer accepting votes.")
 
     # Strictly enforce EXACTLY ONE VOTE per user: delete any existing vote row for this user & discussion
     db.query(DiscussionPollVote).filter_by(
