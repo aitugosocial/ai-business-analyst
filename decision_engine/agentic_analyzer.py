@@ -779,6 +779,11 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
             # Always present, same length as what_to_do, so the frontend can
             # zip step text ↔ step tool by index regardless of plan type.
             plan["step_tools"] = [None] * len(what_to_do_list)
+            # Parallel array: populated instead of step_tools (never both, see
+            # the assignment loop below) when 2+ candidates independently
+            # clear the gate for the same step — item 42, replaces the old
+            # embedding-similarity automation-stack mechanism at step level.
+            plan["step_stacks"] = [None] * len(what_to_do_list)
 
         if not needy_indices:
             return action_plans
@@ -1060,64 +1065,90 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
             if candidates:
                 by_step[(plan_idx, step_idx)] = candidates
 
+        def _evaluate_candidate(candidate: dict, plan_idx: int, step_idx: int) -> Optional[dict]:
+            """Validate one candidate against uniqueness/the gate/defensible
+            text; if it survives, claim it in the global uniqueness set and
+            return its assignment entry. Returns None to skip (a dedup
+            collision, a failed gate, or no defensible what_it_helps text)."""
+            canonical = _resolve_canonical(candidate.get("tool_name", ""), plan_idx)
+            if not canonical or canonical.lower() in assigned_tool_names_lower:
+                return None
+
+            tool_record = all_tools[canonical]
+            is_step_cited = bool(tool_record.get("_step_cited"))
+
+            # A step-cited tool was named explicitly inside the plan's own
+            # step text — the plan itself already decided this tool belongs
+            # here, so task_relevance is self-evident.
+            scores = candidate.get("scores", {}) or {}
+            if not is_step_cited and not _passes_gate(scores):
+                logger.info(
+                    f"Rejected '{canonical}' for plan {plan_idx + 1} step {step_idx + 1}: "
+                    f"scores {scores} did not clear {self._STEP_TOOL_PASS_THRESHOLD}/5 pass bar"
+                )
+                return None
+
+            what_it_helps = (candidate.get("what_it_helps") or "").strip()
+            if not what_it_helps:
+                is_stub = is_step_cited or not tool_record.get("url")
+                if is_stub:
+                    # No step-specific text from the LLM and no real DB
+                    # description to fall back on — showing the internal stub
+                    # placeholder would assert an unverifiable claim.
+                    return None
+                what_it_helps = tool_record.get("description", "")
+
+            # Trust the DB's own url over whatever the LLM echoed back; only
+            # step-cited stubs (no DB record) fall through to it.
+            db_url = tool_record.get("url")
+            assigned_tool_names_lower.add(canonical.lower())
+            return {
+                "tool_name": canonical,
+                "website": db_url or candidate.get("website") or None,
+                "what_it_helps": what_it_helps,
+                "scores": {crit: scores.get(crit) for crit in bars},
+            }
+
         # Walk plans/steps in priority order (lower plan number = higher
         # priority, then step order within the plan) so that when two steps
         # compete for the same tool, the higher-priority one wins — same
         # tie-break rule the old plan-level assignment used.
         assigned_steps = 0
+        stacked_steps = 0
         for plan_idx in needy_indices:
             what_to_do_list = action_plans[plan_idx].get("what_to_do", [])
             step_count = len(what_to_do_list) if isinstance(what_to_do_list, list) else 0
             for step_idx in range(step_count):
-                # Up to 2 ranked candidates per step (best-first) act as the
-                # per-step "backfill": if candidate 1 is already claimed by a
-                # higher-priority step or fails the gate, try candidate 2
-                # before giving up — no second LLM round trip required.
-                for candidate in (by_step.get((plan_idx, step_idx), []) or [])[:2]:
-                    canonical = _resolve_canonical(candidate.get("tool_name", ""), plan_idx)
-                    if not canonical or canonical.lower() in assigned_tool_names_lower:
-                        continue
+                # Evaluate BOTH ranked candidates (not just the first that
+                # passes) — a step where 2 tools independently clear the gate
+                # is exactly what should become an automation stack, not a
+                # single tool with the runner-up silently discarded (item 42).
+                passing = [
+                    entry
+                    for candidate in (by_step.get((plan_idx, step_idx), []) or [])[:2]
+                    if (entry := _evaluate_candidate(candidate, plan_idx, step_idx))
+                ]
 
-                    tool_record = all_tools[canonical]
-                    is_step_cited = bool(tool_record.get("_step_cited"))
-
-                    # A step-cited tool was named explicitly inside the plan's
-                    # own step text — the plan itself already decided this
-                    # tool belongs here, so task_relevance is self-evident.
-                    scores = candidate.get("scores", {}) or {}
-                    if not is_step_cited and not _passes_gate(scores):
-                        logger.info(
-                            f"Rejected '{canonical}' for plan {plan_idx + 1} step {step_idx + 1}: "
-                            f"scores {scores} did not clear {self._STEP_TOOL_PASS_THRESHOLD}/5 pass bar"
-                        )
-                        continue
-
-                    what_it_helps = (candidate.get("what_it_helps") or "").strip()
-                    if not what_it_helps:
-                        is_stub = is_step_cited or not tool_record.get("url")
-                        if is_stub:
-                            # No step-specific text from the LLM and no real DB
-                            # description to fall back on — showing the internal
-                            # stub placeholder would assert an unverifiable claim.
-                            continue
-                        what_it_helps = tool_record.get("description", "")
-
-                    # Trust the DB's own url over whatever the LLM echoed back;
-                    # only step-cited stubs (no DB record) fall through to it.
-                    db_url = tool_record.get("url")
-                    assigned_tool_names_lower.add(canonical.lower())
-                    action_plans[plan_idx]["step_tools"][step_idx] = {
-                        "tool_name": canonical,
-                        "website": db_url or candidate.get("website") or None,
-                        "what_it_helps": what_it_helps,
-                        "scores": {crit: scores.get(crit) for crit in bars},
+                if len(passing) >= 2:
+                    # Same effort convention the old embedding-based mechanism
+                    # used for a 2-tool combination (recommender_db.py::
+                    # recommend_automation_stacks: "Medium" for 2-3 tools).
+                    action_plans[plan_idx]["step_stacks"][step_idx] = {
+                        "tools": passing,
+                        "estimated_effort": "Medium",
                     }
+                    stacked_steps += 1
+                    logger.info(
+                        f"Stacked {[p['tool_name'] for p in passing]} → plan {plan_idx + 1} "
+                        f"step {step_idx + 1} '{action_plans[plan_idx]['title'][:40]}'"
+                    )
+                elif len(passing) == 1:
+                    action_plans[plan_idx]["step_tools"][step_idx] = passing[0]
                     assigned_steps += 1
                     logger.info(
-                        f"Assigned '{canonical}' → plan {plan_idx + 1} step {step_idx + 1} "
+                        f"Assigned '{passing[0]['tool_name']}' → plan {plan_idx + 1} step {step_idx + 1} "
                         f"'{action_plans[plan_idx]['title'][:40]}'"
                     )
-                    break  # step satisfied — don't consider its 2nd candidate
 
         total_eligible_steps = sum(
             len(action_plans[i].get("what_to_do", []))
@@ -1125,8 +1156,8 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
             if isinstance(action_plans[i].get("what_to_do"), list)
         )
         logger.info(
-            f"Step-level assignment complete: {assigned_steps}/{total_eligible_steps} "
-            f"steps across {len(needy_indices)} plans received a tool"
+            f"Step-level assignment complete: {assigned_steps} single-tool + {stacked_steps} stacked "
+            f"of {total_eligible_steps} steps across {len(needy_indices)} plans received a tool"
         )
         return action_plans
 
@@ -1828,6 +1859,8 @@ OUTPUT FORMAT (JSON only, no markdown):
 
         tools_count = sum(
             1 for ap in action_plans for t in (ap.get("step_tools") or []) if t
+        ) + sum(
+            1 for ap in action_plans for s in (ap.get("step_stacks") or []) if s
         )
         score += min(tools_count * 2, 6)
 
@@ -1909,6 +1942,11 @@ OUTPUT FORMAT (JSON only, no markdown):
                     for ap in action_plans_result["action_plans"]
                     for t in (ap.get("step_tools") or [])
                     if t
+                ) + sum(
+                    1
+                    for ap in action_plans_result["action_plans"]
+                    for s in (ap.get("step_stacks") or [])
+                    if s
                 ),
                 recommendation_mode=recommendation_mode,
                 single_tool_recommendation=single_tool_recommendation,
