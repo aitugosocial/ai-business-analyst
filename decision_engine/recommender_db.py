@@ -366,6 +366,38 @@ def recommend_tools(user_query: str, top_k: int = 5, db_session: Session = None)
     return recommender.recommend(user_query, top_k)
 
 
+def find_tool_by_name(name: str, db_session: Session) -> Optional[dict]:
+    """Exact (case-insensitive) name lookup, bypassing semantic search.
+
+    Used for tools the user names directly in their prompt — semantic search
+    over an action *description* can miss a specific named product entirely,
+    but the user already told us exactly which tool they mean, so look it up
+    directly instead of hoping retrieval surfaces it.
+    """
+    from database.pg_models import AITool
+
+    if not name or not name.strip():
+        return None
+
+    tool = (
+        db_session.query(AITool)
+        .filter(AITool.name.ilike(name.strip()))
+        .first()
+    )
+    if not tool:
+        return None
+
+    return {
+        "tool_name": tool.name,
+        "similarity_score": 1.0,
+        "description": tool.description,
+        "url": tool.url or "",
+        "key_features": tool.key_features,
+        "who_should_use": tool.who_should_use,
+        "compatibility_integration": tool.compatibility_integration,
+    }
+
+
 def _safe_parse_text_list(value: Any) -> list[str]:
     """Parse semi-structured text/json fields into a normalized string list."""
     if value is None:
