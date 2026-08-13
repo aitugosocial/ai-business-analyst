@@ -84,6 +84,7 @@ Thumbs.db
 # Testing
 coverage/
 ai/cache/
+decision_engine/cache/
 create_stripe_prices.py
 
 *Zone.Identifier

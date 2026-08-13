@@ -760,7 +760,7 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         Flow:
         1. Search for candidates per plan using ONLY that plan's steps (not user_query)
         2. Pool all unique candidates into a single deduplicated catalog
-        3. One LLM call proposes up to 2 ranked candidates per step, each with
+        3. One LLM call proposes up to 4 ranked candidates per step, each with
            the 5 criterion scores (0-100) the tool must earn for that step
         4. Python deterministically gates every proposal against the pass bar
            and enforces global uniqueness — the LLM's scores are advisory
@@ -1025,7 +1025,7 @@ Good: "Step 2: Its automated re-engagement sequences feature sends a personalise
 Bad: "A powerful automation platform that can help with re-engagement."
 
 STEP 3 — CANDIDATES, RANKED
-For each step you're confident about, return up to 2 candidates ordered best-first. Do not pad with a weak second choice just to fill the slot — but if two DIFFERENT catalog tools each independently perform this step's action and each clears task_relevance >= {bars['task_relevance']} on their own documented features, return both; that is exactly the case the system is designed to surface as a combined recommendation, not something to withhold in favor of a single winner.
+For each step you're confident about, return up to 4 candidates ordered best-first. Do not pad with a weak choice just to fill a slot — but if multiple DIFFERENT catalog tools each independently perform this step's action and each clears task_relevance >= {bars['task_relevance']} on their own documented features, return all of them (up to 4); that is exactly the case the system is designed to surface as a combined recommendation, not something to withhold in favor of a single winner.
 
 STEP 4 — ASSIGNMENT RULES
 1. Do not propose the same tool for two different steps in this plan.
@@ -1057,9 +1057,18 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
                     model=self.fast_model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.2,
-                    max_tokens=600,
+                    # 600 was sized for up to 2 candidates/step; raised alongside
+                    # the STEP 3 cap going to 4 so a plan with several steps that
+                    # each get multiple candidates has headroom to not truncate
+                    # (see the finish_reason=="length" warning below).
+                    max_tokens=1200,
                 )
                 raw = response.choices[0].message.content.strip()
+                if response.choices[0].finish_reason == "length":
+                    logger.warning(
+                        f"Step-assignment response for plan {plan_idx + 1} was TRUNCATED by "
+                        f"max_tokens ({len(raw)} chars) — some steps/candidates are likely missing"
+                    )
                 if "```json" in raw:
                     raw = raw.split("```json")[1].split("```")[0].strip()
                 elif "```" in raw:
@@ -1186,23 +1195,24 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
             what_to_do_list = action_plans[plan_idx].get("what_to_do", [])
             step_count = len(what_to_do_list) if isinstance(what_to_do_list, list) else 0
             for step_idx in range(step_count):
-                # Evaluate BOTH ranked candidates (not just the first that
-                # passes) — a step where 2 tools independently clear the gate
-                # is exactly what should become an automation stack, not a
-                # single tool with the runner-up silently discarded (item 42).
+                # Evaluate ALL ranked candidates (not just the first that
+                # passes) — a step where multiple tools independently clear
+                # the gate is exactly what should become an automation stack,
+                # not a single tool with the runner-up(s) silently discarded
+                # (item 42).
                 passing = [
                     entry
-                    for candidate in (by_step.get((plan_idx, step_idx), []) or [])[:2]
+                    for candidate in (by_step.get((plan_idx, step_idx), []) or [])[:4]
                     if (entry := _evaluate_candidate(candidate, plan_idx, step_idx))
                 ]
 
                 if len(passing) >= 2:
                     # Same effort convention the old embedding-based mechanism
-                    # used for a 2-tool combination (recommender_db.py::
-                    # recommend_automation_stacks: "Medium" for 2-3 tools).
+                    # used (recommender_db.py::recommend_automation_stacks):
+                    # "Medium" for 2-3 tools, "High" for 4+.
                     action_plans[plan_idx]["step_stacks"][step_idx] = {
                         "tools": passing,
-                        "estimated_effort": "Medium",
+                        "estimated_effort": "Medium" if len(passing) <= 3 else "High",
                     }
                     stacked_steps += 1
                     logger.info(
