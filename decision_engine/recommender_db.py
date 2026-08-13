@@ -11,6 +11,7 @@ import os
 import pickle
 import re
 import sys
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -35,6 +36,18 @@ try:
 except Exception as e:
     logger.error(f"Error initializing SentenceTransformer: {e}")
     raise
+
+# agentic_analyzer.py runs one recommend_tools() call per action plan
+# concurrently (asyncio.gather + asyncio.to_thread, one OS thread per plan),
+# and every one of them calls into this single shared `model` object. The
+# underlying HuggingFace fast tokenizer isn't safe for concurrent use across
+# threads — two encode() calls landing at the same instant raise a Rust-level
+# "Already borrowed" panic, which callers below catch and silently treat as
+# "no candidates for this plan" (the same failure mode the Session race in
+# get_recommender() had, just one layer down). Serializing access to `model`
+# is cheap — a single encode() call is a few milliseconds — and removes the
+# race entirely.
+_model_lock = threading.Lock()
 
 
 class AIToolRecommender:
@@ -159,11 +172,19 @@ class AIToolRecommender:
         Load tools from database and generate/load embeddings.
         Uses caching to avoid regenerating embeddings on every restart.
         """
+        from database.pg_connections import SessionLocal
         from database.pg_models import AITool
 
+        # This instance is a process-wide singleton (see get_recommender)
+        # reused across every request for the rest of the process's life —
+        # querying through the caller's own request-scoped self.db would tie
+        # this long-lived object to whichever request happened to trigger the
+        # first load, and that session may already be closed by the time a
+        # later .refresh() runs. Open a short-lived session of our own instead.
+        session = SessionLocal()
         try:
             # Query all tools from database
-            tools = self.db.query(AITool).all()
+            tools = session.query(AITool).all()
 
             if not tools:
                 logger.warning("No tools found in database. Run migration script first.")
@@ -230,7 +251,8 @@ class AIToolRecommender:
                 if who and who not in ("[", "[]"):
                     parts.append(who[:150])
                 composite_texts.append(" ".join(parts))
-            embeddings = model.encode(composite_texts, convert_to_tensor=False, show_progress_bar=True)
+            with _model_lock:
+                embeddings = model.encode(composite_texts, convert_to_tensor=False, show_progress_bar=True)
 
             self.tools_df = tools_df
             self.embeddings = embeddings
@@ -244,6 +266,8 @@ class AIToolRecommender:
         except Exception as e:
             logger.error(f"Error loading tools from database: {e}")
             raise
+        finally:
+            session.close()
 
     def recommend(self, user_query: str, top_k: int = 5) -> list[dict]:
         """
@@ -262,7 +286,8 @@ class AIToolRecommender:
                 return []
 
             # Generate embedding for user query
-            query_embedding = model.encode([user_query], convert_to_tensor=False)[0]
+            with _model_lock:
+                query_embedding = model.encode([user_query], convert_to_tensor=False)[0]
 
             # Compute cosine similarity
             similarities = cosine_similarity([query_embedding], self.embeddings)[0]
@@ -326,6 +351,23 @@ class AIToolRecommender:
 
 # Global recommender instance (initialized when first needed)
 _recommender_instance = None
+# Guards singleton construction. agentic_analyzer.py fires one
+# recommend_tools() call per action plan concurrently via asyncio.gather, each
+# on its own thread (asyncio.to_thread) — on a cold instance (process start,
+# or right after a worker restart), those threads used to race straight into
+# AIToolRecommender(db_session), all querying the SAME caller-supplied
+# SQLAlchemy Session at once. SQLAlchemy Sessions aren't safe for concurrent
+# use across threads, so every racing thread but one raised "This session is
+# provisioning a new connection; concurrent operations are not permitted",
+# recommend_tools() silently swallowed it and returned [], and 2 of 3 plans
+# lost their entire real candidate pool on every cold start — the actual
+# cause of the "only 1 of N steps got a tool" sparsity, not an LLM/scoring
+# weakness. The lock makes only the first thread build the singleton; the
+# rest block until it's ready, then reuse it — no more concurrent access to
+# a shared Session during that first load. _load_tools() also now opens its
+# own dedicated session (see above) so even the winning thread no longer
+# touches the caller's session at all.
+_recommender_lock = threading.Lock()
 
 
 def get_recommender(db_session: Session) -> AIToolRecommender:
@@ -342,7 +384,9 @@ def get_recommender(db_session: Session) -> AIToolRecommender:
     global _recommender_instance
 
     if _recommender_instance is None:
-        _recommender_instance = AIToolRecommender(db_session)
+        with _recommender_lock:
+            if _recommender_instance is None:  # re-check: lost the race while waiting
+                _recommender_instance = AIToolRecommender(db_session)
 
     return _recommender_instance
 
@@ -505,7 +549,8 @@ def recommend_automation_stacks(
     if recommender.embeddings is None or len(recommender.embeddings) == 0:
         return []
 
-    query_embedding = model.encode([user_query], convert_to_tensor=False)[0]
+    with _model_lock:
+        query_embedding = model.encode([user_query], convert_to_tensor=False)[0]
     global_similarities = cosine_similarity([query_embedding], recommender.embeddings)[0]
 
     action_queries: list[tuple[int, str]] = []
@@ -532,14 +577,16 @@ def recommend_automation_stacks(
     action_similarity_maps: dict[int, np.ndarray] = {}
     action_step_similarity_maps: dict[int, list[np.ndarray]] = {}
     for action_id, query in action_queries:
-        action_embedding = model.encode([query], convert_to_tensor=False)[0]
+        with _model_lock:
+            action_embedding = model.encode([query], convert_to_tensor=False)[0]
         action_sims = cosine_similarity([action_embedding], recommender.embeddings)[0]
         action_similarity_maps[action_id] = action_sims
         candidate_indices.update(np.argsort(action_sims)[::-1][:8].tolist())
 
         steps_list = action_step_texts.get(action_id) or []
         if steps_list:
-            step_embeddings = model.encode(steps_list, convert_to_tensor=False)
+            with _model_lock:
+                step_embeddings = model.encode(steps_list, convert_to_tensor=False)
             action_step_similarity_maps[action_id] = [
                 cosine_similarity([step_embedding], recommender.embeddings)[0]
                 for step_embedding in step_embeddings
