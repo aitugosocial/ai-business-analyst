@@ -830,8 +830,14 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
                     action_description=action_description,
                     # Wider than the old per-plan search (12) since candidates
                     # now need to cover multiple distinct steps within a plan,
-                    # not just the plan as a whole.
-                    top_k=15,
+                    # not just the plan as a whole. A step-level automation
+                    # stack needs 2+ DIFFERENT tools to each independently
+                    # clear task_relevance>=90 for the SAME step — with a
+                    # 3-5 step plan, 15 pooled candidates leaves little
+                    # headroom for a second genuine match once the top pick
+                    # per step is accounted for, which was suppressing
+                    # otherwise-legitimate stacks. Raised to 20.
+                    top_k=20,
                 ),
                 self._extract_mentioned_tools(what_to_do_list),
             )
@@ -869,7 +875,41 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
                 all_tools[canonical_name] = record
                 logger.info(f"Injected user-cited tool: '{canonical_name}'")
 
-        for plan_idx, candidates, cited in plan_results:
+        # Tools cited inside LLM-generated step text (plan_step_cited, gathered
+        # below) previously got a bare textual stub with no url/key_features —
+        # unlike user_cited_names above, they never got an exact DB lookup, so
+        # a real catalog tool (e.g. Asana) named in a step but absent from
+        # that plan's own top-15 semantic search results had no documented
+        # features for the scoring LLM to ground "what_it_helps" in. Since
+        # _evaluate_candidate rejects any candidate with no url AND no
+        # what_it_helps text, the LLM often had nothing defensible to write
+        # and silently dropped the citation despite the STEP-CITED OVERRIDE
+        # instruction. Resolve every step-cited name by exact DB lookup too,
+        # same as a user-cited one, so real catalog tools keep their real data.
+        all_step_cited_names = dict.fromkeys(
+            name for _, _, cited in plan_results for name in cited
+        )
+
+        async def _resolve_step_cited(name: str) -> tuple[str, Optional[dict]]:
+            record = await asyncio.to_thread(find_tool_by_name, name, self.db)
+            return name, record
+
+        step_cited_records = dict(
+            await asyncio.gather(*(_resolve_step_cited(n) for n in all_step_cited_names))
+        )
+        # Case-insensitive view, since the LLM's step-text casing of a cited
+        # name won't necessarily match the DB row's casing exactly.
+        step_cited_records_ci = {k.lower(): v for k, v in step_cited_records.items() if v}
+
+        for plan_idx, candidates, cited_raw in plan_results:
+            # Normalise each cited name to its DB-canonical form (when a
+            # match was found) up front, so every later dict lookup keyed by
+            # tool name — all_tools, canonical_map, tools_section — agrees
+            # regardless of the casing/wording the LLM used in step text.
+            cited = [
+                step_cited_records_ci.get(name.lower(), {}).get("tool_name", name)
+                for name in cited_raw
+            ]
             names_for_plan: list[str] = []
             for t in candidates:
                 name = t["tool_name"]
@@ -886,20 +926,37 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
             plan_candidate_names[plan_idx] = names_for_plan
             plan_step_cited[plan_idx] = cited
 
-            # Inject cited tools not found by semantic search as stubs so the
-            # LLM can assign them back to this plan
+            # Inject cited tools not found by semantic search — with real
+            # catalog data when the exact-lookup above found a matching row,
+            # falling back to a bare stub only for tools genuinely absent
+            # from the DB — so the LLM can assign them back to this plan.
             for cited_name in cited:
                 cited_lower = cited_name.lower()
-                already_in = any(k.lower() == cited_lower for k in all_tools)
-                if not already_in:
-                    all_tools[cited_name] = {
-                        "tool_name": cited_name,
-                        "url": None,
-                        "website": None,
-                        "description": f"Tool cited by name in plan steps — assign to the plan that mentions it.",
-                        "_step_cited": True,
-                    }
-                    logger.info(f"Injected step-cited tool stub: '{cited_name}' for plan {plan_idx + 1}")
+                existing_key = next((k for k in all_tools if k.lower() == cited_lower), None)
+                if existing_key:
+                    # Already present via semantic search — still flag it as
+                    # step-cited so it keeps the [CITED IN STEPS] tag and the
+                    # gate exemption below; without this a tool that is BOTH
+                    # a semantic-search hit AND explicitly named in the step
+                    # text silently loses its citation status and has to
+                    # clear the full 90+ task_relevance bar like any ordinary
+                    # candidate, which is how a genuinely cited tool (e.g.
+                    # Asana) can still get rejected despite being named.
+                    all_tools[existing_key]["_step_cited"] = True
+                else:
+                    db_record = step_cited_records_ci.get(cited_lower)
+                    if db_record:
+                        all_tools[db_record["tool_name"]] = {**db_record, "_step_cited": True}
+                        logger.info(f"Injected step-cited tool (DB match): '{db_record['tool_name']}' for plan {plan_idx + 1}")
+                    else:
+                        all_tools[cited_name] = {
+                            "tool_name": cited_name,
+                            "url": None,
+                            "website": None,
+                            "description": f"Tool cited by name in plan steps — assign to the plan that mentions it.",
+                            "_step_cited": True,
+                        }
+                        logger.info(f"Injected step-cited tool stub: '{cited_name}' for plan {plan_idx + 1}")
 
         if not all_tools:
             return action_plans
@@ -1306,9 +1363,10 @@ PER-PLAN REQUIREMENTS:
 (a) The EXACT action to take
 (b) The SPECIFIC output or deliverable it produces
 (c) The METRIC or observable signal that confirms it is done correctly
+(d) If the action genuinely requires software to execute, NAME A SPECIFIC REAL PRODUCT by its actual name — "in Typeform", "using Zapier", "via Google Sheets" — never a generic category like "a form tool", "an automation platform", or "a spreadsheet tool". This is not optional decoration: a vague category name cannot be matched to a real recommendation downstream, a specific product name can. Only name a tool where the step genuinely needs one — steps that are a decision, a call, or manual judgment need no tool at all.
 Steps are SEQUENTIAL — each builds on the previous and assumes its completion.
-Good: "Write a 3-question post-purchase survey targeting the moment of highest engagement — the confirmation page — using a free form tool, and set a 24-hour email trigger to send to every buyer. Review the first 20 responses to identify the top two unmet expectations."
-Bad: "Collect customer feedback."
+Good: "Build a 3-question post-purchase survey in Typeform targeting the moment of highest engagement — the confirmation page — and set a 24-hour trigger in Zapier to email it to every buyer automatically. Review the first 20 responses to identify the top two unmet expectations."
+Bad: "Collect customer feedback using a form tool."
 
 "why_it_matters" — EXACTLY 2–3 impact statements (no more than 3) in second person:
 At least one must name a UNIT ECONOMICS metric (CAC, LTV, gross margin, payback period, contribution margin) with a calibrated range and timeframe.
