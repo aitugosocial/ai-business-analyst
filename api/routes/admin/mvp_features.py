@@ -60,7 +60,7 @@ _SEED_FEATURES = [
     {"name": "Help & Support",      "directory": "/dashboard/customer-service",             "is_in_mvp": True,  "has_sub_pages": False, "is_in_next_feature_launch": False, "sub_pages": []},
     {"name": "Analyses",            "directory": "/dashboard/analyses",                     "is_in_mvp": True,  "has_sub_pages": False, "is_in_next_feature_launch": False, "sub_pages": []},
     {"name": "Opportunities",       "directory": "/dashboard/opportunity-alerts",           "is_in_mvp": True,  "has_sub_pages": False, "is_in_next_feature_launch": False, "sub_pages": []},
-    {"name": "Leaderboard",         "directory": "/dashboard/leaderboard",                  "is_in_mvp": False, "has_sub_pages": False, "is_in_next_feature_launch": True,  "sub_pages": []},
+    {"name": "Leaderboard",         "directory": "/dashboard/leaderboard",                  "is_in_mvp": True,  "has_sub_pages": False, "is_in_next_feature_launch": False, "sub_pages": []},
     {"name": "Community",           "directory": "/dashboard/community",                    "is_in_mvp": False, "has_sub_pages": False, "is_in_next_feature_launch": True,  "sub_pages": []},
     {"name": "Market place",        "directory": "/dashboard/market-place",                 "is_in_mvp": False, "has_sub_pages": False, "is_in_next_feature_launch": True,  "sub_pages": []},
     {"name": "Reviews",             "directory": "/dashboard/reviews",                      "is_in_mvp": True,  "has_sub_pages": False, "is_in_next_feature_launch": False, "sub_pages": []},
