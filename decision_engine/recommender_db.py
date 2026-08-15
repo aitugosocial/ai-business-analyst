@@ -4,6 +4,7 @@ AI Tool Recommender using PostgreSQL database.
 This replaces the CSV-based recommender with database queries.
 """
 
+import difflib
 import hashlib
 import json
 import logging
@@ -411,23 +412,52 @@ def recommend_tools(user_query: str, top_k: int = 5, db_session: Session = None)
 
 
 def find_tool_by_name(name: str, db_session: Session) -> Optional[dict]:
-    """Exact (case-insensitive) name lookup, bypassing semantic search.
+    """Exact (case-insensitive) name lookup, bypassing semantic search, with a
+    substring/fuzzy fallback when nothing matches exactly.
 
     Used for tools the user names directly in their prompt — semantic search
     over an action *description* can miss a specific named product entirely,
     but the user already told us exactly which tool they mean, so look it up
     directly instead of hoping retrieval surfaces it.
+
+    A citation frequently doesn't match a catalog name verbatim (e.g. "Notion"
+    vs. the catalog's "Notion AI", or "Google Sheet" vs. "Google Sheets") —
+    without a fallback those resolve to nothing and the caller falls back
+    further to an ungrounded stub (no real url/description). Substring
+    containment (either direction) catches brand-vs-product-line mismatches;
+    difflib catches typos/near-misses. Both still only ever return a real
+    catalog row, never a fabricated one.
     """
     from database.pg_models import AITool
 
     if not name or not name.strip():
         return None
+    query = name.strip()
 
     tool = (
         db_session.query(AITool)
-        .filter(AITool.name.ilike(name.strip()))
+        .filter(AITool.name.ilike(query))
         .first()
     )
+
+    if not tool and len(query) >= 3:
+        query_lower = query.lower()
+        all_tools = db_session.query(AITool.id, AITool.name).all()
+
+        substring_matches = [
+            t for t in all_tools
+            if query_lower in t.name.lower() or t.name.lower() in query_lower
+        ]
+        if substring_matches:
+            best = min(substring_matches, key=lambda t: abs(len(t.name) - len(query)))
+            tool = db_session.query(AITool).get(best.id)
+        else:
+            close = difflib.get_close_matches(
+                query, [t.name for t in all_tools], n=1, cutoff=0.82
+            )
+            if close:
+                tool = db_session.query(AITool).filter(AITool.name == close[0]).first()
+
     if not tool:
         return None
 

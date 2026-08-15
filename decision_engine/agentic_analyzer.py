@@ -1041,7 +1041,7 @@ Your output appears directly on an action plan card that a solo founder will use
 GLOBAL QUALITY STANDARDS — every "what_it_helps" you write must pass ALL of these:
 1. PERSONA: Second person only — "you", "your". Never "the user", "the founder", or any third-person reference.
 2. SPECIFICITY: Passes the intern test — a smart person with zero context about the tool can tell exactly what feature does what, for this exact step, on first read.
-3. GROUNDING: Name the actual Key Feature / integration from the catalog block below, not a paraphrase of the generic description. If the catalog gives you nothing concrete enough to name, that candidate is not a 90+ task_relevance and should not be proposed.
+3. GROUNDING: Name the actual Key Feature / integration from the catalog block below, not a paraphrase of the generic description. If the catalog gives you nothing concrete enough to name, that candidate is not a 90+ task_relevance and should not be proposed. EXCEPTION: this does not apply to a tool marked [CITED IN STEPS] or [USER-NAMED] that has real catalog data (a URL, Key Features, or Integrates With entries) — those are covered by the overrides below and MUST still be proposed even if their catalog entry is thin; write what_it_helps from whatever real data is present rather than omitting the candidate. A [CITED IN STEPS]/[USER-NAMED] tool with NO catalog data at all (no URL, no features) is the one case this standard still blocks — omit it rather than inventing a description for a product with no verified data behind it.
 4. COMMITMENT: Never hedge with "can help", "may assist", "is useful for", or "could be used to". State plainly what it does — "sends", "generates", "tracks" — not what it might do.
 5. FORMATTING: Do NOT start any text value with a dash, bullet, or em dash.
 
@@ -1060,7 +1060,7 @@ SCORING RUBRIC — for every candidate you propose, score all 5 criteria honestl
 - ease_of_implementation (bar: {bars['ease_of_implementation']}): can a non-technical founder start using it the same day, no engineering help required?
 - cost_efficiency (bar: {bars['cost_efficiency']}): is there a free tier or low-cost plan sufficient at solo-founder volume?
 
-Only propose a candidate for a step if you would defend task_relevance >= {bars['task_relevance']} under scrutiny from another independent reviewer. If no catalog tool's documented function genuinely performs a step's action, omit that step entirely.
+Only propose a candidate for a step if you would defend task_relevance >= {bars['task_relevance']} under scrutiny from another independent reviewer. If no catalog tool's documented function genuinely performs a step's action, omit that step entirely. This bar does not gate a [CITED IN STEPS] or [USER-NAMED] tool with real catalog data — score it honestly, but propose it regardless of where it lands; the STEP-CITED/USER-NAMED OVERRIDE below exempts it from this bar in code.
 
 USER BUSINESS CHALLENGE: "{user_query}"
 
