@@ -1018,12 +1018,16 @@ async def vote_poll(
     if poll_payload and poll_payload.get("is_closed"):
         raise HTTPException(status_code=400, detail="This poll has closed and is no longer accepting votes.")
 
-    # Strictly enforce ONE VOTE per user: block re-voting if user already voted
+    # Strictly enforce ONE VOTE per user: if user already voted, return status already_voted with canonical poll
     existing_vote = db.query(DiscussionPollVote).filter_by(
         discussion_id=discussion_id, user_id=current_user.id
     ).first()
     if existing_vote:
-        raise HTTPException(status_code=400, detail="You have already voted in this poll.")
+        return {
+            "status": "already_voted",
+            "message": "You have already voted in this poll.",
+            "poll": _get_poll_payload(d, current_user=current_user, db=db)
+        }
 
     vote = DiscussionPollVote(
         discussion_id=discussion_id,
