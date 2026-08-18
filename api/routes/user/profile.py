@@ -84,6 +84,7 @@ def get_profile(
         "total_chops": current_user.total_chops or 0,
         "login_streak": current_user.login_streak or 0,
         "hide_public_metrics": getattr(current_user, 'hide_public_metrics', False),
+        "referral_code": current_user.referral_code or "",
         "expertise": getattr(current_user, 'expertise', None) or ["Product design", "Community", "No-code", "Brand", "Growth loops"],
         "open_to": getattr(current_user, 'open_to', None) or ["Weekly decision swaps", "Co-founder conversations", "Beta testing partnerships", "Warm intros to creators"],
         "recent_wins": getattr(current_user, 'recent_wins', None) or ["Crossed 40 activated beta founders", "Shipped the Build Room v2 prototype", "Featured as top contributor this month"],
