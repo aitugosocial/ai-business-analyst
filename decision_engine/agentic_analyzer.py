@@ -32,8 +32,11 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
+from database.pg_models import AITool
 from decision_engine.recommender_db import (
     _safe_parse_text_list,
+    compile_catalog_name_pattern,
+    find_catalog_names_in_text,
     find_tool_by_name,
     recommend_automation_stacks,
     recommend_tools,
@@ -795,6 +798,25 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         # plan_idx → tool names explicitly named inside what_to_do step text
         plan_step_cited: dict[int, list[str]] = {}
 
+        # _extract_mentioned_tools below is an LLM call that silently returns
+        # [] on ANY failure (bad JSON, rate limit, the model just missing a
+        # name) — there's no retry and, until now, no fallback, so a cited
+        # tool could depend entirely on one non-deterministic call succeeding
+        # to ever be considered "cited" at all. Every fix made to the
+        # scoring/gate logic downstream (STEP-CITED OVERRIDE, the GROUNDING
+        # carve-out, etc.) is powerless if the tool was never flagged as
+        # cited in the first place. Build one compiled regex against the
+        # WHOLE real catalog, once, and use it below as a deterministic
+        # backstop that doesn't depend on the LLM at all — if a step's text
+        # literally contains a real catalog tool's name, it's caught
+        # regardless of what the extraction call did.
+        catalog_names = [
+            n for (n,) in await asyncio.to_thread(
+                lambda: self.db.query(AITool.name).all()
+            )
+        ]
+        catalog_name_pattern = compile_catalog_name_pattern(catalog_names)
+
         # Tools the user named directly in their own prompt (not the
         # LLM-generated step text — Stage 3 often paraphrases a named tool
         # like "Zapier" into a generic action, e.g. "automate the handoff",
@@ -803,7 +825,10 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         # shared across every plan. Resolved by exact DB lookup rather than
         # semantic search, since semantic search over an action description
         # can easily miss a specific named product.
-        user_cited_names = await self._extract_mentioned_tools([user_query])
+        user_cited_names = list(dict.fromkeys(
+            await self._extract_mentioned_tools([user_query])
+            + find_catalog_names_in_text(user_query, catalog_name_pattern)
+        ))
 
         # Per-plan search + citation-extraction are independent of each other —
         # run them concurrently instead of one plan at a time, so the N
@@ -849,6 +874,12 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
                 ),
                 self._extract_mentioned_tools(what_to_do_list),
             )
+            # Deterministic backstop (see catalog_name_pattern above) — union
+            # in any real catalog name that literally appears in this plan's
+            # step text, regardless of what the LLM extraction call did.
+            cited = list(dict.fromkeys(
+                cited + find_catalog_names_in_text(steps_text, catalog_name_pattern)
+            ))
             return plan_idx, candidates, cited
 
         plan_results = await asyncio.gather(*(_gather_plan_data(idx) for idx in needy_indices))
@@ -1646,7 +1677,6 @@ OUTPUT FORMAT (JSON only, no markdown fences):
         Also generates per-plan descriptions so each action card shows unique context for
         the same tool — no extra LLM call, same request with more structured output.
         """
-        from database.pg_models import AITool
         try:
             # See _search_ai_tools — must not block the event loop on a cache miss.
             tools = await asyncio.to_thread(recommend_tools, user_query, top_k=3, db_session=self.db)
