@@ -172,6 +172,14 @@ _TOPIC_SLUGS = {
 }
 
 
+def _slugify(text: str) -> str:
+    if not text:
+        return "post"
+    clean = re.sub(r'[^a-zA-Z0-9\s\-]', '', text).lower().strip()
+    slug = re.sub(r'[\s\-]+', '-', clean)
+    return slug or "post"
+
+
 def _get_poll_payload(d: CommunityDiscussion, current_user: Optional[User] = None, db: Optional[Session] = None) -> Optional[dict]:
     poll_data = getattr(d, 'poll_data', None)
     if not poll_data or not isinstance(poll_data, dict):
@@ -223,7 +231,8 @@ def _get_poll_payload(d: CommunityDiscussion, current_user: Optional[User] = Non
 
     if expires_at_raw:
         try:
-            expires_dt = datetime.fromisoformat(expires_at_raw)
+            clean_iso = str(expires_at_raw).replace('Z', '+00:00')
+            expires_dt = datetime.fromisoformat(clean_iso)
             now = datetime.now(timezone.utc)
             if expires_dt.tzinfo is None:
                 expires_dt = expires_dt.replace(tzinfo=timezone.utc)
@@ -299,8 +308,12 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, sa
     tagged_ids = getattr(d, 'tagged_user_ids', None) or []
     visibility_val = getattr(d, 'visibility', 'public') or 'public'
 
+    slug_val = _slugify(d.title or "")
+
     return {
         "id": d.id, "channel_id": d.channel_id, "title": d.title, "content": d.content,
+        "slug": slug_val,
+        "canonical_url": f"https://lavoo.io/l/thebuildroom/posts/{d.id}/{slug_val}",
         "tags": d.tags or [], "like_count": d.like_count, "reply_count": d.reply_count,
         "likes": d.like_count, "replies": d.reply_count,
         "pinned": d.is_pinned, "is_pinned": d.is_pinned,
@@ -547,53 +560,53 @@ async def get_discussions(
         cache_key = f"community:discussions:user:{user_id_str}:ch:{channel_id}:lim:{limit}:off:{offset}"
         cached = await get_cached(cache_key)
         if cached is not None:
-            # Bypass stale cache if any reflection item is missing mission_task
-            has_stale_reflection = False
-            if isinstance(cached, list):
-                for item in cached:
+            items = cached.get("data") if isinstance(cached, dict) else (cached if isinstance(cached, list) else None)
+            if items and isinstance(items, list):
+                # Bypass stale cache if any reflection item is missing mission_task
+                has_stale_reflection = False
+                for item in items:
                     if isinstance(item, dict) and item.get("type") == "mission_reflection" and not item.get("mission_task"):
                         has_stale_reflection = True
                         break
-            if not has_stale_reflection:
-                # Dynamically inject current user's real-time liked & bookmarked status
-                if current_user and isinstance(cached, list):
-                    post_ids = [i.get("id") for i in cached if isinstance(i, dict) and isinstance(i.get("id"), int)]
+                if not has_stale_reflection:
+                    post_ids = [i.get("id") for i in items if isinstance(i, dict) and isinstance(i.get("id"), int)]
                     if post_ids:
-                        user_likes = {row[0] for row in db.query(DiscussionLike.discussion_id).filter(
-                            DiscussionLike.user_id == current_user.id,
-                            DiscussionLike.discussion_id.in_(post_ids)
-                        ).all()}
-                        bm_saves = {row[0] for row in db.query(DiscussionBookmark.discussion_id).filter(
-                            DiscussionBookmark.user_id == current_user.id,
-                            DiscussionBookmark.discussion_id.in_(post_ids)
-                        ).all()}
-                        tbl_saves = {row[0] for row in db.query(SavedItem.item_id).filter(
-                            SavedItem.user_id == current_user.id,
-                            SavedItem.item_id.in_(post_ids)
-                        ).all()}
-                        user_saves = bm_saves.union(tbl_saves)
-                        for item in cached:
-                            if isinstance(item, dict) and isinstance(item.get("id"), int):
-                                pid = item["id"]
-                                item["has_liked"] = pid in user_likes
-                                item["liked_by_user"] = pid in user_likes
-                                item["isBookmarked"] = pid in user_saves
-                                item["is_saved"] = pid in user_saves
-                                item["saved_by_user"] = pid in user_saves
-                                item["bookmarked"] = pid in user_saves
+                        if current_user:
+                            user_likes = {row[0] for row in db.query(DiscussionLike.discussion_id).filter(
+                                DiscussionLike.user_id == current_user.id,
+                                DiscussionLike.discussion_id.in_(post_ids)
+                            ).all()}
+                            bm_saves = {row[0] for row in db.query(DiscussionBookmark.discussion_id).filter(
+                                DiscussionBookmark.user_id == current_user.id,
+                                DiscussionBookmark.discussion_id.in_(post_ids)
+                            ).all()}
+                            tbl_saves = {row[0] for row in db.query(SavedItem.item_id).filter(
+                                SavedItem.user_id == current_user.id,
+                                SavedItem.item_id.in_(post_ids)
+                            ).all()}
+                            user_saves = bm_saves.union(tbl_saves)
+                            for item in items:
+                                if isinstance(item, dict) and isinstance(item.get("id"), int):
+                                    pid = item["id"]
+                                    item["has_liked"] = pid in user_likes
+                                    item["liked_by_user"] = pid in user_likes
+                                    item["isBookmarked"] = pid in user_saves
+                                    item["is_saved"] = pid in user_saves
+                                    item["saved_by_user"] = pid in user_saves
+                                    item["bookmarked"] = pid in user_saves
 
-                    # Rehydrate poll state in real-time for all cached items
-                    poll_pids = [
-                        i["id"] for i in cached
-                        if isinstance(i, dict) and isinstance(i.get("id"), int) and (i.get("type") == "poll" or i.get("poll") is not None)
-                    ]
-                    if poll_pids:
-                        poll_discussions = db.query(CommunityDiscussion).filter(CommunityDiscussion.id.in_(poll_pids)).all()
-                        poll_map = {p.id: _get_poll_payload(p, current_user=current_user) for p in poll_discussions}
-                        for item in cached:
-                            if isinstance(item, dict) and item.get("id") in poll_map:
-                                item["poll"] = poll_map[item["id"]]
-                return cached
+                        # Rehydrate poll state in real-time for all cached items
+                        poll_pids = [
+                            i["id"] for i in items
+                            if isinstance(i, dict) and isinstance(i.get("id"), int) and (i.get("type") == "poll" or i.get("poll") is not None)
+                        ]
+                        if poll_pids:
+                            poll_discussions = db.query(CommunityDiscussion).filter(CommunityDiscussion.id.in_(poll_pids)).all()
+                            poll_map = {p.id: _get_poll_payload(p, current_user=current_user) for p in poll_discussions}
+                            for item in items:
+                                if isinstance(item, dict) and item.get("id") in poll_map:
+                                    item["poll"] = poll_map[item["id"]]
+                    return cached
 
         q = db.query(CommunityDiscussion)
         if channel_id:
@@ -969,6 +982,7 @@ async def create_discussion(
     current_user.total_chops = (current_user.total_chops or 0) + 10
     db.commit()
     db.refresh(d)
+    await delete_cached("community:discussions:*")
     
     _log_activity(db, current_user.id, "posted", d.id, "discussion", d.title)
 
@@ -1016,10 +1030,16 @@ async def vote_poll(
     if poll_payload and poll_payload.get("is_closed"):
         raise HTTPException(status_code=400, detail="This poll has closed and is no longer accepting votes.")
 
-    # Strictly enforce EXACTLY ONE VOTE per user: delete any existing vote row for this user & discussion
-    db.query(DiscussionPollVote).filter_by(
+    # Strictly enforce ONE VOTE per user: if user already voted, return status already_voted with canonical poll
+    existing_vote = db.query(DiscussionPollVote).filter_by(
         discussion_id=discussion_id, user_id=current_user.id
-    ).delete(synchronize_session=False)
+    ).first()
+    if existing_vote:
+        return {
+            "status": "already_voted",
+            "message": "You have already voted in this poll.",
+            "poll": _get_poll_payload(d, current_user=current_user, db=db)
+        }
 
     vote = DiscussionPollVote(
         discussion_id=discussion_id,
@@ -1035,6 +1055,52 @@ async def vote_poll(
     return {
         "status": "success",
         "poll": _get_poll_payload(d, current_user=current_user, db=db)
+    }
+
+
+@router.get("/public/posts/{discussion_id}")
+async def get_public_discussion(
+    discussion_id: int,
+    db: Session = Depends(get_db)
+):
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    if getattr(d, 'visibility', 'public') == 'tagged_only':
+        raise HTTPException(status_code=403, detail="This post is private to tagged members")
+        
+    discussion_data = _discussion_dict(d, liked_ids=set(), saved_ids=set(), current_user=None)
+    
+    replies_raw = db.query(DiscussionReply).filter_by(discussion_id=discussion_id).order_by(DiscussionReply.created_at.asc()).all()
+    author_ids = list(set([r.user_id for r in replies_raw] + [d.user_id]))
+    authors = {u.id: u for u in db.query(User).filter(User.id.in_(author_ids)).all()} if author_ids else {}
+    
+    replies_data = []
+    for r in replies_raw:
+        r_author = authors.get(r.user_id)
+        author_name = r_author.name if r_author else "Member"
+        replies_data.append({
+            "id": r.id,
+            "user_id": r.user_id,
+            "content": r.content,
+            "like_count": r.like_count or 0,
+            "chops_gifted": r.chops_gifted or 0,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "author": {
+                "id": r.user_id,
+                "name": author_name,
+                "initials": (author_name or "M")[:2].upper(),
+                "role": getattr(r_author, 'role', '') if r_author else '',
+            }
+        })
+        
+    return {
+        "success": True,
+        "data": {
+            **discussion_data,
+            "replies_list": replies_data
+        }
     }
 
 
@@ -1693,7 +1759,7 @@ async def get_my_community_profile(
 
 @router.get("/leaderboard")
 async def get_leaderboard(
-    limit: int = Query(10, le=50),
+    limit: int = Query(10, le=500),
     current_user: Optional[User] = Depends(get_current_user_optional),
     db: Session = Depends(get_db)
 ):

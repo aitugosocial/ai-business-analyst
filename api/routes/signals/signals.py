@@ -247,10 +247,13 @@ def _format_signal(signal: Signal, current_user_id: int = None, db: Session = No
             SignalLike.user_id   == current_user_id,
         ).first() is not None
 
+    canonical_url = f"https://lavoo.io/l/thesignal/{signal.id}/{signal.slug}"
+
     return {
         "id":              signal.id,
         "title":           signal.title,
         "slug":            signal.slug,
+        "canonical_url":   canonical_url,
         "excerpt":         signal.excerpt,
         "content":         signal.content,
         "cover_image_url": signal.cover_image_url,
@@ -387,15 +390,15 @@ async def list_signals(
     }
 
 
-@router.get("/{slug}")
+@router.get("/{identifier}")
 async def get_signal(
-    slug: str,
+    identifier: str,
     response: Response,
     db:   Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """
-    Return a single published Signal by its URL slug.
+    Return a single published Signal by its ID or URL slug.
     Increments the view counter on every successful request.
 
     Uses optional auth (get_current_user_optional) so:
@@ -405,10 +408,16 @@ async def get_signal(
     """
     response.headers["Cache-Control"] = "no-store"
 
-    signal = db.query(Signal).filter(
-        Signal.slug   == slug,
-        Signal.status == "published",
-    ).first()
+    if identifier.isdigit():
+        signal = db.query(Signal).filter(
+            Signal.id == int(identifier),
+            Signal.status == "published",
+        ).first()
+    else:
+        signal = db.query(Signal).filter(
+            Signal.slug == identifier,
+            Signal.status == "published",
+        ).first()
 
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found.")
@@ -565,16 +574,13 @@ async def update_signal(
 @router.delete("/{signal_id}", status_code=200)
 async def delete_signal(
     signal_id:    int,
+    permanent:    bool = Query(default=True),
     current_user: User    = Depends(get_current_user),
     db:           Session = Depends(get_db),
 ):
     """
-    Archive (soft-delete) a Signal post by setting its status to "archived".
-
-    - Authors may archive their own posts.
-    - Admins may archive any post.
-    - The record and all engagement data are preserved; the post simply
-      disappears from the public list endpoint.
+    Delete or archive a Signal post.
+    When permanent=True (default), removes the record and its associations completely from the database.
     """
     _require_moderator(current_user)
 
@@ -588,11 +594,18 @@ async def delete_signal(
             detail="You can only delete your own Signal posts.",
         )
 
-    signal.status = "archived"
-    db.commit()
-
-    logger.info(f"Signal archived: id={signal.id} by user={current_user.email}")
-    return {"status": "success", "message": "Signal has been archived."}
+    if permanent:
+        db.query(SignalLike).filter(SignalLike.signal_id == signal_id).delete(synchronize_session=False)
+        db.query(SignalComment).filter(SignalComment.signal_id == signal_id).delete(synchronize_session=False)
+        db.delete(signal)
+        db.commit()
+        logger.info(f"Signal permanently deleted: id={signal_id} by user={current_user.email}")
+        return {"status": "success", "message": "Signal has been permanently deleted."}
+    else:
+        signal.status = "archived"
+        db.commit()
+        logger.info(f"Signal archived: id={signal.id} by user={current_user.email}")
+        return {"status": "success", "message": "Signal has been archived."}
 
 
 # ---------------------------------------------------------------------------
