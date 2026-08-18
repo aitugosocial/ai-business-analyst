@@ -50,6 +50,19 @@ except Exception as e:
 # race entirely.
 _model_lock = threading.Lock()
 
+# find_tool_by_name() runs concurrently too — agentic_analyzer.py resolves
+# every cited/user-named tool via asyncio.gather + asyncio.to_thread (one OS
+# thread per name), and every one of them queries the SAME request-scoped
+# db_session (unlike recommend_tools(), whose singleton loads its own
+# dedicated session once at startup and never touches the caller's session
+# again). SQLAlchemy Session objects aren't safe for concurrent use from
+# multiple threads — two queries landing on the same session at once raise
+# "This session is provisioning a new connection; concurrent operations are
+# not permitted" (sqlalche.me/e/20/isce). Same fix as _model_lock above:
+# serialize access. A name lookup is a handful of milliseconds even with the
+# substring/fuzzy fallback below, so serializing costs nothing.
+_db_lock = threading.Lock()
+
 
 class AIToolRecommender:
     """
@@ -434,29 +447,31 @@ def find_tool_by_name(name: str, db_session: Session) -> Optional[dict]:
         return None
     query = name.strip()
 
-    tool = (
-        db_session.query(AITool)
-        .filter(AITool.name.ilike(query))
-        .first()
-    )
+    # Whole lookup (all queries below) is one critical section — see _db_lock.
+    with _db_lock:
+        tool = (
+            db_session.query(AITool)
+            .filter(AITool.name.ilike(query))
+            .first()
+        )
 
-    if not tool and len(query) >= 3:
-        query_lower = query.lower()
-        all_tools = db_session.query(AITool.id, AITool.name).all()
+        if not tool and len(query) >= 3:
+            query_lower = query.lower()
+            all_tools = db_session.query(AITool.id, AITool.name).all()
 
-        substring_matches = [
-            t for t in all_tools
-            if query_lower in t.name.lower() or t.name.lower() in query_lower
-        ]
-        if substring_matches:
-            best = min(substring_matches, key=lambda t: abs(len(t.name) - len(query)))
-            tool = db_session.query(AITool).get(best.id)
-        else:
-            close = difflib.get_close_matches(
-                query, [t.name for t in all_tools], n=1, cutoff=0.82
-            )
-            if close:
-                tool = db_session.query(AITool).filter(AITool.name == close[0]).first()
+            substring_matches = [
+                t for t in all_tools
+                if query_lower in t.name.lower() or t.name.lower() in query_lower
+            ]
+            if substring_matches:
+                best = min(substring_matches, key=lambda t: abs(len(t.name) - len(query)))
+                tool = db_session.query(AITool).get(best.id)
+            else:
+                close = difflib.get_close_matches(
+                    query, [t.name for t in all_tools], n=1, cutoff=0.82
+                )
+                if close:
+                    tool = db_session.query(AITool).filter(AITool.name == close[0]).first()
 
     if not tool:
         return None

@@ -828,16 +828,24 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
                 self._search_ai_tools(
                     user_query=user_query,
                     action_description=action_description,
-                    # Wider than the old per-plan search (12) since candidates
-                    # now need to cover multiple distinct steps within a plan,
-                    # not just the plan as a whole. A step-level automation
-                    # stack needs 2+ DIFFERENT tools to each independently
-                    # clear task_relevance>=90 for the SAME step — with a
-                    # 3-5 step plan, 15 pooled candidates leaves little
-                    # headroom for a second genuine match once the top pick
-                    # per step is accounted for, which was suppressing
-                    # otherwise-legitimate stacks. Raised to 20.
-                    top_k=20,
+                    # Wider than the old per-plan search (12, then 20) since
+                    # candidates now need to cover multiple distinct steps
+                    # within a plan, not just the plan as a whole. A
+                    # step-level automation stack needs 2+ DIFFERENT tools to
+                    # each independently clear task_relevance>=90 for the SAME
+                    # step — but retrieval here runs ONE embedding search
+                    # against the whole plan's combined text (action_description
+                    # above), not per-step, so a 4-5 step plan spanning several
+                    # distinct topics (e.g. email + forms + analytics) can
+                    # crowd out a step's second genuinely-qualifying tool from
+                    # even reaching the LLM's candidate pool, well before the
+                    # scoring gate ever gets a chance to evaluate it — a recall
+                    # problem, not a bar-strictness one, so the fix is more
+                    # candidates, not a lower bar (2026-08-14/15: bar stays
+                    # fixed at 90 by design — loosening it trades precision for
+                    # stack count instead of just recovering already-qualifying
+                    # tools that retrieval was dropping). Raised 20 -> 30.
+                    top_k=30,
                 ),
                 self._extract_mentioned_tools(what_to_do_list),
             )
@@ -850,7 +858,13 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         # at all, so the LLM still knows it was asked for even without real
         # feature data to defend it against.
         async def _resolve_user_cited(name: str) -> tuple[str, dict]:
-            record = await asyncio.to_thread(find_tool_by_name, name, self.db)
+            try:
+                record = await asyncio.to_thread(find_tool_by_name, name, self.db)
+            except Exception as e:
+                # One bad lookup shouldn't take the whole gather (and every
+                # other plan's tool assignment riding on it) down with it.
+                logger.warning(f"find_tool_by_name failed for user-cited '{name}': {e}")
+                record = None
             if record:
                 record = {**record, "_user_cited": True}
                 return record["tool_name"], record
@@ -891,7 +905,11 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         )
 
         async def _resolve_step_cited(name: str) -> tuple[str, Optional[dict]]:
-            record = await asyncio.to_thread(find_tool_by_name, name, self.db)
+            try:
+                record = await asyncio.to_thread(find_tool_by_name, name, self.db)
+            except Exception as e:
+                logger.warning(f"find_tool_by_name failed for step-cited '{name}': {e}")
+                record = None
             return name, record
 
         step_cited_records = dict(
