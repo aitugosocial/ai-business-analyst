@@ -163,7 +163,7 @@ Return ONLY valid JSON array: no intro text, no markdown block wrappers, no comm
                     "insight_text": text_val,
                     "source": item.get("source", "Based on Founder Intelligence").strip(),
                     "category": item.get("category", "african_tech").strip(),
-                    "accent_color": item.get("accent_color", "#e87a02").strip() or "#e87a02"
+                    "accent_color": "#f97316"
                 })
             return valid_items
         except Exception as parse_err:
