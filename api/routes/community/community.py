@@ -327,6 +327,9 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, sa
         "takeaways": raw_takeaways if (is_subscribed and raw_takeaways) else None,
         "has_takeaways": bool(raw_takeaways),
         "type": post_type_val,
+        "analysis_id": getattr(d, 'analysis_id', None),
+        "analysis_goal": getattr(d, 'analysis_goal', None),
+        "mission_task": getattr(d, 'mission_task', None),
         "tagged_user_ids": tagged_ids,
         "visibility": visibility_val,
         "poll": _get_poll_payload(d, current_user=current_user),
@@ -656,7 +659,6 @@ async def get_discussions(
         result = [_discussion_dict(d, liked_ids=liked, saved_ids=saved, current_user=current_user) for d in discussions]
 
         # Include mission roadmap comments from users who opted in.
-        # Comments live in analysis.user_progress['roadmap_comments'] (a dict of task_id → [comment, ...]).
         try:
             opted_in_user_ids = db.query(UserSettings.user_id).filter(
                 UserSettings.show_mission_comments_in_community == True
@@ -669,34 +671,19 @@ async def get_discussions(
                     .filter(BusinessAnalysis.user_id.in_(opted_in_ids))
                     .all()
                 )
-                any_summaries_changed = False
                 for analysis, author in analyses:
                     up = analysis.user_progress or {}
                     roadmap_comments = up.get('roadmap_comments', {}) if isinstance(up, dict) else {}
                     if not isinstance(roadmap_comments, dict):
                         continue
-                    # Map each task's frontend_id → its mission text, so the
-                    # reflection post title is the mission it was submitted
-                    # under, not the reflection body itself.
                     mission_titles = {
                         t['frontend_id']: t['text'] for t in _flatten_roadmap_tasks(analysis)
                     }
-                    # Full mission text is often too long for the post card's
-                    # title (wraps/overflows). Word-capped summaries are
-                    # computed once per task and persisted in their own column
-                    # (business_analyses.roadmap_task_summaries) so they're
-                    # reused on every later fetch instead of being
-                    # re-summarized — and re-truncated — on every request.
-                    task_summaries = analysis.roadmap_task_summaries
-                    if not isinstance(task_summaries, dict):
-                        task_summaries = {}
-                    analysis_summaries_changed = False
                     for task_id, comments in roadmap_comments.items():
                         if not isinstance(comments, list):
                             continue
                         for comment in comments:
                             text = comment.get('text', '').strip()
-                            # Filter out empty and trivial single-word test placeholders
                             if not text or len(text) < 5 or text.lower().strip('.!') in ('test', 'testing', 'tes', 'tesst', 'text', 'test2', 'tessssst', 'reesss', 'done', 'testtt'):
                                 continue
                             created_at = comment.get('createdAt')
@@ -707,6 +694,7 @@ async def get_discussions(
                                 "type": "mission_reflection",
                                 "title": full_title if full_title else text[:80],
                                 "mission_task": full_title if full_title else text[:80],
+                                "analysis_goal": analysis.business_goal,
                                 "content": text,
                                 "excerpt": text[:160],
                                 "tags": [],
@@ -721,8 +709,8 @@ async def get_discussions(
                                     "id": author.id,
                                     "name": author.name or "Member",
                                     "initials": (author.name or "M")[:2].upper(),
-                                    "gradient": "from-orange-400 to-rose-400",
-                                    "role": "",
+                                    "gradient": _AUTHOR_GRADIENTS[author.id % len(_AUTHOR_GRADIENTS)],
+                                    "role": getattr(author, 'role', '') or 'Founder',
                                     "total_chops": author.total_chops or 0,
                                 },
                                 "channel": "reflections",
@@ -730,14 +718,10 @@ async def get_discussions(
                                 "timeAgo": created_at,
                                 "updated_at": None,
                             })
-                    if analysis_summaries_changed:
-                        analysis.roadmap_task_summaries = task_summaries
-                if any_summaries_changed:
-                    db.commit()
         except Exception as reflection_err:
             logger.warning(f"Mission reflections fetch error: {reflection_err}")
 
-        # Interleave Founder Insights & Reflections into the discussion stream (4 Standard : 1 Insight : 4 Standard : 1 Reflection)
+        # Interleave Founder Insights & Decision Engine Reflections into the discussion stream (4 Standard : 1 Insight : 4 Standard : 1 Reflection)
         try:
             insights_raw = db.query(FounderInsightCard).filter(FounderInsightCard.is_active == True).order_by(FounderInsightCard.created_at.desc()).all()
             insight_cards = [{
@@ -773,7 +757,7 @@ async def get_discussions(
                             interleaved.append(std_posts[std_i])
                             std_i += 1
 
-                    # 2. Alternating cadence: Even cycle = Insight, Odd cycle = Reflection
+                    # 2. Alternating cadence: Even cycle = Insight, Odd cycle = Decision Engine Reflection
                     if cycle % 2 == 0:
                         if ins_i < len(insight_cards):
                             interleaved.append(insight_cards[ins_i % len(insight_cards)])
