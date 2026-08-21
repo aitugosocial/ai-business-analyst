@@ -1674,6 +1674,9 @@ class CommunityDiscussion(Base):
     ai_takeaways = Column(JSON, nullable=True)
     is_pinned = Column(Boolean, default=False)
     post_type = Column(String(50), default="discussion")  # discussion | reflection | spiced | poll
+    analysis_id = Column(Integer, ForeignKey("business_analyses.id", ondelete="SET NULL"), nullable=True)
+    analysis_goal = Column(Text, nullable=True)  # Brief business goal/description of analysis
+    mission_task = Column(Text, nullable=True)   # Mission task executed
     tagged_user_ids = Column(JSON, nullable=True, default=list)  # array of tagged user IDs
     visibility = Column(String(30), default="public")  # public | tagged_only
     poll_data = Column(JSON, nullable=True)  # poll options and metadata
@@ -1681,6 +1684,7 @@ class CommunityDiscussion(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     channel = relationship("CommunityChannel", back_populates="discussions")
     user = relationship("User")
+    analysis = relationship("BusinessAnalysis", foreign_keys=[analysis_id])
     quoted_discussion = relationship("CommunityDiscussion", remote_side="[CommunityDiscussion.id]", foreign_keys=[quoted_discussion_id])
     replies = relationship("DiscussionReply", back_populates="discussion", cascade="all, delete-orphan")
     likes = relationship("DiscussionLike", back_populates="discussion", cascade="all, delete-orphan")

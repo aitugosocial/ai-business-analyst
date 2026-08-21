@@ -127,7 +127,7 @@ def _flatten_roadmap_tasks(analysis):
 from pydantic import BaseModel
 
 from database.pg_connections import get_db
-from database.pg_models import User, BusinessAnalysis
+from database.pg_models import User, BusinessAnalysis, CommunityDiscussion, CommunityChannel
 from api.routes.auth.login import get_current_user
 
 logging.basicConfig(level=logging.INFO)
