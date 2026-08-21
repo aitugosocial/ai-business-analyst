@@ -1291,6 +1291,24 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
                 "scores": {crit: scores.get(crit) for crit in bars},
             }
 
+        def _candidate_is_cited(candidate: dict, plan_idx: int) -> bool:
+            """Peek at whether a raw LLM candidate resolves to a step-cited
+            or user-named tool, without claiming it (no dedup/gate side
+            effects — that's still _evaluate_candidate's job). Used only to
+            sort cited candidates ahead of searched ones before the top-4
+            cap below, since the prompt's "cited tools go first" instruction
+            (STEP-CITED OVERRIDE / USER-NAMED OVERRIDE) is advisory only —
+            nothing previously enforced it if the LLM ignored it or listed
+            the cited tool 5th+, where the old unconditional [:4] slice
+            would have dropped it before it was ever evaluated."""
+            canonical = _resolve_canonical(candidate.get("tool_name", ""), plan_idx)
+            if not canonical:
+                return False
+            tool_record = all_tools.get(canonical)
+            if not tool_record:
+                return False
+            return bool(tool_record.get("_step_cited")) or bool(tool_record.get("_user_cited"))
+
         # Walk plans/steps in priority order (lower plan number = higher
         # priority, then step order within the plan) so that when two steps
         # compete for the same tool, the higher-priority one wins — same
@@ -1306,9 +1324,21 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
                 # the gate is exactly what should become an automation stack,
                 # not a single tool with the runner-up(s) silently discarded
                 # (item 42).
+                #
+                # Cited tools are sorted ahead of searched candidates (stable
+                # sort — order within each group is otherwise untouched)
+                # *before* the top-4 cap, so a tool named directly in the
+                # step text or by the user is guaranteed to survive the cap
+                # and land first in step_tools/step_stacks, rather than
+                # relying on the LLM having ranked it first on its own.
+                raw_candidates = by_step.get((plan_idx, step_idx), []) or []
+                ordered_candidates = sorted(
+                    raw_candidates,
+                    key=lambda c: 0 if _candidate_is_cited(c, plan_idx) else 1,
+                )
                 passing = [
                     entry
-                    for candidate in (by_step.get((plan_idx, step_idx), []) or [])[:4]
+                    for candidate in ordered_candidates[:4]
                     if (entry := _evaluate_candidate(candidate, plan_idx, step_idx))
                 ]
 
