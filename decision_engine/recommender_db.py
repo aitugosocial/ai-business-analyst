@@ -74,7 +74,6 @@ class AIToolRecommender:
     # Cache settings
     CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
     EMBEDDINGS_CACHE_FILE = os.path.join(CACHE_DIR, "tool_embeddings.pkl")
-    CACHE_VALIDITY_HOURS = 24  # Refresh cache every 24 hours
 
     def __init__(self, db_session: Session, use_cache: bool = True):
         """
@@ -120,24 +119,29 @@ class AIToolRecommender:
 
     def _is_cache_valid(self) -> bool:
         """
-        Check if cached embeddings are still valid.
+        Check if a cache file exists to try loading.
+
+        Freshness itself is decided by _load_tools()'s data-hash comparison,
+        not by file age: this used to also reject any cache file older than a
+        hardcoded 24h, regardless of whether the underlying tool data had
+        actually changed. That was harmless when _load_tools() only
+        ever ran once per process (the original design), but get_recommender()
+        now calls refresh() periodically to self-heal stale tool URLs/metadata
+        without a redeploy (see _RECOMMENDER_METADATA_REFRESH) — combined with
+        the 24h age gate, that turned into a recurring, fully-synchronous,
+        multi-minute re-embedding of the ENTIRE ~1700-tool catalog roughly
+        once a day purely because the cache file had gotten "old", even when
+        no tool's data had changed at all. That rebuild ran inside
+        _recommender_lock, so it blocked every concurrent tool search for its
+        full duration — the actual cause of an incident where every analysis
+        in-flight during that window got zero tool recommendations. The hash
+        check below is the real, content-based signal for "did anything
+        change"; age no longer overrides it.
 
         Returns:
-            True if cache exists and is not expired
+            True if a cache file exists to attempt loading.
         """
-        if not os.path.exists(self.EMBEDDINGS_CACHE_FILE):
-            return False
-
-        # Check file age
-        cache_time = datetime.fromtimestamp(os.path.getmtime(self.EMBEDDINGS_CACHE_FILE))
-        age = datetime.now() - cache_time
-
-        if age > timedelta(hours=self.CACHE_VALIDITY_HOURS):
-            logger.info(f"Cache expired (age: {age.total_seconds() / 3600:.1f} hours)")
-            return False
-
-        logger.info(f"Cache is valid (age: {age.total_seconds() / 3600:.1f} hours)")
-        return True
+        return os.path.exists(self.EMBEDDINGS_CACHE_FILE)
 
     def _load_from_cache(self):
         """
@@ -267,8 +271,26 @@ class AIToolRecommender:
                 if who and who not in ("[", "[]"):
                     parts.append(who[:150])
                 composite_texts.append(" ".join(parts))
-            with _model_lock:
-                embeddings = model.encode(composite_texts, convert_to_tensor=False, show_progress_bar=True)
+            # Chunked rather than one encode() call over the whole catalog:
+            # _model_lock also gates every live single-query embedding at
+            # request time (see its docstring above), sized on the
+            # assumption that a lock holder is "a few milliseconds" — true
+            # for a single query, false for ~1700 tools at once (a full pass
+            # takes minutes). Encoding in small chunks and releasing the lock
+            # between them means a concurrent live query waits at most one
+            # chunk's worth of time instead of the whole multi-minute pass —
+            # this is what actually fixed an incident where a background
+            # catalog refresh (see get_recommender's _background_refresh)
+            # blocked every concurrent tool search for its full duration.
+            _EMBED_CHUNK_SIZE = 64
+            embedding_chunks = []
+            for i in range(0, len(composite_texts), _EMBED_CHUNK_SIZE):
+                chunk = composite_texts[i : i + _EMBED_CHUNK_SIZE]
+                with _model_lock:
+                    embedding_chunks.append(
+                        model.encode(chunk, convert_to_tensor=False, show_progress_bar=False)
+                    )
+            embeddings = np.concatenate(embedding_chunks, axis=0) if embedding_chunks else np.array([])
 
             self.tools_df = tools_df
             self.embeddings = embeddings
@@ -398,6 +420,36 @@ _recommender_instance = None
 # touches the caller's session at all.
 _recommender_lock = threading.Lock()
 
+# Guards the periodic background refresh below (a completely separate
+# concern from _recommender_lock, which only guards one-time singleton
+# construction). acquire(blocking=False) here doubles as an "already
+# refreshing" flag: whichever request first notices staleness wins the
+# acquire and spawns the background thread; every other concurrent request
+# in that window fails the non-blocking acquire and just moves on with the
+# existing (still-usable, at most slightly stale) instance rather than
+# piling up duplicate refreshes or waiting on this one.
+#
+# This refresh must run in the background, never inline on a request: when
+# the catalog's data hash has genuinely changed (a tool added/edited/
+# removed), _load_tools() does a real SentenceTransformer encode() pass over
+# the ~1700-tool catalog, which takes minutes. Running that inline while
+# holding a shared lock previously blocked every concurrent tool search for
+# the whole duration — the cause of an incident where every analysis
+# in-flight during that window returned zero tool recommendations.
+_refresh_lock = threading.Lock()
+
+
+def _background_refresh(instance: "AIToolRecommender") -> None:
+    try:
+        # clear_cache=False: keep cached embeddings unless the data hash
+        # actually changed — _load_tools() already regenerates them itself
+        # when it does.
+        instance.refresh(clear_cache=False)
+    except Exception:
+        logger.exception("Periodic tool-catalog refresh failed; serving existing data")
+    finally:
+        _refresh_lock.release()
+
 
 def get_recommender(db_session: Session) -> AIToolRecommender:
     """
@@ -419,20 +471,16 @@ def get_recommender(db_session: Session) -> AIToolRecommender:
         return _recommender_instance
 
     # Metadata staleness check — see _RECOMMENDER_METADATA_REFRESH comment.
-    # Cheap in the common case: just a datetime comparison, and the lock is
-    # only taken once an hour has actually elapsed.
+    # Cheap in the common case: just a datetime comparison. The refresh
+    # itself always runs in a background thread (see _refresh_lock above) so
+    # this call never blocks waiting on it — the caller gets the existing
+    # instance immediately either way.
     last_loaded = _recommender_instance.last_loaded
     if last_loaded is None or datetime.now() - last_loaded > _RECOMMENDER_METADATA_REFRESH:
-        with _recommender_lock:
-            last_loaded = _recommender_instance.last_loaded
-            if last_loaded is None or datetime.now() - last_loaded > _RECOMMENDER_METADATA_REFRESH:
-                try:
-                    # clear_cache=False: keep cached embeddings unless the
-                    # data hash actually changed — _load_tools() already
-                    # regenerates them itself when it does.
-                    _recommender_instance.refresh(clear_cache=False)
-                except Exception:
-                    logger.exception("Periodic tool-catalog refresh failed; serving existing data")
+        if _refresh_lock.acquire(blocking=False):
+            threading.Thread(
+                target=_background_refresh, args=(_recommender_instance,), daemon=True
+            ).start()
 
     return _recommender_instance
 
