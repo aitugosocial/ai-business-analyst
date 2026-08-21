@@ -88,6 +88,7 @@ class AIToolRecommender:
         self.tools_df = None
         self.embeddings = None
         self.use_cache = use_cache
+        self.last_loaded: Optional[datetime] = None
 
         # Create cache directory if it doesn't exist
         os.makedirs(self.CACHE_DIR, exist_ok=True)
@@ -244,6 +245,7 @@ class AIToolRecommender:
                     if cached_hash == current_hash and len(cached_df) == len(tools_df):
                         self.tools_df = tools_df  # Use fresh data from DB
                         self.embeddings = cached_embeddings  # Use cached embeddings
+                        self.last_loaded = datetime.now()
                         logger.info("🚀 Using cached embeddings (data unchanged)")
                         return
                     else:
@@ -270,6 +272,7 @@ class AIToolRecommender:
 
             self.tools_df = tools_df
             self.embeddings = embeddings
+            self.last_loaded = datetime.now()
 
             logger.info(f"✅ Generated embeddings for {len(embeddings)} tools")
 
@@ -363,6 +366,18 @@ class AIToolRecommender:
             logger.info("No cache to clear")
 
 
+# The singleton below is built once and then reused for the rest of the
+# process's life (see get_recommender) — _load_tools() was never called
+# again after that first build, so any DB edit to a tool's metadata (e.g. a
+# corrected `url` after scripts/fix_tool_urls.py ran) stayed invisible to
+# every request served by this process until it happened to restart. The
+# embeddings themselves are the expensive part (a full SentenceTransformer
+# encode() pass over ~1700 tools) and are already protected from needless
+# regeneration by the data-hash check inside _load_tools() — so refreshing
+# tools_df periodically is cheap in the common case (DB requery + hash
+# match, embeddings reused) and self-heals metadata drift without a deploy.
+_RECOMMENDER_METADATA_REFRESH = timedelta(hours=1)
+
 # Global recommender instance (initialized when first needed)
 _recommender_instance = None
 # Guards singleton construction. agentic_analyzer.py fires one
@@ -401,6 +416,23 @@ def get_recommender(db_session: Session) -> AIToolRecommender:
         with _recommender_lock:
             if _recommender_instance is None:  # re-check: lost the race while waiting
                 _recommender_instance = AIToolRecommender(db_session)
+        return _recommender_instance
+
+    # Metadata staleness check — see _RECOMMENDER_METADATA_REFRESH comment.
+    # Cheap in the common case: just a datetime comparison, and the lock is
+    # only taken once an hour has actually elapsed.
+    last_loaded = _recommender_instance.last_loaded
+    if last_loaded is None or datetime.now() - last_loaded > _RECOMMENDER_METADATA_REFRESH:
+        with _recommender_lock:
+            last_loaded = _recommender_instance.last_loaded
+            if last_loaded is None or datetime.now() - last_loaded > _RECOMMENDER_METADATA_REFRESH:
+                try:
+                    # clear_cache=False: keep cached embeddings unless the
+                    # data hash actually changed — _load_tools() already
+                    # regenerates them itself when it does.
+                    _recommender_instance.refresh(clear_cache=False)
+                except Exception:
+                    logger.exception("Periodic tool-catalog refresh failed; serving existing data")
 
     return _recommender_instance
 
