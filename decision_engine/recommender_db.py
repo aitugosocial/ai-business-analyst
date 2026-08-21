@@ -12,7 +12,7 @@ import pickle
 import re
 import sys
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -281,6 +281,15 @@ class AIToolRecommender:
                         "similarity_score": top_scores[idx],
                         "description": tool["description"],
                         "url": tool.get("url", ""),
+                        # Already loaded into tools_df and already used to build
+                        # this tool's retrieval embedding (see _load_tools) —
+                        # surfacing them here too lets a downstream scoring LLM
+                        # (agentic_analyzer.py::_score_plan) defend a relevance
+                        # score against real documented features instead of a
+                        # bare description. Deliberately excludes pricing.
+                        "key_features": tool.get("key_features"),
+                        "who_should_use": tool.get("who_should_use"),
+                        "compatibility_integration": tool.get("compatibility_integration"),
                     }
                 )
 
@@ -468,23 +477,41 @@ def recommend_automation_stacks(
     global_similarities = cosine_similarity([query_embedding], recommender.embeddings)[0]
 
     action_queries: list[tuple[int, str]] = []
+    # Per-plan list of individual step strings, keyed by the same action_id
+    # used above — lets a stack's coverage be pinned to the ONE step it best
+    # matches (not just "this plan somewhere"), same embedding-similarity
+    # method as the plan-level query, just run per step instead of on the
+    # whole plan joined together.
+    action_step_texts: dict[int, list[str]] = {}
     for plan in action_plans or []:
         title = str(plan.get("title", "")).strip()
         what_to_do = plan.get("what_to_do", [])
-        steps_text = " ".join(what_to_do) if isinstance(what_to_do, list) else str(what_to_do)
+        steps_list = [str(s) for s in what_to_do] if isinstance(what_to_do, list) else ([str(what_to_do)] if what_to_do else [])
+        steps_text = " ".join(steps_list)
         query = f"{title} {steps_text}".strip()
         if query:
-            action_queries.append((int(plan.get("id", len(action_queries) + 1)), query))
+            action_id = int(plan.get("id", len(action_queries) + 1))
+            action_queries.append((action_id, query))
+            action_step_texts[action_id] = steps_list
 
     # Gather candidate indices from global query + each action query to preserve semantic relevance.
     candidate_indices: set[int] = set(np.argsort(global_similarities)[::-1][:20].tolist())
 
     action_similarity_maps: dict[int, np.ndarray] = {}
+    action_step_similarity_maps: dict[int, list[np.ndarray]] = {}
     for action_id, query in action_queries:
         action_embedding = model.encode([query], convert_to_tensor=False)[0]
         action_sims = cosine_similarity([action_embedding], recommender.embeddings)[0]
         action_similarity_maps[action_id] = action_sims
         candidate_indices.update(np.argsort(action_sims)[::-1][:8].tolist())
+
+        steps_list = action_step_texts.get(action_id) or []
+        if steps_list:
+            step_embeddings = model.encode(steps_list, convert_to_tensor=False)
+            action_step_similarity_maps[action_id] = [
+                cosine_similarity([step_embedding], recommender.embeddings)[0]
+                for step_embedding in step_embeddings
+            ]
 
     if not candidate_indices:
         return []
@@ -552,11 +579,26 @@ def recommend_automation_stacks(
                 continue
             match = max(float(sims[tool["index"]]) for tool in chosen)
             if match >= 0.45:
+                # Which single step (within this plan) the stack's tools are
+                # most semantically similar to, so the frontend can attach the
+                # whole workflow inline under that step instead of showing it
+                # as a plan-level footer. None if the plan has no step text or
+                # no step clears the same 0.45 relevance bar used everywhere
+                # else in this function.
+                step_index: Optional[int] = None
+                step_match_score: Optional[float] = None
+                for i, step_sims in enumerate(action_step_similarity_maps.get(action_id) or []):
+                    step_match = max(float(step_sims[tool["index"]]) for tool in chosen)
+                    if step_match >= 0.45 and (step_match_score is None or step_match > step_match_score):
+                        step_index = i
+                        step_match_score = step_match
                 action_coverage.append(
                     {
                         "action_id": action_id,
                         "action": action_query[:160],
                         "match_score": round(match, 3),
+                        "step_index": step_index,
+                        "step_match_score": round(step_match_score, 3) if step_match_score is not None else None,
                     }
                 )
 

@@ -117,8 +117,8 @@ _origins_base = [
     "http://localhost:5173",
     "http://localhost:8080",
     # Production frontend domains — always allowed regardless of ALLOWED_ORIGINS env var
-    "https://lavooai.com",
-    "https://www.lavooai.com",
+    "https://lavoo.io",
+    "https://www.lavoo.io",
     "https://control.lavooai.com/",
 ]
 # Allow additional origins from environment (comma-separated list)
@@ -1131,6 +1131,54 @@ async def startup_event():
         init_db()
         db_info = get_db_info()
         logger.info(f"✓ Database initialized: {db_info['type']} at {db_info['host']}")
+
+        # Tool-recommendation embeddings pre-warm — backgrounded, NOT awaited.
+        #
+        # History: originally (2026-07-28) this deliberately BLOCKED startup so
+        # the 90-100s SentenceTransformer.encode() cost over the full tool
+        # catalog would never land on a live user's request — a cold-cache
+        # encode had previously run synchronously inside a request, blocked
+        # the single asyncio event loop for the whole process, and Railway's
+        # HTTP/2 proxy killed every other open connection (including SSE
+        # streams) in that window. That version awaited the prewarm directly
+        # so /health wouldn't return 200 until the cache was genuinely warm.
+        #
+        # Incident 2026-07-29: that awaited call hung indefinitely on Railway
+        # (confirmed via metrics — CPU stayed busy, single container, never
+        # crashed or restarted, never recovered) which meant startup_event()
+        # never returned and the deploy never became healthy — a full
+        # production outage (users couldn't log in at all, since no replica
+        # ever passed its healthcheck). Root cause of the hang itself was not
+        # identified (encode() and the cache write both provably completed
+        # per the logs; nothing after them should be expensive). A bounded
+        # `asyncio.wait_for(..., timeout=200.0)` was tried first but still
+        # left every deploy attempt able to take up to 200s AND still
+        # dependent on the hang being transient rather than deterministic —
+        # not acceptable for something actively blocking production.
+        #
+        # Fix: fire this via asyncio.create_task like the schema-migration
+        # jobs below, so it can NEVER block "Application startup complete" or
+        # /health, no matter how long it takes or whether it hangs entirely.
+        # The safety net this depended on already exists independently of
+        # this pre-warm: recommend_tools()/recommend_automation_stacks() are
+        # already called via asyncio.to_thread from agentic_analyzer.py, so a
+        # cold cache at request time is slow for that one request but no
+        # longer capable of blocking other connections. Losing the pre-warm
+        # (if the hang is deterministic and it never completes) degrades to
+        # "first tool recommendation after a deploy is slow" — acceptable —
+        # instead of "the whole app is unreachable" — not acceptable.
+        def _prewarm_tool_embeddings():
+            from decision_engine.recommender_db import get_recommender
+            _sync_db = SessionLocal()
+            try:
+                get_recommender(_sync_db)
+                logger.info("✓ Tool-recommendation embeddings pre-warmed")
+            except Exception as e:
+                logger.error(f"⚠️ Tool embeddings pre-warm failed (non-fatal, will warm on first request): {e}")
+            finally:
+                _sync_db.close()
+
+        asyncio.create_task(asyncio.to_thread(_prewarm_tool_embeddings))
 
         # Ensure admin exists (moved to a background task so synchronous DB queries don't block the event loop)
         # It is now called at the beginning of run_heavy_schema_migrations()
