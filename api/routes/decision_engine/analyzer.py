@@ -283,7 +283,7 @@ async def analyze_business_goal(
         result = await analyzer.analyze(user_query=business_goal, user_id=user_id)
 
         logger.info(f"✅ Analysis completed: ID {result['data']['analysis_id']}")
-        await delete_cached(f"analyses:user:{user_id}")
+        await delete_cached(f"analyses:user:{user_id}:limit:*")
 
         _raw_stacks = result["data"].get("recommended_tool_stacks", [])
         _bottleneck_title = result["data"].get("primary_bottleneck", {}).get("title", "")
@@ -333,7 +333,15 @@ async def get_user_analyses(
     try:
         user_id = get_user_id(current_user)
 
-        cache_key = f"analyses:user:{user_id}"
+        # Keyed by limit too — without this, a limit=1 caller (e.g. the
+        # decision-engine page's own "check for an existing/just-created
+        # analysis" calls, or the home-feed page's preview widget) and a
+        # limit=10 caller (the same page's "previous reports" list) shared
+        # one cache entry. Whichever request landed first within the 30s TTL
+        # decided what every other limit got served for the rest of that
+        # window — the actual cause of "sometimes only one analysis shows
+        # under the search box" despite the user having several.
+        cache_key = f"analyses:user:{user_id}:limit:{limit}"
         cached = await get_cached(cache_key)
         if cached is not None:
             return cached
@@ -532,7 +540,7 @@ async def analyze_business_goal_stream(
                     user_query=business_goal,
                     bottleneck_title=_bottleneck_title,
                 )
-            await delete_cached(f"analyses:user:{user_id}")
+            await delete_cached(f"analyses:user:{user_id}:limit:*")
             await queue.put({"type": "result", "data": result["data"]})
         except Exception as exc:
             logger.error(f"SSE analysis failed: {exc}", exc_info=True)
