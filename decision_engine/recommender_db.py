@@ -71,7 +71,27 @@ class AIToolRecommender:
     Includes caching for embeddings to improve performance.
     """
 
-    # Cache settings
+    # Cache settings — tool_embeddings.pkl is COMMITTED to git (deliberately
+    # not gitignored, see .gitignore), not generated fresh per deploy. A
+    # Railway build clones the repo from scratch, so a gitignored cache file
+    # would never exist in a freshly built image — every deploy would start
+    # with zero cache and pay a full ~3-5 minute SentenceTransformer encode()
+    # over the whole catalog on the very first request that needs the
+    # recommender (the singleton's initial construction genuinely has to
+    # block, since there's no prior instance to serve in the meantime — see
+    # get_recommender). That is what "still off right after a fresh deploy"
+    # was: not the periodic-refresh bug (fixed via the background thread
+    # below), but this same cost recurring on EVERY deploy, forever. A
+    # matching committed cache means a normal deploy loads a valid cache in
+    # under a second instead. When a maintenance script changes the tool
+    # catalog (add/edit/remove a tool), re-run
+    # `venv/bin/python3 -c "from decision_engine.recommender_db import
+    # AIToolRecommender; from database.pg_connections import SessionLocal;
+    # AIToolRecommender(SessionLocal())"` (or just let get_recommender()
+    # rebuild it locally) and commit the resulting
+    # decision_engine/cache/tool_embeddings.pkl alongside that script's
+    # changes — otherwise the NEXT deploy pays the full rebuild cost once,
+    # the same as before this file was tracked.
     CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
     EMBEDDINGS_CACHE_FILE = os.path.join(CACHE_DIR, "tool_embeddings.pkl")
 
