@@ -187,18 +187,54 @@ async def setup_payout_account(
         db.commit()
         db.refresh(payout_account)
 
+        # Register a Flutterwave Subaccount so a future referral charge can
+        # split straight to this account instead of sitting as a pending
+        # manual payout — see flutterwave_split.py. Best-effort: a failure
+        # here does not undo the bank account that was just saved above:
+        # subaccount_status stays 'failed'/null and referral earnings fall
+        # back to the existing pending-Commission path until this succeeds
+        # (e.g. on a later payout-account save with a valid bank code).
+        subaccount_created = False
+        if account_data.payment_method == 'flutterwave':
+            from subscriptions.flutterwave_split import create_flutterwave_subaccount
+            requester = db.query(User).filter(User.id == user_id).first()
+            subaccount = create_flutterwave_subaccount(
+                account_number=account_data.account_number,
+                bank_code=account_data.bank_code or "",
+                business_name=account_data.account_name or (requester.name if requester else ""),
+                business_email=requester.email if requester else "",
+            )
+            if subaccount and subaccount.get("subaccount_id"):
+                payout_account.flutterwave_subaccount_id = subaccount["subaccount_id"]
+                payout_account.subaccount_status = "active"
+                subaccount_created = True
+            else:
+                payout_account.subaccount_status = "failed"
+                logger.warning(
+                    "[payout-account] Flutterwave subaccount creation failed for user=%s — "
+                    "falling back to manual payout for this account", user_id,
+                )
+            db.commit()
+
         # Real-time notification so the bell badge increments immediately
         from api.services.notification_service import NotificationService
         method_label = account_data.payment_method.replace('_', ' ').title()
+        if account_data.payment_method == 'flutterwave' and subaccount_created:
+            payout_message = (
+                f"Your payout account ({method_label}) has been set up. Future referral "
+                f"earnings will now settle to this account automatically at payment time."
+            )
+        else:
+            payout_message = (
+                f"Your payout account ({method_label}) has been set up. "
+                f"You will now receive referral earnings automatically."
+            )
         NotificationService.create_notification(
             db=db,
             user_id=user_id,
             type="payout_account_setup",
             title="✅ Payout Account Configured",
-            message=(
-                f"Your payout account ({method_label}) has been set up. "
-                f"You will now receive referral earnings automatically."
-            ),
+            message=payout_message,
             link="/dashboard/upgrade",
         )
 
@@ -266,6 +302,11 @@ async def get_payout_account(
             "account_number":  account_num,   # full number — user is viewing their own data
             "account_last_4":  account_num[-4:] if len(account_num) >= 4 else account_num,
             "paypal_email":    getattr(payout_account, "paypal_email", None),
+            # Whether future referral earnings on this account settle
+            # automatically via a Flutterwave split, vs. sitting as a
+            # pending balance until manually requested.
+            "auto_settle_active": bool(getattr(payout_account, "flutterwave_subaccount_id", None))
+                and getattr(payout_account, "subaccount_status", None) == "active",
         }
         logger.info(
             "[payout-account] GET user=%s method=%s has_bank=%s bank_name=%s account_name=%s",
@@ -307,6 +348,7 @@ async def get_all_payout_accounts(
             "account_last_4": num[-4:] if len(num) >= 4 else num,
             "has_stripe": bool(acc.stripe_account_id),
             "is_verified": bool(acc.is_verified),
+            "auto_settle_active": bool(acc.flutterwave_subaccount_id) and acc.subaccount_status == "active",
         }
 
     return {"status": "success", "data": [_serialise(r) for r in rows]}

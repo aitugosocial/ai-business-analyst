@@ -30,11 +30,24 @@ class CommissionService:
         return COMMISSION_RATE_STANDARD
 
     @staticmethod
-    def calculate_commission(subscription, db: Session):
+    def calculate_commission(subscription, db: Session, already_settled: bool = False):
         """
-        Calculate and create commission when a referred user makes a payment.
-        Regular users receive 40% of the subscription amount.
+        Calculate and create a Commission record when a referred user makes
+        a payment. Regular users receive 40% of the subscription amount.
         Partners/staff receive 50% (screen always shows 40%).
+
+        already_settled=True means the actual charge this Commission is
+        for was placed with a Flutterwave split (see flutterwave_split.py)
+        — the referrer's share already landed in their own account at
+        payment time, so this row is a read-only history/earnings-page
+        record, not something owed. It's created with status='auto_settled'
+        and paid_at set immediately, skipping the pending -> approved ->
+        payout pipeline entirely (no "Request Payout" action applies to it).
+        already_settled=False (the default, and the only behaviour that
+        existed before Flutterwave splits) means the referrer has no
+        verified payout account to split to yet — this Commission starts
+        'pending' and is only ever paid via the existing manual
+        approve/payout flow once they add one.
         """
         try:
             # Check if user was referred
@@ -63,6 +76,7 @@ class CommissionService:
             commission_amount = original_amount * actual_rate
 
             # Create commission — always store the actual rate used
+            now = datetime.now(timezone.utc)
             commission = Commission(
                 user_id=referral.referrer_id,
                 referred_user_id=subscription.user_id,
@@ -71,38 +85,47 @@ class CommissionService:
                 original_amount=original_amount,
                 currency=subscription.currency,
                 commission_rate=actual_rate * 100,
-                status='pending',  # Starts as pending
-                created_at=datetime.now(timezone.utc)
+                status='auto_settled' if already_settled else 'pending',
+                created_at=now,
+                paid_at=now if already_settled else None,
             )
-            
+
             db.add(commission)
             db.flush()
-            
-            # Update monthly summary
+
+            # Update monthly summary — an already-settled commission counts
+            # straight into paid_commissions, not pending_commissions, since
+            # nothing is owed on it (see _update_monthly_summary).
             CommissionService._update_monthly_summary(
-                referral.referrer_id, 
-                commission_amount, 
-                db
+                referral.referrer_id,
+                commission_amount,
+                db,
+                already_settled=already_settled,
             )
-            
+
             db.flush()
             # db.refresh(commission) # We can use flush + already in session
-            
+
             logger.info(
-                f"✅ Commission created: ${commission_amount} for user {referral.referrer_id}"
+                f"✅ Commission created: ${commission_amount} for user {referral.referrer_id} "
+                f"(status={commission.status})"
             )
-            
+
             # Notify referrer about builder bonus in real time
             cur = getattr(subscription, "currency", "USD") or "USD"
+            bonus_message = (
+                f"You earned a {cur} {commission_amount:.2f} builder bonus from a "
+                f"referral's subscription payment — sent straight to your account."
+                if already_settled else
+                f"You earned a {cur} {commission_amount:.2f} builder bonus "
+                f"from a referral's subscription payment."
+            )
             NotificationService.create_notification(
                 db=db,
                 user_id=referral.referrer_id,
                 type=NotificationType.COMMISSION_EARNED.value,
                 title="🎉 Builder Bonus Earned!",
-                message=(
-                    f"You earned a {cur} {commission_amount:.2f} builder bonus "
-                    f"from a referral's subscription payment."
-                ),
+                message=bonus_message,
                 link="/dashboard/earnings",
             )
             
@@ -114,19 +137,27 @@ class CommissionService:
             raise
     
     @staticmethod
-    def _update_monthly_summary(user_id: int, amount: Decimal, db: Session):
-        """Update or create monthly commission summary"""
+    def _update_monthly_summary(user_id: int, amount: Decimal, db: Session, already_settled: bool = False):
+        """Update or create monthly commission summary.
+
+        already_settled routes `amount` into paid_commissions instead of
+        pending_commissions — a Flutterwave-split commission has nothing
+        owed on it, so it must not appear as payout-requestable balance.
+        """
         now = datetime.now(timezone.utc)
-        
+
         summary = db.query(CommissionSummary).filter(
             CommissionSummary.user_id == user_id,
             CommissionSummary.year == now.year,
             CommissionSummary.month == now.month
         ).first()
-        
+
         if summary:
             summary.total_commissions += amount
-            summary.pending_commissions += amount
+            if already_settled:
+                summary.paid_commissions += amount
+            else:
+                summary.pending_commissions += amount
             summary.commission_count += 1
             summary.updated_at = now
         else:
@@ -135,8 +166,8 @@ class CommissionService:
                 year=now.year,
                 month=now.month,
                 total_commissions=amount,
-                pending_commissions=amount,
-                paid_commissions=Decimal("0.00"),
+                pending_commissions=Decimal("0.00") if already_settled else amount,
+                paid_commissions=amount if already_settled else Decimal("0.00"),
                 commission_count=1,
                 currency='USD'
             )
