@@ -57,8 +57,9 @@ class User(Base):
     signal_like_chops = Column(Integer, default=0)
     signal_comment_chops = Column(Integer, default=0)
 
-    # Admin and subscription
+    # Admin, bot, and subscription
     is_admin = Column(Boolean, default=False)
+    is_bot = Column(Boolean, default=False, server_default="false")
     is_partner = Column(Boolean, default=False)   # partners/staff receive 50% payout; display shows 40%
     is_active = Column(Boolean, default=True)
     user_status = Column(String(20), server_default="active", nullable=False)
@@ -1680,16 +1681,21 @@ class CommunityDiscussion(Base):
     tagged_user_ids = Column(JSON, nullable=True, default=list)  # array of tagged user IDs
     visibility = Column(String(30), default="public")  # public | tagged_only
     poll_data = Column(JSON, nullable=True)  # poll options and metadata
+    voo_status = Column(String(30), server_default="untracked", default="untracked", nullable=False)  # untracked | pending_replies | scheduled | completed | skipped
+    voo_scheduled_for = Column(DateTime(timezone=True), nullable=True)
+    voo_reply_id = Column(Integer, ForeignKey("discussion_replies.id", ondelete="SET NULL", use_alter=True, name="fk_community_discussions_voo_reply_id"), nullable=True)
+    is_resolved = Column(Boolean, default=False, server_default="false")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     channel = relationship("CommunityChannel", back_populates="discussions")
     user = relationship("User")
     analysis = relationship("BusinessAnalysis", foreign_keys=[analysis_id])
     quoted_discussion = relationship("CommunityDiscussion", remote_side="[CommunityDiscussion.id]", foreign_keys=[quoted_discussion_id])
-    replies = relationship("DiscussionReply", back_populates="discussion", cascade="all, delete-orphan")
+    replies = relationship("DiscussionReply", back_populates="discussion", foreign_keys="[DiscussionReply.discussion_id]", cascade="all, delete-orphan")
     likes = relationship("DiscussionLike", back_populates="discussion", cascade="all, delete-orphan")
     bookmarks = relationship("DiscussionBookmark", back_populates="discussion", cascade="all, delete-orphan")
     poll_votes = relationship("DiscussionPollVote", back_populates="discussion", cascade="all, delete-orphan")
+    voo_reply = relationship("DiscussionReply", foreign_keys=[voo_reply_id], post_update=True)
 
 
 class DiscussionPollVote(Base):
@@ -1716,7 +1722,7 @@ class DiscussionReply(Base):
     tagged_user_ids = Column(JSON, nullable=True, default=list)  # array of tagged user IDs
     like_count = Column(Integer, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    discussion = relationship("CommunityDiscussion", back_populates="replies")
+    discussion = relationship("CommunityDiscussion", back_populates="replies", foreign_keys=[discussion_id])
     user = relationship("User")
     sub_replies = relationship(
         "DiscussionReply",
