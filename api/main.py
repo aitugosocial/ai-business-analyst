@@ -129,8 +129,30 @@ if _extra_origins:
 origins = list(dict.fromkeys(_origins_base))  # deduplicate while preserving order
 
 
-# GZip compression — reduces JSON payload size by ~70% for typical API responses
-app.add_middleware(GZipMiddleware, minimum_size=500)
+# GZip compression — reduces JSON payload size by ~70% for typical API responses.
+# Excluded for SSE streaming routes: GZipMiddleware buffers every chunk through
+# zlib, which doesn't flush until a deflate block boundary, so small SSE frames
+# (heartbeats/keepalives) can sit unflushed indefinitely. That starves Railway's
+# HTTP/2 edge proxy of bytes past its idle-stream timeout, which then RST_STREAMs
+# the connection mid-response — surfacing client-side as net::ERR_HTTP2_PROTOCOL_ERROR
+# right after a 200, even though both stream endpoints already emit app-level
+# heartbeats specifically to avoid that.
+_GZIP_EXCLUDED_PATHS = {"/api/mvp-features/stream", "/api/business/analyze/stream"}
+
+
+class _StreamingSafeGZipMiddleware:
+    def __init__(self, app, **gzip_kwargs):
+        self.plain_app = app
+        self.gzip_app = GZipMiddleware(app, **gzip_kwargs)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] in _GZIP_EXCLUDED_PATHS:
+            await self.plain_app(scope, receive, send)
+        else:
+            await self.gzip_app(scope, receive, send)
+
+
+app.add_middleware(_StreamingSafeGZipMiddleware, minimum_size=500)
 
 # Initialize and Register Firewall Middleware
 app.add_middleware(FirewallMiddleware)

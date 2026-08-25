@@ -4,6 +4,7 @@ AI Tool Recommender using PostgreSQL database.
 This replaces the CSV-based recommender with database queries.
 """
 
+import difflib
 import hashlib
 import json
 import logging
@@ -11,6 +12,7 @@ import os
 import pickle
 import re
 import sys
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -36,6 +38,31 @@ except Exception as e:
     logger.error(f"Error initializing SentenceTransformer: {e}")
     raise
 
+# agentic_analyzer.py runs one recommend_tools() call per action plan
+# concurrently (asyncio.gather + asyncio.to_thread, one OS thread per plan),
+# and every one of them calls into this single shared `model` object. The
+# underlying HuggingFace fast tokenizer isn't safe for concurrent use across
+# threads — two encode() calls landing at the same instant raise a Rust-level
+# "Already borrowed" panic, which callers below catch and silently treat as
+# "no candidates for this plan" (the same failure mode the Session race in
+# get_recommender() had, just one layer down). Serializing access to `model`
+# is cheap — a single encode() call is a few milliseconds — and removes the
+# race entirely.
+_model_lock = threading.Lock()
+
+# find_tool_by_name() runs concurrently too — agentic_analyzer.py resolves
+# every cited/user-named tool via asyncio.gather + asyncio.to_thread (one OS
+# thread per name), and every one of them queries the SAME request-scoped
+# db_session (unlike recommend_tools(), whose singleton loads its own
+# dedicated session once at startup and never touches the caller's session
+# again). SQLAlchemy Session objects aren't safe for concurrent use from
+# multiple threads — two queries landing on the same session at once raise
+# "This session is provisioning a new connection; concurrent operations are
+# not permitted" (sqlalche.me/e/20/isce). Same fix as _model_lock above:
+# serialize access. A name lookup is a handful of milliseconds even with the
+# substring/fuzzy fallback below, so serializing costs nothing.
+_db_lock = threading.Lock()
+
 
 class AIToolRecommender:
     """
@@ -44,10 +71,29 @@ class AIToolRecommender:
     Includes caching for embeddings to improve performance.
     """
 
-    # Cache settings
+    # Cache settings — tool_embeddings.pkl is COMMITTED to git (deliberately
+    # not gitignored, see .gitignore), not generated fresh per deploy. A
+    # Railway build clones the repo from scratch, so a gitignored cache file
+    # would never exist in a freshly built image — every deploy would start
+    # with zero cache and pay a full ~3-5 minute SentenceTransformer encode()
+    # over the whole catalog on the very first request that needs the
+    # recommender (the singleton's initial construction genuinely has to
+    # block, since there's no prior instance to serve in the meantime — see
+    # get_recommender). That is what "still off right after a fresh deploy"
+    # was: not the periodic-refresh bug (fixed via the background thread
+    # below), but this same cost recurring on EVERY deploy, forever. A
+    # matching committed cache means a normal deploy loads a valid cache in
+    # under a second instead. When a maintenance script changes the tool
+    # catalog (add/edit/remove a tool), re-run
+    # `venv/bin/python3 -c "from decision_engine.recommender_db import
+    # AIToolRecommender; from database.pg_connections import SessionLocal;
+    # AIToolRecommender(SessionLocal())"` (or just let get_recommender()
+    # rebuild it locally) and commit the resulting
+    # decision_engine/cache/tool_embeddings.pkl alongside that script's
+    # changes — otherwise the NEXT deploy pays the full rebuild cost once,
+    # the same as before this file was tracked.
     CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
     EMBEDDINGS_CACHE_FILE = os.path.join(CACHE_DIR, "tool_embeddings.pkl")
-    CACHE_VALIDITY_HOURS = 24  # Refresh cache every 24 hours
 
     def __init__(self, db_session: Session, use_cache: bool = True):
         """
@@ -61,6 +107,7 @@ class AIToolRecommender:
         self.tools_df = None
         self.embeddings = None
         self.use_cache = use_cache
+        self.last_loaded: Optional[datetime] = None
 
         # Create cache directory if it doesn't exist
         os.makedirs(self.CACHE_DIR, exist_ok=True)
@@ -92,24 +139,29 @@ class AIToolRecommender:
 
     def _is_cache_valid(self) -> bool:
         """
-        Check if cached embeddings are still valid.
+        Check if a cache file exists to try loading.
+
+        Freshness itself is decided by _load_tools()'s data-hash comparison,
+        not by file age: this used to also reject any cache file older than a
+        hardcoded 24h, regardless of whether the underlying tool data had
+        actually changed. That was harmless when _load_tools() only
+        ever ran once per process (the original design), but get_recommender()
+        now calls refresh() periodically to self-heal stale tool URLs/metadata
+        without a redeploy (see _RECOMMENDER_METADATA_REFRESH) — combined with
+        the 24h age gate, that turned into a recurring, fully-synchronous,
+        multi-minute re-embedding of the ENTIRE ~1700-tool catalog roughly
+        once a day purely because the cache file had gotten "old", even when
+        no tool's data had changed at all. That rebuild ran inside
+        _recommender_lock, so it blocked every concurrent tool search for its
+        full duration — the actual cause of an incident where every analysis
+        in-flight during that window got zero tool recommendations. The hash
+        check below is the real, content-based signal for "did anything
+        change"; age no longer overrides it.
 
         Returns:
-            True if cache exists and is not expired
+            True if a cache file exists to attempt loading.
         """
-        if not os.path.exists(self.EMBEDDINGS_CACHE_FILE):
-            return False
-
-        # Check file age
-        cache_time = datetime.fromtimestamp(os.path.getmtime(self.EMBEDDINGS_CACHE_FILE))
-        age = datetime.now() - cache_time
-
-        if age > timedelta(hours=self.CACHE_VALIDITY_HOURS):
-            logger.info(f"Cache expired (age: {age.total_seconds() / 3600:.1f} hours)")
-            return False
-
-        logger.info(f"Cache is valid (age: {age.total_seconds() / 3600:.1f} hours)")
-        return True
+        return os.path.exists(self.EMBEDDINGS_CACHE_FILE)
 
     def _load_from_cache(self):
         """
@@ -159,11 +211,19 @@ class AIToolRecommender:
         Load tools from database and generate/load embeddings.
         Uses caching to avoid regenerating embeddings on every restart.
         """
+        from database.pg_connections import SessionLocal
         from database.pg_models import AITool
 
+        # This instance is a process-wide singleton (see get_recommender)
+        # reused across every request for the rest of the process's life —
+        # querying through the caller's own request-scoped self.db would tie
+        # this long-lived object to whichever request happened to trigger the
+        # first load, and that session may already be closed by the time a
+        # later .refresh() runs. Open a short-lived session of our own instead.
+        session = SessionLocal()
         try:
             # Query all tools from database
-            tools = self.db.query(AITool).all()
+            tools = session.query(AITool).all()
 
             if not tools:
                 logger.warning("No tools found in database. Run migration script first.")
@@ -209,6 +269,7 @@ class AIToolRecommender:
                     if cached_hash == current_hash and len(cached_df) == len(tools_df):
                         self.tools_df = tools_df  # Use fresh data from DB
                         self.embeddings = cached_embeddings  # Use cached embeddings
+                        self.last_loaded = datetime.now()
                         logger.info("🚀 Using cached embeddings (data unchanged)")
                         return
                     else:
@@ -230,10 +291,30 @@ class AIToolRecommender:
                 if who and who not in ("[", "[]"):
                     parts.append(who[:150])
                 composite_texts.append(" ".join(parts))
-            embeddings = model.encode(composite_texts, convert_to_tensor=False, show_progress_bar=True)
+            # Chunked rather than one encode() call over the whole catalog:
+            # _model_lock also gates every live single-query embedding at
+            # request time (see its docstring above), sized on the
+            # assumption that a lock holder is "a few milliseconds" — true
+            # for a single query, false for ~1700 tools at once (a full pass
+            # takes minutes). Encoding in small chunks and releasing the lock
+            # between them means a concurrent live query waits at most one
+            # chunk's worth of time instead of the whole multi-minute pass —
+            # this is what actually fixed an incident where a background
+            # catalog refresh (see get_recommender's _background_refresh)
+            # blocked every concurrent tool search for its full duration.
+            _EMBED_CHUNK_SIZE = 64
+            embedding_chunks = []
+            for i in range(0, len(composite_texts), _EMBED_CHUNK_SIZE):
+                chunk = composite_texts[i : i + _EMBED_CHUNK_SIZE]
+                with _model_lock:
+                    embedding_chunks.append(
+                        model.encode(chunk, convert_to_tensor=False, show_progress_bar=False)
+                    )
+            embeddings = np.concatenate(embedding_chunks, axis=0) if embedding_chunks else np.array([])
 
             self.tools_df = tools_df
             self.embeddings = embeddings
+            self.last_loaded = datetime.now()
 
             logger.info(f"✅ Generated embeddings for {len(embeddings)} tools")
 
@@ -244,6 +325,8 @@ class AIToolRecommender:
         except Exception as e:
             logger.error(f"Error loading tools from database: {e}")
             raise
+        finally:
+            session.close()
 
     def recommend(self, user_query: str, top_k: int = 5) -> list[dict]:
         """
@@ -262,7 +345,8 @@ class AIToolRecommender:
                 return []
 
             # Generate embedding for user query
-            query_embedding = model.encode([user_query], convert_to_tensor=False)[0]
+            with _model_lock:
+                query_embedding = model.encode([user_query], convert_to_tensor=False)[0]
 
             # Compute cosine similarity
             similarities = cosine_similarity([query_embedding], self.embeddings)[0]
@@ -324,8 +408,67 @@ class AIToolRecommender:
             logger.info("No cache to clear")
 
 
+# The singleton below is built once and then reused for the rest of the
+# process's life (see get_recommender) — _load_tools() was never called
+# again after that first build, so any DB edit to a tool's metadata (e.g. a
+# corrected `url` after scripts/fix_tool_urls.py ran) stayed invisible to
+# every request served by this process until it happened to restart. The
+# embeddings themselves are the expensive part (a full SentenceTransformer
+# encode() pass over ~1700 tools) and are already protected from needless
+# regeneration by the data-hash check inside _load_tools() — so refreshing
+# tools_df periodically is cheap in the common case (DB requery + hash
+# match, embeddings reused) and self-heals metadata drift without a deploy.
+_RECOMMENDER_METADATA_REFRESH = timedelta(hours=1)
+
 # Global recommender instance (initialized when first needed)
 _recommender_instance = None
+# Guards singleton construction. agentic_analyzer.py fires one
+# recommend_tools() call per action plan concurrently via asyncio.gather, each
+# on its own thread (asyncio.to_thread) — on a cold instance (process start,
+# or right after a worker restart), those threads used to race straight into
+# AIToolRecommender(db_session), all querying the SAME caller-supplied
+# SQLAlchemy Session at once. SQLAlchemy Sessions aren't safe for concurrent
+# use across threads, so every racing thread but one raised "This session is
+# provisioning a new connection; concurrent operations are not permitted",
+# recommend_tools() silently swallowed it and returned [], and 2 of 3 plans
+# lost their entire real candidate pool on every cold start — the actual
+# cause of the "only 1 of N steps got a tool" sparsity, not an LLM/scoring
+# weakness. The lock makes only the first thread build the singleton; the
+# rest block until it's ready, then reuse it — no more concurrent access to
+# a shared Session during that first load. _load_tools() also now opens its
+# own dedicated session (see above) so even the winning thread no longer
+# touches the caller's session at all.
+_recommender_lock = threading.Lock()
+
+# Guards the periodic background refresh below (a completely separate
+# concern from _recommender_lock, which only guards one-time singleton
+# construction). acquire(blocking=False) here doubles as an "already
+# refreshing" flag: whichever request first notices staleness wins the
+# acquire and spawns the background thread; every other concurrent request
+# in that window fails the non-blocking acquire and just moves on with the
+# existing (still-usable, at most slightly stale) instance rather than
+# piling up duplicate refreshes or waiting on this one.
+#
+# This refresh must run in the background, never inline on a request: when
+# the catalog's data hash has genuinely changed (a tool added/edited/
+# removed), _load_tools() does a real SentenceTransformer encode() pass over
+# the ~1700-tool catalog, which takes minutes. Running that inline while
+# holding a shared lock previously blocked every concurrent tool search for
+# the whole duration — the cause of an incident where every analysis
+# in-flight during that window returned zero tool recommendations.
+_refresh_lock = threading.Lock()
+
+
+def _background_refresh(instance: "AIToolRecommender") -> None:
+    try:
+        # clear_cache=False: keep cached embeddings unless the data hash
+        # actually changed — _load_tools() already regenerates them itself
+        # when it does.
+        instance.refresh(clear_cache=False)
+    except Exception:
+        logger.exception("Periodic tool-catalog refresh failed; serving existing data")
+    finally:
+        _refresh_lock.release()
 
 
 def get_recommender(db_session: Session) -> AIToolRecommender:
@@ -342,7 +485,22 @@ def get_recommender(db_session: Session) -> AIToolRecommender:
     global _recommender_instance
 
     if _recommender_instance is None:
-        _recommender_instance = AIToolRecommender(db_session)
+        with _recommender_lock:
+            if _recommender_instance is None:  # re-check: lost the race while waiting
+                _recommender_instance = AIToolRecommender(db_session)
+        return _recommender_instance
+
+    # Metadata staleness check — see _RECOMMENDER_METADATA_REFRESH comment.
+    # Cheap in the common case: just a datetime comparison. The refresh
+    # itself always runs in a background thread (see _refresh_lock above) so
+    # this call never blocks waiting on it — the caller gets the existing
+    # instance immediately either way.
+    last_loaded = _recommender_instance.last_loaded
+    if last_loaded is None or datetime.now() - last_loaded > _RECOMMENDER_METADATA_REFRESH:
+        if _refresh_lock.acquire(blocking=False):
+            threading.Thread(
+                target=_background_refresh, args=(_recommender_instance,), daemon=True
+            ).start()
 
     return _recommender_instance
 
@@ -364,6 +522,115 @@ def recommend_tools(user_query: str, top_k: int = 5, db_session: Session = None)
 
     recommender = get_recommender(db_session)
     return recommender.recommend(user_query, top_k)
+
+
+def find_tool_by_name(name: str, db_session: Session) -> Optional[dict]:
+    """Exact (case-insensitive) name lookup, bypassing semantic search, with a
+    substring/fuzzy fallback when nothing matches exactly.
+
+    Used for tools the user names directly in their prompt — semantic search
+    over an action *description* can miss a specific named product entirely,
+    but the user already told us exactly which tool they mean, so look it up
+    directly instead of hoping retrieval surfaces it.
+
+    A citation frequently doesn't match a catalog name verbatim (e.g. "Notion"
+    vs. the catalog's "Notion AI", or "Google Sheet" vs. "Google Sheets") —
+    without a fallback those resolve to nothing and the caller falls back
+    further to an ungrounded stub (no real url/description). Substring
+    containment (either direction) catches brand-vs-product-line mismatches;
+    difflib catches typos/near-misses. Both still only ever return a real
+    catalog row, never a fabricated one.
+    """
+    from database.pg_models import AITool
+
+    if not name or not name.strip():
+        return None
+    query = name.strip()
+
+    # Whole lookup (all queries below) is one critical section — see _db_lock.
+    with _db_lock:
+        tool = (
+            db_session.query(AITool)
+            .filter(AITool.name.ilike(query))
+            .first()
+        )
+
+        if not tool and len(query) >= 3:
+            query_lower = query.lower()
+            all_tools = db_session.query(AITool.id, AITool.name).all()
+
+            substring_matches = [
+                t for t in all_tools
+                if query_lower in t.name.lower() or t.name.lower() in query_lower
+            ]
+            if substring_matches:
+                best = min(substring_matches, key=lambda t: abs(len(t.name) - len(query)))
+                tool = db_session.query(AITool).get(best.id)
+            else:
+                close = difflib.get_close_matches(
+                    query, [t.name for t in all_tools], n=1, cutoff=0.82
+                )
+                if close:
+                    tool = db_session.query(AITool).filter(AITool.name == close[0]).first()
+
+    if not tool:
+        return None
+
+    return {
+        "tool_name": tool.name,
+        "similarity_score": 1.0,
+        "description": tool.description,
+        "url": tool.url or "",
+        "key_features": tool.key_features,
+        "who_should_use": tool.who_should_use,
+        "compatibility_integration": tool.compatibility_integration,
+    }
+
+
+def compile_catalog_name_pattern(catalog_names: list[str]) -> Optional["re.Pattern"]:
+    """Build one compiled regex matching any real catalog tool name as a
+    whole word/phrase, case-insensitively. Build ONCE per analysis (catalog
+    is ~1700 names — compiling per step or per plan would be wasteful) and
+    reuse across every plan via find_catalog_names_in_text below.
+
+    Names are sorted longest-first so a more specific name wins over a
+    shorter one it contains (e.g. "Notion AI" matches before bare "Notion"
+    when both are present at the same text position) — alternation in `re`
+    takes the first alternative that matches, not the longest, so ordering
+    is what makes this deterministic rather than order-of-insertion luck.
+    Names under 4 characters are dropped: a short catalog name (e.g. a
+    2-3 letter brand) risks matching generic words/substrings inside
+    unrelated step text, which is a worse failure mode than an occasional
+    miss on a very short name.
+    """
+    usable = sorted((n for n in catalog_names if n and len(n) >= 4), key=len, reverse=True)
+    if not usable:
+        return None
+    pattern = r'\b(' + '|'.join(re.escape(n) for n in usable) + r')\b'
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def find_catalog_names_in_text(text: str, compiled_pattern: Optional["re.Pattern"]) -> list[str]:
+    """Deterministic backstop for _extract_mentioned_tools (an LLM call that
+    silently returns [] on any failure, with no retry): a plain regex scan
+    of `text` against every real catalog name via compiled_pattern (see
+    compile_catalog_name_pattern). This never depends on the LLM correctly
+    judging what counts as a "specific named product" — if a catalog tool's
+    exact name literally appears in the step text, it's flagged, full stop.
+    Pure in-memory string matching, no DB access — safe to call from
+    anywhere, including inside a concurrent asyncio.gather.
+    """
+    if not text or compiled_pattern is None:
+        return []
+    seen_lower: set[str] = set()
+    found: list[str] = []
+    for m in compiled_pattern.finditer(text):
+        matched = m.group(0)
+        key = matched.lower()
+        if key not in seen_lower:
+            seen_lower.add(key)
+            found.append(matched)
+    return found
 
 
 def _safe_parse_text_list(value: Any) -> list[str]:
@@ -473,7 +740,8 @@ def recommend_automation_stacks(
     if recommender.embeddings is None or len(recommender.embeddings) == 0:
         return []
 
-    query_embedding = model.encode([user_query], convert_to_tensor=False)[0]
+    with _model_lock:
+        query_embedding = model.encode([user_query], convert_to_tensor=False)[0]
     global_similarities = cosine_similarity([query_embedding], recommender.embeddings)[0]
 
     action_queries: list[tuple[int, str]] = []
@@ -500,14 +768,16 @@ def recommend_automation_stacks(
     action_similarity_maps: dict[int, np.ndarray] = {}
     action_step_similarity_maps: dict[int, list[np.ndarray]] = {}
     for action_id, query in action_queries:
-        action_embedding = model.encode([query], convert_to_tensor=False)[0]
+        with _model_lock:
+            action_embedding = model.encode([query], convert_to_tensor=False)[0]
         action_sims = cosine_similarity([action_embedding], recommender.embeddings)[0]
         action_similarity_maps[action_id] = action_sims
         candidate_indices.update(np.argsort(action_sims)[::-1][:8].tolist())
 
         steps_list = action_step_texts.get(action_id) or []
         if steps_list:
-            step_embeddings = model.encode(steps_list, convert_to_tensor=False)
+            with _model_lock:
+                step_embeddings = model.encode(steps_list, convert_to_tensor=False)
             action_step_similarity_maps[action_id] = [
                 cosine_similarity([step_embedding], recommender.embeddings)[0]
                 for step_embedding in step_embeddings

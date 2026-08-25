@@ -32,8 +32,12 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
+from database.pg_models import AITool
 from decision_engine.recommender_db import (
     _safe_parse_text_list,
+    compile_catalog_name_pattern,
+    find_catalog_names_in_text,
+    find_tool_by_name,
     recommend_automation_stacks,
     recommend_tools,
 )
@@ -759,7 +763,7 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         Flow:
         1. Search for candidates per plan using ONLY that plan's steps (not user_query)
         2. Pool all unique candidates into a single deduplicated catalog
-        3. One LLM call proposes up to 2 ranked candidates per step, each with
+        3. One LLM call proposes up to 4 ranked candidates per step, each with
            the 5 criterion scores (0-100) the tool must earn for that step
         4. Python deterministically gates every proposal against the pass bar
            and enforces global uniqueness — the LLM's scores are advisory
@@ -794,6 +798,38 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         # plan_idx → tool names explicitly named inside what_to_do step text
         plan_step_cited: dict[int, list[str]] = {}
 
+        # _extract_mentioned_tools below is an LLM call that silently returns
+        # [] on ANY failure (bad JSON, rate limit, the model just missing a
+        # name) — there's no retry and, until now, no fallback, so a cited
+        # tool could depend entirely on one non-deterministic call succeeding
+        # to ever be considered "cited" at all. Every fix made to the
+        # scoring/gate logic downstream (STEP-CITED OVERRIDE, the GROUNDING
+        # carve-out, etc.) is powerless if the tool was never flagged as
+        # cited in the first place. Build one compiled regex against the
+        # WHOLE real catalog, once, and use it below as a deterministic
+        # backstop that doesn't depend on the LLM at all — if a step's text
+        # literally contains a real catalog tool's name, it's caught
+        # regardless of what the extraction call did.
+        catalog_names = [
+            n for (n,) in await asyncio.to_thread(
+                lambda: self.db.query(AITool.name).all()
+            )
+        ]
+        catalog_name_pattern = compile_catalog_name_pattern(catalog_names)
+
+        # Tools the user named directly in their own prompt (not the
+        # LLM-generated step text — Stage 3 often paraphrases a named tool
+        # like "Zapier" into a generic action, e.g. "automate the handoff",
+        # which silently drops it from plan_step_cited below even though the
+        # user explicitly asked for it). Extracted once since user_query is
+        # shared across every plan. Resolved by exact DB lookup rather than
+        # semantic search, since semantic search over an action description
+        # can easily miss a specific named product.
+        user_cited_names = list(dict.fromkeys(
+            await self._extract_mentioned_tools([user_query])
+            + find_catalog_names_in_text(user_query, catalog_name_pattern)
+        ))
+
         # Per-plan search + citation-extraction are independent of each other —
         # run them concurrently instead of one plan at a time, so the N
         # sequential LLM round-trips collapse into one overlapped wait.
@@ -817,41 +853,159 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
                 self._search_ai_tools(
                     user_query=user_query,
                     action_description=action_description,
-                    # Wider than the old per-plan search (12) since candidates
-                    # now need to cover multiple distinct steps within a plan,
-                    # not just the plan as a whole.
-                    top_k=15,
+                    # Wider than the old per-plan search (12, then 20) since
+                    # candidates now need to cover multiple distinct steps
+                    # within a plan, not just the plan as a whole. A
+                    # step-level automation stack needs 2+ DIFFERENT tools to
+                    # each independently clear task_relevance>=90 for the SAME
+                    # step — but retrieval here runs ONE embedding search
+                    # against the whole plan's combined text (action_description
+                    # above), not per-step, so a 4-5 step plan spanning several
+                    # distinct topics (e.g. email + forms + analytics) can
+                    # crowd out a step's second genuinely-qualifying tool from
+                    # even reaching the LLM's candidate pool, well before the
+                    # scoring gate ever gets a chance to evaluate it — a recall
+                    # problem, not a bar-strictness one, so the fix is more
+                    # candidates, not a lower bar (2026-08-14/15: bar stays
+                    # fixed at 90 by design — loosening it trades precision for
+                    # stack count instead of just recovering already-qualifying
+                    # tools that retrieval was dropping). Raised 20 -> 30.
+                    top_k=30,
                 ),
                 self._extract_mentioned_tools(what_to_do_list),
             )
+            # Deterministic backstop (see catalog_name_pattern above) — union
+            # in any real catalog name that literally appears in this plan's
+            # step text, regardless of what the LLM extraction call did.
+            cited = list(dict.fromkeys(
+                cited + find_catalog_names_in_text(steps_text, catalog_name_pattern)
+            ))
             return plan_idx, candidates, cited
 
         plan_results = await asyncio.gather(*(_gather_plan_data(idx) for idx in needy_indices))
 
-        for plan_idx, candidates, cited in plan_results:
+        # Resolve each user-named tool once by exact DB lookup; fall back to a
+        # stub (same as an unmatched step-citation) if it isn't in the catalog
+        # at all, so the LLM still knows it was asked for even without real
+        # feature data to defend it against.
+        async def _resolve_user_cited(name: str) -> tuple[str, dict]:
+            try:
+                record = await asyncio.to_thread(find_tool_by_name, name, self.db)
+            except Exception as e:
+                # One bad lookup shouldn't take the whole gather (and every
+                # other plan's tool assignment riding on it) down with it.
+                logger.warning(f"find_tool_by_name failed for user-cited '{name}': {e}")
+                record = None
+            if record:
+                record = {**record, "_user_cited": True}
+                return record["tool_name"], record
+            return name, {
+                "tool_name": name,
+                "url": None,
+                "website": None,
+                "description": "Tool named directly by the user in their prompt — not in the catalog, but assign it if a step genuinely matches.",
+                "_user_cited": True,
+            }
+
+        user_cited_records = dict(
+            await asyncio.gather(*(_resolve_user_cited(n) for n in dict.fromkeys(user_cited_names)))
+        )
+        for canonical_name, record in user_cited_records.items():
+            existing = next((k for k in all_tools if k.lower() == canonical_name.lower()), None)
+            if existing:
+                # Prefer the real DB record's fields but keep the flag so it
+                # still gets the gate-exemption treatment below.
+                all_tools[existing]["_user_cited"] = True
+            else:
+                all_tools[canonical_name] = record
+                logger.info(f"Injected user-cited tool: '{canonical_name}'")
+
+        # Tools cited inside LLM-generated step text (plan_step_cited, gathered
+        # below) previously got a bare textual stub with no url/key_features —
+        # unlike user_cited_names above, they never got an exact DB lookup, so
+        # a real catalog tool (e.g. Asana) named in a step but absent from
+        # that plan's own top-15 semantic search results had no documented
+        # features for the scoring LLM to ground "what_it_helps" in. Since
+        # _evaluate_candidate rejects any candidate with no url AND no
+        # what_it_helps text, the LLM often had nothing defensible to write
+        # and silently dropped the citation despite the STEP-CITED OVERRIDE
+        # instruction. Resolve every step-cited name by exact DB lookup too,
+        # same as a user-cited one, so real catalog tools keep their real data.
+        all_step_cited_names = dict.fromkeys(
+            name for _, _, cited in plan_results for name in cited
+        )
+
+        async def _resolve_step_cited(name: str) -> tuple[str, Optional[dict]]:
+            try:
+                record = await asyncio.to_thread(find_tool_by_name, name, self.db)
+            except Exception as e:
+                logger.warning(f"find_tool_by_name failed for step-cited '{name}': {e}")
+                record = None
+            return name, record
+
+        step_cited_records = dict(
+            await asyncio.gather(*(_resolve_step_cited(n) for n in all_step_cited_names))
+        )
+        # Case-insensitive view, since the LLM's step-text casing of a cited
+        # name won't necessarily match the DB row's casing exactly.
+        step_cited_records_ci = {k.lower(): v for k, v in step_cited_records.items() if v}
+
+        for plan_idx, candidates, cited_raw in plan_results:
+            # Normalise each cited name to its DB-canonical form (when a
+            # match was found) up front, so every later dict lookup keyed by
+            # tool name — all_tools, canonical_map, tools_section — agrees
+            # regardless of the casing/wording the LLM used in step text.
+            cited = [
+                step_cited_records_ci.get(name.lower(), {}).get("tool_name", name)
+                for name in cited_raw
+            ]
             names_for_plan: list[str] = []
             for t in candidates:
                 name = t["tool_name"]
                 if name not in all_tools:
                     all_tools[name] = t
                 names_for_plan.append(name)
+            # Make every user-named tool visible as a candidate for every
+            # plan — we don't know in advance which plan/step it belongs to,
+            # so let the per-plan scoring LLM decide (see USER-NAMED note in
+            # the prompt below) rather than guessing a mapping here.
+            for canonical_name in user_cited_records:
+                if canonical_name not in names_for_plan:
+                    names_for_plan.append(canonical_name)
             plan_candidate_names[plan_idx] = names_for_plan
             plan_step_cited[plan_idx] = cited
 
-            # Inject cited tools not found by semantic search as stubs so the
-            # LLM can assign them back to this plan
+            # Inject cited tools not found by semantic search — with real
+            # catalog data when the exact-lookup above found a matching row,
+            # falling back to a bare stub only for tools genuinely absent
+            # from the DB — so the LLM can assign them back to this plan.
             for cited_name in cited:
                 cited_lower = cited_name.lower()
-                already_in = any(k.lower() == cited_lower for k in all_tools)
-                if not already_in:
-                    all_tools[cited_name] = {
-                        "tool_name": cited_name,
-                        "url": None,
-                        "website": None,
-                        "description": f"Tool cited by name in plan steps — assign to the plan that mentions it.",
-                        "_step_cited": True,
-                    }
-                    logger.info(f"Injected step-cited tool stub: '{cited_name}' for plan {plan_idx + 1}")
+                existing_key = next((k for k in all_tools if k.lower() == cited_lower), None)
+                if existing_key:
+                    # Already present via semantic search — still flag it as
+                    # step-cited so it keeps the [CITED IN STEPS] tag and the
+                    # gate exemption below; without this a tool that is BOTH
+                    # a semantic-search hit AND explicitly named in the step
+                    # text silently loses its citation status and has to
+                    # clear the full 90+ task_relevance bar like any ordinary
+                    # candidate, which is how a genuinely cited tool (e.g.
+                    # Asana) can still get rejected despite being named.
+                    all_tools[existing_key]["_step_cited"] = True
+                else:
+                    db_record = step_cited_records_ci.get(cited_lower)
+                    if db_record:
+                        all_tools[db_record["tool_name"]] = {**db_record, "_step_cited": True}
+                        logger.info(f"Injected step-cited tool (DB match): '{db_record['tool_name']}' for plan {plan_idx + 1}")
+                    else:
+                        all_tools[cited_name] = {
+                            "tool_name": cited_name,
+                            "url": None,
+                            "website": None,
+                            "description": f"Tool cited by name in plan steps — assign to the plan that mentions it.",
+                            "_step_cited": True,
+                        }
+                        logger.info(f"Injected step-cited tool stub: '{cited_name}' for plan {plan_idx + 1}")
 
         if not all_tools:
             return action_plans
@@ -884,7 +1038,12 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
                 if not t:
                     continue
                 url = t.get("url") or t.get("website") or "unknown"
-                step_flag = " [CITED IN STEPS]" if t.get("_step_cited") else ""
+                if t.get("_step_cited"):
+                    step_flag = " [CITED IN STEPS]"
+                elif t.get("_user_cited"):
+                    step_flag = " [USER-NAMED]"
+                else:
+                    step_flag = ""
                 block = f"- {name}{step_flag} | URL: {url}\n  Description: {t.get('description', '')[:200]}"
                 # Documented feature/audience/integration data — the same
                 # fields already used to steer this tool's retrieval embedding
@@ -908,7 +1067,14 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
 
             cited_note = ""
             if plan_step_cited.get(plan_idx):
-                cited_note = f"\nTools explicitly named in steps (MUST assign to the step that names them): {', '.join(plan_step_cited[plan_idx])}"
+                cited_note += f"\nTools explicitly named in steps (MUST assign to the step that names them): {', '.join(plan_step_cited[plan_idx])}"
+            if user_cited_records:
+                cited_note += (
+                    f"\nTools the user named directly in their own request (marked [USER-NAMED] above): "
+                    f"{', '.join(user_cited_records.keys())}. If ANY step in this plan genuinely uses one, "
+                    f"assign it there as that step's top candidate, gate-exempt like a step-cited tool. Only "
+                    f"skip it if no step in this specific plan actually involves it."
+                )
 
             why_list = plan.get("why_it_matters", [])
             why_it_matters_block = ""
@@ -924,7 +1090,7 @@ Your output appears directly on an action plan card that a solo founder will use
 GLOBAL QUALITY STANDARDS — every "what_it_helps" you write must pass ALL of these:
 1. PERSONA: Second person only — "you", "your". Never "the user", "the founder", or any third-person reference.
 2. SPECIFICITY: Passes the intern test — a smart person with zero context about the tool can tell exactly what feature does what, for this exact step, on first read.
-3. GROUNDING: Name the actual Key Feature / integration from the catalog block below, not a paraphrase of the generic description. If the catalog gives you nothing concrete enough to name, that candidate is not a 90+ task_relevance and should not be proposed.
+3. GROUNDING: Name the actual Key Feature / integration from the catalog block below, not a paraphrase of the generic description. If the catalog gives you nothing concrete enough to name, that candidate is not a 90+ task_relevance and should not be proposed. EXCEPTION: this does not apply to a tool marked [CITED IN STEPS] or [USER-NAMED] that has real catalog data (a URL, Key Features, or Integrates With entries) — those are covered by the overrides below and MUST still be proposed even if their catalog entry is thin; write what_it_helps from whatever real data is present rather than omitting the candidate. A [CITED IN STEPS]/[USER-NAMED] tool with NO catalog data at all (no URL, no features) is the one case this standard still blocks — omit it rather than inventing a description for a product with no verified data behind it.
 4. COMMITMENT: Never hedge with "can help", "may assist", "is useful for", or "could be used to". State plainly what it does — "sends", "generates", "tracks" — not what it might do.
 5. FORMATTING: Do NOT start any text value with a dash, bullet, or em dash.
 
@@ -934,6 +1100,8 @@ WITHIN-PLAN CONSTRAINT: Do not propose the same tool for two different steps in 
 
 STEP-CITED OVERRIDE: Any tool marked [CITED IN STEPS] is explicitly named inside this plan's step text. It MUST be assigned to the specific step that names it, as that step's top candidate, regardless of catalog rank.
 
+USER-NAMED OVERRIDE: Any tool marked [USER-NAMED] was explicitly named by the user in their own request (not generated by this system). If any step in THIS plan genuinely uses it, assign it to that step as the top candidate, gate-exempt — do not withhold it over task_relevance score. Only omit it from this plan if none of this plan's steps actually involve it.
+
 SCORING RUBRIC — for every candidate you propose, score all 5 criteria honestly on a 0-100 scale. These numbers are checked in code against fixed pass bars, not just read by a person, so inflate nothing:
 - task_relevance (bar: {bars['task_relevance']}): does the tool's DOCUMENTED core feature literally perform the action named in THIS step? Score 90+ only if unambiguous. A tool that is merely "in the same category" or "could be adapted" scores well below 90.
 - workflow_integration (bar: {bars['workflow_integration']}): does adopting it fit how a solo founder already works, without a heavy migration or new platform lock-in?
@@ -941,7 +1109,7 @@ SCORING RUBRIC — for every candidate you propose, score all 5 criteria honestl
 - ease_of_implementation (bar: {bars['ease_of_implementation']}): can a non-technical founder start using it the same day, no engineering help required?
 - cost_efficiency (bar: {bars['cost_efficiency']}): is there a free tier or low-cost plan sufficient at solo-founder volume?
 
-Only propose a candidate for a step if you would defend task_relevance >= {bars['task_relevance']} under scrutiny from another independent reviewer. If no catalog tool's documented function genuinely performs a step's action, omit that step entirely.
+Only propose a candidate for a step if you would defend task_relevance >= {bars['task_relevance']} under scrutiny from another independent reviewer. If no catalog tool's documented function genuinely performs a step's action, omit that step entirely. This bar does not gate a [CITED IN STEPS] or [USER-NAMED] tool with real catalog data — score it honestly, but propose it regardless of where it lands; the STEP-CITED/USER-NAMED OVERRIDE below exempts it from this bar in code.
 
 USER BUSINESS CHALLENGE: "{user_query}"
 
@@ -949,7 +1117,7 @@ PLAN: {plan['title']}
 STEPS:
 {numbered_steps}{cited_note}{why_it_matters_block}
 
-TOOL CATALOG FOR THIS PLAN (from semantic search + step extraction — names marked [CITED IN STEPS] were found inside the steps themselves):
+TOOL CATALOG FOR THIS PLAN (from semantic search + step extraction — names marked [CITED IN STEPS] were found inside the steps themselves, [USER-NAMED] were named directly by the user):
 {tools_section}
 
 MATCHING PROTOCOL:
@@ -963,13 +1131,13 @@ Good: "Step 2: Its automated re-engagement sequences feature sends a personalise
 Bad: "A powerful automation platform that can help with re-engagement."
 
 STEP 3 — CANDIDATES, RANKED
-For each step you're confident about, return up to 2 candidates ordered best-first (a second one only if it is also genuinely defensible — never pad with a weak second choice). Most steps will have exactly 1 or 0 candidates.
+For each step you're confident about, return up to 4 candidates ordered best-first. Do not pad with a weak choice just to fill a slot — but if multiple DIFFERENT catalog tools each independently perform this step's action and each clears task_relevance >= {bars['task_relevance']} on their own documented features, return all of them (up to 4); that is exactly the case the system is designed to surface as a combined recommendation, not something to withhold in favor of a single winner.
 
 STEP 4 — ASSIGNMENT RULES
 1. Do not propose the same tool for two different steps in this plan.
-2. Tools marked [CITED IN STEPS] MUST appear as the top candidate for the step that cites them.
-3. Only propose non-cited tools if they directly address that step's named action, grounded in a specific Key Feature or integration. Do NOT propose based on general category fit.
-4. Return the tool's URL from the catalog exactly as shown (null is acceptable for step-cited stubs).
+2. Tools marked [CITED IN STEPS] or [USER-NAMED] MUST appear as the top candidate for the step that cites/matches them.
+3. Only propose non-cited, non-user-named tools if they directly address that step's named action, grounded in a specific Key Feature or integration. Do NOT propose based on general category fit.
+4. Return the tool's URL from the catalog exactly as shown (null is acceptable for step-cited/user-named stubs).
 
 OUTPUT FORMAT (JSON only, no markdown):
 {{
@@ -995,9 +1163,18 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
                     model=self.fast_model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.2,
-                    max_tokens=600,
+                    # 600 was sized for up to 2 candidates/step; raised alongside
+                    # the STEP 3 cap going to 4 so a plan with several steps that
+                    # each get multiple candidates has headroom to not truncate
+                    # (see the finish_reason=="length" warning below).
+                    max_tokens=1200,
                 )
                 raw = response.choices[0].message.content.strip()
+                if response.choices[0].finish_reason == "length":
+                    logger.warning(
+                        f"Step-assignment response for plan {plan_idx + 1} was TRUNCATED by "
+                        f"max_tokens ({len(raw)} chars) — some steps/candidates are likely missing"
+                    )
                 if "```json" in raw:
                     raw = raw.split("```json")[1].split("```")[0].strip()
                 elif "```" in raw:
@@ -1075,11 +1252,12 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
                 return None
 
             tool_record = all_tools[canonical]
-            is_step_cited = bool(tool_record.get("_step_cited"))
+            is_step_cited = bool(tool_record.get("_step_cited")) or bool(tool_record.get("_user_cited"))
 
-            # A step-cited tool was named explicitly inside the plan's own
-            # step text — the plan itself already decided this tool belongs
-            # here, so task_relevance is self-evident.
+            # A step-cited or user-named tool was named explicitly — by the
+            # plan's own step text or by the user directly — so task_relevance
+            # is self-evident; the gate exists to catch tools the LLM merely
+            # guessed at, not ones the human already told us to use.
             scores = candidate.get("scores", {}) or {}
             if not is_step_cited and not _passes_gate(scores):
                 logger.info(
@@ -1090,7 +1268,11 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
 
             what_it_helps = (candidate.get("what_it_helps") or "").strip()
             if not what_it_helps:
-                is_stub = is_step_cited or not tool_record.get("url")
+                # Distinct from is_step_cited (which only controls the gate):
+                # a user-named tool resolved to a real DB record still has a
+                # real description to fall back on even with no step-specific
+                # LLM text, unlike a bare citation stub with no url at all.
+                is_stub = not tool_record.get("url")
                 if is_stub:
                     # No step-specific text from the LLM and no real DB
                     # description to fall back on — showing the internal stub
@@ -1109,6 +1291,24 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
                 "scores": {crit: scores.get(crit) for crit in bars},
             }
 
+        def _candidate_is_cited(candidate: dict, plan_idx: int) -> bool:
+            """Peek at whether a raw LLM candidate resolves to a step-cited
+            or user-named tool, without claiming it (no dedup/gate side
+            effects — that's still _evaluate_candidate's job). Used only to
+            sort cited candidates ahead of searched ones before the top-4
+            cap below, since the prompt's "cited tools go first" instruction
+            (STEP-CITED OVERRIDE / USER-NAMED OVERRIDE) is advisory only —
+            nothing previously enforced it if the LLM ignored it or listed
+            the cited tool 5th+, where the old unconditional [:4] slice
+            would have dropped it before it was ever evaluated."""
+            canonical = _resolve_canonical(candidate.get("tool_name", ""), plan_idx)
+            if not canonical:
+                return False
+            tool_record = all_tools.get(canonical)
+            if not tool_record:
+                return False
+            return bool(tool_record.get("_step_cited")) or bool(tool_record.get("_user_cited"))
+
         # Walk plans/steps in priority order (lower plan number = higher
         # priority, then step order within the plan) so that when two steps
         # compete for the same tool, the higher-priority one wins — same
@@ -1119,23 +1319,36 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
             what_to_do_list = action_plans[plan_idx].get("what_to_do", [])
             step_count = len(what_to_do_list) if isinstance(what_to_do_list, list) else 0
             for step_idx in range(step_count):
-                # Evaluate BOTH ranked candidates (not just the first that
-                # passes) — a step where 2 tools independently clear the gate
-                # is exactly what should become an automation stack, not a
-                # single tool with the runner-up silently discarded (item 42).
+                # Evaluate ALL ranked candidates (not just the first that
+                # passes) — a step where multiple tools independently clear
+                # the gate is exactly what should become an automation stack,
+                # not a single tool with the runner-up(s) silently discarded
+                # (item 42).
+                #
+                # Cited tools are sorted ahead of searched candidates (stable
+                # sort — order within each group is otherwise untouched)
+                # *before* the top-4 cap, so a tool named directly in the
+                # step text or by the user is guaranteed to survive the cap
+                # and land first in step_tools/step_stacks, rather than
+                # relying on the LLM having ranked it first on its own.
+                raw_candidates = by_step.get((plan_idx, step_idx), []) or []
+                ordered_candidates = sorted(
+                    raw_candidates,
+                    key=lambda c: 0 if _candidate_is_cited(c, plan_idx) else 1,
+                )
                 passing = [
                     entry
-                    for candidate in (by_step.get((plan_idx, step_idx), []) or [])[:2]
+                    for candidate in ordered_candidates[:4]
                     if (entry := _evaluate_candidate(candidate, plan_idx, step_idx))
                 ]
 
                 if len(passing) >= 2:
                     # Same effort convention the old embedding-based mechanism
-                    # used for a 2-tool combination (recommender_db.py::
-                    # recommend_automation_stacks: "Medium" for 2-3 tools).
+                    # used (recommender_db.py::recommend_automation_stacks):
+                    # "Medium" for 2-3 tools, "High" for 4+.
                     action_plans[plan_idx]["step_stacks"][step_idx] = {
                         "tools": passing,
-                        "estimated_effort": "Medium",
+                        "estimated_effort": "Medium" if len(passing) <= 3 else "High",
                     }
                     stacked_steps += 1
                     logger.info(
@@ -1229,9 +1442,10 @@ PER-PLAN REQUIREMENTS:
 (a) The EXACT action to take
 (b) The SPECIFIC output or deliverable it produces
 (c) The METRIC or observable signal that confirms it is done correctly
+(d) If the action genuinely requires software to execute, NAME A SPECIFIC REAL PRODUCT by its actual name — "in Typeform", "using Zapier", "via Google Sheets" — never a generic category like "a form tool", "an automation platform", or "a spreadsheet tool". This is not optional decoration: a vague category name cannot be matched to a real recommendation downstream, a specific product name can. Only name a tool where the step genuinely needs one — steps that are a decision, a call, or manual judgment need no tool at all.
 Steps are SEQUENTIAL — each builds on the previous and assumes its completion.
-Good: "Write a 3-question post-purchase survey targeting the moment of highest engagement — the confirmation page — using a free form tool, and set a 24-hour email trigger to send to every buyer. Review the first 20 responses to identify the top two unmet expectations."
-Bad: "Collect customer feedback."
+Good: "Build a 3-question post-purchase survey in Typeform targeting the moment of highest engagement — the confirmation page — and set a 24-hour trigger in Zapier to email it to every buyer automatically. Review the first 20 responses to identify the top two unmet expectations."
+Bad: "Collect customer feedback using a form tool."
 
 "why_it_matters" — EXACTLY 2–3 impact statements (no more than 3) in second person:
 At least one must name a UNIT ECONOMICS metric (CAC, LTV, gross margin, payback period, contribution margin) with a calibrated range and timeframe.
@@ -1493,7 +1707,6 @@ OUTPUT FORMAT (JSON only, no markdown fences):
         Also generates per-plan descriptions so each action card shows unique context for
         the same tool — no extra LLM call, same request with more structured output.
         """
-        from database.pg_models import AITool
         try:
             # See _search_ai_tools — must not block the event loop on a cache miss.
             tools = await asyncio.to_thread(recommend_tools, user_query, top_k=3, db_session=self.db)
