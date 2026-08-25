@@ -869,8 +869,11 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
                     # candidates, not a lower bar (2026-08-14/15: bar stays
                     # fixed at 90 by design — loosening it trades precision for
                     # stack count instead of just recovering already-qualifying
-                    # tools that retrieval was dropping). Raised 20 -> 30.
-                    top_k=30,
+                    # tools that retrieval was dropping). Raised 20 -> 30, then
+                    # 30 -> 40 (2026-08-25: real test batch of 10 analyses
+                    # still produced a stack on only 3 — same recall problem,
+                    # same fix, larger pool).
+                    top_k=40,
                 ),
                 self._extract_mentioned_tools(what_to_do_list),
             )
@@ -1220,9 +1223,31 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
             # matches a tool explicitly cited inside this plan's own steps.
             cited_for_plan = [c.lower() for c in plan_step_cited.get(plan_idx, [])]
             if name.lower() in cited_for_plan:
+                # Before minting a fresh, ungrounded stub (no url/description)
+                # under this exact spelling, check whether a near-miss
+                # spelling of the SAME tool was already resolved to a real
+                # DB record earlier in this same run — e.g. the citation
+                # extraction step canonicalized "Google Sheet" (singular, as
+                # the step text literally said) to the real catalog row
+                # "Google Sheets", but this later scoring call's tool_name
+                # came back as "Google Sheet" again. A second, case-exact
+                # dict lookup against canonical_map misses that, and used to
+                # fork off a second entry for "Google Sheet" with url=None —
+                # silently stripping the link even though the system already
+                # had the real one under a one-character-different key. Same
+                # substring heuristic find_tool_by_name/fix_tool_urls.py use
+                # for this identical class of mismatch.
+                name_lower = name.lower()
+                for existing_name, record in all_tools.items():
+                    if not record.get("url"):
+                        continue  # itself a stub — not something to merge onto
+                    existing_lower = existing_name.lower()
+                    if name_lower in existing_lower or existing_lower in name_lower:
+                        canonical_map[name_lower] = existing_name
+                        return existing_name
                 if name not in all_tools:
                     all_tools[name] = {"tool_name": name, "url": None, "website": None, "description": ""}
-                canonical_map[name.lower()] = name
+                canonical_map[name_lower] = name
                 return name
             return None  # genuinely unknown — reject
 
@@ -1427,6 +1452,8 @@ PRIMARY BOTTLENECK: "{primary_title}"
 SECONDARY CONSTRAINTS: {constraints}
 
 TASK: Create 3–5 action plans that directly dismantle your primary bottleneck. Rank by leverage — the plan that produces the fastest measurable business result goes first.
+
+DOMAIN vs. GROWTH BALANCE: Do not let every plan default to acquisition/marketing (landing pages, ad campaigns, lead capture, social posting) just because those are the most familiar leverage points. If the bottleneck or constraints point to a core operational, delivery, or domain-specific inefficiency — service delivery, scheduling, case/client management, curriculum or content structure, inventory, fulfillment, member/congregation management, and so on — at least one plan must address that directly, naming the domain-appropriate software for it where one genuinely exists (a specific practice-management, scheduling, or industry tool — not a generic marketing platform repurposed for it). A church, a clinic, and a marketing agency should not all receive the same acquisition-shaped plans; the mix should reflect what the business actually runs on, not just how it gets customers.
 
 RANKING METHODOLOGY (BCG impact-feasibility matrix, adapted for solo founders):
 - IMPACT VELOCITY: How fast does measurable evidence appear? (Not "how big is the eventual impact" — how fast does the SIGNAL appear?)
