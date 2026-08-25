@@ -657,6 +657,23 @@ async def run_scheduled_reflections_job():
             logger.error("[reflections-job] error: %s", exc)
 
 
+async def run_scheduled_voo_bot_job():
+    """
+    Runs every 60 seconds in the background inside FastAPI.
+    Checks for question discussions where voo_status == 'scheduled' and voo_scheduled_for <= now.
+    Generates intelligent follow-up via xAI Grok and posts as Voo (System Bot).
+    """
+    while True:
+        await asyncio.sleep(60)
+        try:
+            from database.pg_connections import SessionLocal
+            from api.routes.community.community import cron_process_pending_voo_replies
+            with SessionLocal() as db:
+                await cron_process_pending_voo_replies(db=db)
+        except Exception as exc:
+            logger.error("[voo-bot-job] error: %s", exc)
+
+
 def run_heavy_schema_migrations():
     """
     Background task that performs all non-critical, potentially slow schema
@@ -808,6 +825,26 @@ def run_heavy_schema_migrations():
         logger.info("✓ Added email column to ip_blacklist table")
     except Exception as e:
         logger.warning(f"Email column migration: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+    # --- Voo AI Bot Columns & Bot User Initialization ---
+    db = SessionLocal()
+    try:
+        db.execute(text("""
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN DEFAULT FALSE;
+            ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS voo_status VARCHAR(30) DEFAULT 'untracked';
+            ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS voo_scheduled_for TIMESTAMP WITH TIME ZONE;
+            ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS voo_reply_id INTEGER;
+            ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS is_resolved BOOLEAN DEFAULT FALSE;
+        """))
+        db.commit()
+        from api.routes.community.community import ensure_voo_bot_user
+        ensure_voo_bot_user(db)
+        logger.info("✓ Voo AI bot schema & user account verified")
+    except Exception as e:
+        logger.warning(f"Voo bot schema migration warning: {e}")
         db.rollback()
     finally:
         db.close()
@@ -1147,6 +1184,7 @@ async def startup_event():
     asyncio.create_task(run_subscription_expiry_job())
     asyncio.create_task(run_new_alert_notifications_job())
     asyncio.create_task(run_scheduled_reflections_job())
+    asyncio.create_task(run_scheduled_voo_bot_job())
 
     try:
         # --- MINIMAL WORK REQUIRED FOR "Application startup complete" ---

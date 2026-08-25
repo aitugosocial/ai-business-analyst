@@ -28,9 +28,217 @@ from api.routes.dependencies import get_current_user_optional
 from api.routes.user.missions import _flatten_roadmap_tasks
 from api.cache import get_cached, set_cached, delete_cached
 
+from passlib.context import CryptContext
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/community", tags=["community"])
+
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+
+
+def ensure_voo_bot_user(db: Session) -> User:
+    """
+    Ensures the system bot user 'Voo' exists in the database.
+    """
+    bot = db.query(User).filter(func.lower(User.username) == "voo").first()
+    if not bot:
+        bot = db.query(User).filter(User.email == "voo@lavoo.io").first()
+    if not bot:
+        bot_pw = pwd_context.hash("voo_bot_secure_password_99x")
+        bot = User(
+            name="Voo",
+            email="voo@lavoo.io",
+            username="voo",
+            is_bot=True,
+            role="ai_bot",
+            avatar_url="https://lavoo.io/logo.png",
+            bio="Lavoo's intelligent AI assistant in The Build Room.",
+            password=bot_pw,
+            confirm_password=bot_pw
+        )
+        db.add(bot)
+        db.commit()
+        db.refresh(bot)
+        logger.info(f"[voo-bot] Created Voo bot user account (id={bot.id})")
+    else:
+        changed = False
+        if not getattr(bot, "is_bot", False):
+            bot.is_bot = True
+            changed = True
+        if getattr(bot, "role", "") != "ai_bot":
+            bot.role = "ai_bot"
+            changed = True
+        if changed:
+            db.commit()
+    return bot
+
+
+def _generate_voo_checkin_message(author_handle: str, question_title: str, question_content: str, contributors: List[str], replies_text: str) -> str:
+    """
+    Generates a high-quality, friendly check-in response from Voo using xAI Grok (or OpenAI client).
+    """
+    api_key = os.getenv("XAI_API_KEY")
+    contributors_str = ", ".join(contributors[:3]) if contributors else "the community"
+    
+    fallback_message = (
+        f"Hey {author_handle}! 👋\n\n"
+        f"It's been a little while since you posted your question about **{question_title}**, and {contributors_str} shared some helpful thoughts!\n\n"
+        f"Did the responses so far give you clarity, or are you still working through this? If you've found your answer, feel free to mark this discussion as resolved, or turn this into a Decision Engine mission to execute the steps."
+    )
+
+    if not api_key:
+        return fallback_message
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.x.ai/v1",
+            timeout=30.0,
+            max_retries=2,
+        )
+        prompt = (
+            f"You are Voo, the friendly and hyper-intelligent AI community assistant in the Lavoo Build Room for business owners.\n\n"
+            f"The author ({author_handle}) asked this question:\n"
+            f"Title: {question_title}\n"
+            f"Question details: {question_content}\n\n"
+            f"Community contributors ({contributors_str}) shared these responses:\n{replies_text}\n\n"
+            f"Write a warm, natural, and concise 2-3 paragraph follow-up comment directly to {author_handle}:\n"
+            f"1. Greet {author_handle} warmly and mention that {contributors_str} shared valuable insights on their question.\n"
+            f"2. In 1 concise sentence, summarize the core direction or solutions the community suggested.\n"
+            f"3. Ask {author_handle} if the responses so far were helpful or if they need further breakdown.\n"
+            f"4. Remind them they can mark the discussion as resolved or convert the advice into a Decision Engine mission.\n"
+            f"Keep the tone encouraging, crisp, and professional. Do NOT use markdown code fences."
+        )
+
+        completion = client.chat.completions.create(
+            model="grok-4-1-fast-reasoning",
+            messages=[
+                {"role": "system", "content": "You are Voo, the intelligent AI community companion for the Lavoo Build Room. Keep replies warm, concise, and helpful."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.4,
+            max_tokens=350,
+        )
+
+        if completion and completion.choices:
+            text_resp = completion.choices[0].message.content.strip()
+            if text_resp:
+                return text_resp
+    except Exception as e:
+        logger.error(f"[voo-bot] Grok generation failed, using fallback: {e}")
+
+    return fallback_message
+
+
+async def cron_process_pending_voo_replies(db: Session):
+    """
+    Checks for discussions where voo_status == 'scheduled' AND voo_scheduled_for <= now.
+    Generates intelligent follow-up using xAI Grok and posts as Voo.
+    """
+    now = datetime.now(timezone.utc)
+    eligible = db.query(CommunityDiscussion).filter(
+        CommunityDiscussion.voo_status == "scheduled",
+        CommunityDiscussion.voo_scheduled_for <= now,
+        or_(CommunityDiscussion.is_resolved == False, CommunityDiscussion.is_resolved == None)
+    ).all()
+
+    if not eligible:
+        return
+
+    logger.info(f"[voo-bot] Found {len(eligible)} discussions eligible for Voo check-in")
+    voo_user = ensure_voo_bot_user(db)
+
+    for d in eligible:
+        try:
+            # Check if discussion already has a Voo reply
+            existing_voo_reply = db.query(DiscussionReply).filter_by(
+                discussion_id=d.id,
+                user_id=voo_user.id
+            ).first()
+
+            if existing_voo_reply:
+                d.voo_status = "completed"
+                d.voo_reply_id = existing_voo_reply.id
+                db.commit()
+                continue
+
+            # Fetch all non-bot replies
+            replies = db.query(DiscussionReply).filter(
+                DiscussionReply.discussion_id == d.id,
+                DiscussionReply.user_id != voo_user.id
+            ).order_by(DiscussionReply.created_at.asc()).all()
+
+            if not replies:
+                # If all replies were deleted, revert back to pending_replies
+                d.voo_status = "pending_replies"
+                d.voo_scheduled_for = None
+                db.commit()
+                continue
+
+            # Author name/tag
+            author_user = db.query(User).filter_by(id=d.user_id).first()
+            author_handle = f"@{author_user.username}" if author_user and author_user.username else (f"@{author_user.name}" if author_user and author_user.name else "there")
+
+            # Collect contributor usernames and response snippets
+            contributors = []
+            reply_summaries = []
+            for r in replies:
+                u = db.query(User).filter_by(id=r.user_id).first()
+                u_name = f"@{u.username}" if u and u.username else (f"@{u.name}" if u and u.name else "a builder")
+                if u_name not in contributors and u_name != author_handle:
+                    contributors.append(u_name)
+                reply_summaries.append(f"{u_name}: {r.content[:200]}")
+
+            # Generate synthesis via Grok
+            synthesis = _generate_voo_checkin_message(
+                author_handle=author_handle,
+                question_title=d.title,
+                question_content=d.content,
+                contributors=contributors,
+                replies_text="\n".join(reply_summaries[:5])
+            )
+
+            # Insert DiscussionReply as Voo
+            voo_reply = DiscussionReply(
+                discussion_id=d.id,
+                user_id=voo_user.id,
+                content=synthesis,
+                parent_reply_id=None,
+                tagged_user_ids=[d.user_id] if d.user_id else []
+            )
+            db.add(voo_reply)
+            db.flush()
+
+            d.reply_count = (d.reply_count or 0) + 1
+            d.voo_status = "completed"
+            d.voo_reply_id = voo_reply.id
+            db.commit()
+            db.refresh(voo_reply)
+
+            # Notify question author
+            if d.user_id:
+                try:
+                    notif = UserNotification(
+                        user_id=d.user_id,
+                        type="voo_checkin",
+                        title="🤖 Voo checked in on your question",
+                        message=f"Voo reviewed community responses to '{d.title[:50]}'. Were they helpful?",
+                        link=f"/dashboard/community?discussionId={d.id}",
+                        is_read=False
+                    )
+                    db.add(notif)
+                    db.commit()
+                except Exception as ne:
+                    logger.warning(f"[voo-bot] Notification creation failed: {ne}")
+
+            await delete_cached("community:discussions:*")
+            logger.info(f"[voo-bot] Successfully posted Voo check-in on discussion {d.id}")
+
+        except Exception as e:
+            logger.error(f"[voo-bot] Failed processing discussion {d.id}: {e}", exc_info=True)
+            db.rollback()
 
 
 def _generate_grok_takeaways(title: str, content: str) -> Optional[List[str]]:
@@ -333,6 +541,9 @@ def _discussion_dict(d: CommunityDiscussion, liked_ids: Optional[set] = None, sa
         "tagged_user_ids": tagged_ids,
         "visibility": visibility_val,
         "poll": _get_poll_payload(d, current_user=current_user),
+        "voo_status": getattr(d, 'voo_status', 'untracked') or 'untracked',
+        "voo_reply_id": getattr(d, 'voo_reply_id', None),
+        "is_resolved": getattr(d, 'is_resolved', False) or False,
         "author": author_obj,
         "channel": channel_display,
         "created_at": d.created_at.isoformat() if d.created_at else None,
@@ -860,6 +1071,9 @@ async def get_discussion(
             "author": {
                 "id": r.user.id,
                 "name": r.user.name,
+                "username": getattr(r.user, 'username', '') or '',
+                "role": getattr(r.user, 'role', '') or '',
+                "is_bot": getattr(r.user, 'is_bot', False) or False,
                 "total_chops": r.user.total_chops or 0,
             } if r.user else None,
             "created_at": r.created_at.isoformat() if r.created_at else None,
@@ -954,12 +1168,25 @@ async def create_discussion(
                 "expires_at": expires_at_iso
             }
 
+    # Detect if post is an inquiry / question
+    title_lower = body.title.strip().lower()
+    content_lower = body.content.strip().lower()
+    is_question = (
+        post_type in ['ask-the-community', 'decision-help', 'question']
+        or body.title.strip().endswith('?')
+        or body.content.strip().endswith('?')
+        or any(phrase in title_lower for phrase in ['how do i', 'how to', 'should i', 'what tool', 'what is', 'help me', 'need help', 'any recommendation', 'which tool', 'how can i', 'anyone know'])
+        or any(phrase in content_lower for phrase in ['how do i', 'how to', 'should i', 'what tool', 'what is', 'help me', 'need help', 'any recommendation', 'which tool', 'how can i'])
+    )
+    voo_init_status = "pending_replies" if is_question else "untracked"
+
     d = CommunityDiscussion(
         channel_id=body.channel_id, user_id=current_user.id,
         title=body.title.strip(), content=body.content.strip(),
         tags=body.tags or [], post_type=post_type,
         tagged_user_ids=tagged_ids, visibility=visibility_val,
-        poll_data=poll_payload
+        poll_data=poll_payload,
+        voo_status=voo_init_status
     )
     db.add(d)
     ch.post_count = (ch.post_count or 0) + 1
@@ -1317,6 +1544,18 @@ async def reply_to_discussion(
     # Count all replies (including nested) so comment badge is accurate
     d.reply_count = (d.reply_count or 0) + 1
     current_user.total_chops = (current_user.total_chops or 0) + 5
+
+    # Trigger Voo bot 10-minute follow-up timer for questions
+    if (
+        getattr(d, "voo_status", "untracked") == "pending_replies"
+        and current_user.id != d.user_id
+        and not getattr(current_user, "is_bot", False)
+    ):
+        interval_minutes = int(os.getenv("VOO_BOT_INTERVAL_MINUTES", "10"))
+        d.voo_status = "scheduled"
+        d.voo_scheduled_for = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
+        logger.info(f"[voo-bot] Scheduled Voo follow-up for discussion {discussion_id} in {interval_minutes}m (at {d.voo_scheduled_for})")
+
     db.commit()
     db.refresh(reply)
 
@@ -1358,11 +1597,40 @@ async def reply_to_discussion(
         "author": {
             "id": current_user.id,
             "name": current_user.name,
+            "username": getattr(current_user, 'username', '') or '',
+            "role": getattr(current_user, 'role', '') or '',
+            "is_bot": getattr(current_user, 'is_bot', False) or False,
             "total_chops": current_user.total_chops or 0,
         },
         "created_at": reply.created_at.isoformat() if reply.created_at else None,
         "sub_replies": [],
     }}
+
+
+@router.patch("/discussions/{discussion_id}/resolve")
+async def resolve_discussion(
+    discussion_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Marks a question discussion as resolved.
+    Awards +15 Chops to the author for community resolution and completes Voo bot tracking.
+    """
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    
+    if d.user_id != current_user.id and not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Only the author can mark this discussion as resolved")
+    
+    d.is_resolved = True
+    d.voo_status = "completed"
+    current_user.total_chops = (current_user.total_chops or 0) + 15
+    db.commit()
+    await delete_cached("community:discussions:*")
+    logger.info(f"[voo-bot] Discussion {discussion_id} marked as resolved by user {current_user.id}")
+    return {"success": True, "message": "Discussion marked as resolved", "is_resolved": True, "chops_awarded": 15}
 
 
 @router.post("/discussions/{discussion_id}/replies/{reply_id}/like")
