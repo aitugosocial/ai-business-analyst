@@ -559,9 +559,26 @@ def find_tool_by_name(name: str, db_session: Session) -> Optional[dict]:
             query_lower = query.lower()
             all_tools = db_session.query(AITool.id, AITool.name).all()
 
+            # A short catalog name (e.g. "X", "Pi") is a coincidental
+            # substring of huge swaths of unrelated text — "x" is inside
+            # "Glofox", "pi" is inside "pipeline" — so a raw `in` check in
+            # this direction previously resolved queries like "Glofox" to
+            # the catalog's single-letter "X" row. Require the catalog name
+            # to appear as a whole word and be long enough that a
+            # coincidental match is implausible, mirroring the same 4-char
+            # floor compile_catalog_name_pattern already uses for this exact
+            # reason. The other direction (query contained in a longer
+            # catalog name, e.g. "Notion" -> "Notion AI") is left as a plain
+            # substring check — the query here is a full cited/extracted
+            # product name, not an arbitrary short fragment.
+            def _catalog_name_in_query(catalog_name: str) -> bool:
+                if len(catalog_name) < 4:
+                    return False
+                return re.search(r'\b' + re.escape(catalog_name.lower()) + r'\b', query_lower) is not None
+
             substring_matches = [
                 t for t in all_tools
-                if query_lower in t.name.lower() or t.name.lower() in query_lower
+                if query_lower in t.name.lower() or _catalog_name_in_query(t.name)
             ]
             if substring_matches:
                 best = min(substring_matches, key=lambda t: abs(len(t.name) - len(query)))
