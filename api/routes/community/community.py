@@ -74,6 +74,37 @@ def ensure_voo_bot_user(db: Session) -> User:
     return bot
 
 
+def _is_question_discussion(post_type: str = "", title: str = "", content: str = "") -> bool:
+    """
+    Intelligently identifies if a discussion is an inquiry, question, or advice request.
+    """
+    p_type = (post_type or "").strip().lower()
+    if p_type in ("questions", "question", "ask-the-community", "decision-help", "ask", "help", "inquiry", "advice"):
+        return True
+
+    t = (title or "").strip().lower()
+    c = (content or "").strip().lower()
+
+    if "?" in t or "?" in c:
+        return True
+
+    question_starters = (
+        "how ", "what ", "why ", "where ", "when ", "who ", "which ", "whose ", "whom ",
+        "do ", "does ", "did ", "is ", "are ", "was ", "were ", "am ",
+        "can ", "could ", "should ", "would ", "will ", "shall ", "may ", "might ",
+        "has ", "have ", "had ",
+        "anyone ", "anybody ", "has anyone ", "have you ", "need help",
+        "help me", "any recommendation", "recommendations for", "any advice", "advice on",
+        "any thoughts", "curious to know", "curious to find out", "curious if", "wondering if"
+    )
+    if any(t.startswith(s) or f" {s}" in t for s in question_starters):
+        return True
+    if any(c.startswith(s) or f" {s}" in c for s in question_starters):
+        return True
+
+    return False
+
+
 def _generate_voo_checkin_message(author_handle: str, question_title: str, question_content: str, contributors: List[str], replies_text: str) -> str:
     """
     Generates a high-quality, friendly check-in response from Voo using xAI Grok (or OpenAI client).
@@ -1169,15 +1200,7 @@ async def create_discussion(
             }
 
     # Detect if post is an inquiry / question
-    title_lower = body.title.strip().lower()
-    content_lower = body.content.strip().lower()
-    is_question = (
-        post_type in ['ask-the-community', 'decision-help', 'question']
-        or body.title.strip().endswith('?')
-        or body.content.strip().endswith('?')
-        or any(phrase in title_lower for phrase in ['how do i', 'how to', 'should i', 'what tool', 'what is', 'help me', 'need help', 'any recommendation', 'which tool', 'how can i', 'anyone know'])
-        or any(phrase in content_lower for phrase in ['how do i', 'how to', 'should i', 'what tool', 'what is', 'help me', 'need help', 'any recommendation', 'which tool', 'how can i'])
-    )
+    is_question = _is_question_discussion(post_type=post_type, title=body.title, content=body.content)
     voo_init_status = "pending_replies" if is_question else "untracked"
 
     d = CommunityDiscussion(
@@ -1546,10 +1569,17 @@ async def reply_to_discussion(
     current_user.total_chops = (current_user.total_chops or 0) + 5
 
     # Trigger Voo bot 10-minute follow-up timer for questions
+    is_pending_question = getattr(d, "voo_status", "untracked") == "pending_replies"
+    is_untracked_question = (
+        getattr(d, "voo_status", "untracked") == "untracked"
+        and _is_question_discussion(getattr(d, "post_type", "") or "", d.title or "", d.content or "")
+    )
     if (
-        getattr(d, "voo_status", "untracked") == "pending_replies"
+        (is_pending_question or is_untracked_question)
         and current_user.id != d.user_id
         and not getattr(current_user, "is_bot", False)
+        and not getattr(d, "is_resolved", False)
+        and getattr(d, "voo_status", "untracked") not in ("completed", "skipped")
     ):
         interval_minutes = int(os.getenv("VOO_BOT_INTERVAL_MINUTES", "10"))
         d.voo_status = "scheduled"
