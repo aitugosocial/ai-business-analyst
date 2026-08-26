@@ -76,7 +76,13 @@ def signup(
         logger.warning("[SIGNUP] Passwords do not match")
         raise HTTPException(status_code=400, detail="Passwords do not match")
 
-    # Validate and fetch referrer if code provided
+    # Validate and fetch referrer if code provided. An unrecognized code
+    # (stale link, referrer account deleted, typo) degrades to "sign up
+    # without a referrer" rather than blocking registration outright — this
+    # is the first time this path is actually reachable (the frontend
+    # register form never sent referrer_code at all until now, so a hard
+    # 400 here would have silently started blocking real signups the moment
+    # that gap was fixed, for nothing worse than a broken referral link).
     referrer = None
     if referrer_code and referrer_code.strip():
         search_code = referrer_code.upper().strip()
@@ -86,13 +92,9 @@ def signup(
         ).first()
 
         if not referrer:
-            logger.warning(f"[SIGNUP] Invalid referral code: {search_code}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid referral code. No matching user found."
-            )
-
-        logger.info(f"[SIGNUP] Referral code '{search_code}' validated for referrer ID {referrer.id}")
+            logger.warning(f"[SIGNUP] Unrecognized referral code '{search_code}' — continuing signup without a referrer")
+        else:
+            logger.info(f"[SIGNUP] Referral code '{search_code}' validated for referrer ID {referrer.id}")
 
     # ── Waitlist referral continuity ─────────────────────────────────────────
     # The waitlist and main-app share the same database.  If this email existed
