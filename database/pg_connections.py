@@ -86,9 +86,23 @@ try:
         },
     )
 
-    # Test the connection
-    with engine.connect() as conn:
-        print("[DB] Successfully connected to PostgreSQL!")
+    # Test the connection with retries for transient cloud proxy latency
+    import time
+    connected = False
+    last_err = None
+    for attempt in range(3):
+        try:
+            with engine.connect() as conn:
+                print("[DB] Successfully connected to PostgreSQL!")
+                connected = True
+                break
+        except Exception as conn_err:
+            last_err = conn_err
+            if attempt < 2:
+                print(f"[DB] Initial connection attempt {attempt+1} timed out, retrying in 2s...")
+                time.sleep(2)
+    if not connected and last_err:
+        raise last_err
 
     # Attach an event listener to silence harmless "SSL connection has been closed unexpectedly" errors
     # during connection pool check-ins.
