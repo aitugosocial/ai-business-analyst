@@ -338,6 +338,21 @@ def _attempt_flutterwave_renewal(user_id: int, plan: str, amount: float, currenc
                 "tx_ref": tx_ref,
                 "narration": f"Lavoo {plan.title()} Subscription Renewal",
             }
+            # This is server-initiated (no separate frontend checkout for a
+            # renewal), so — unlike the initial-payment path in
+            # subscriptions/flutterwave.py, which reads back what the
+            # frontend's checkout config actually did via meta — this
+            # function decides the split itself, right here, in the same
+            # payload it charges.
+            from subscriptions.flutterwave_split import (
+                build_split_config,
+                get_split_config_for_referred_user,
+            )
+            split_config = get_split_config_for_referred_user(user_id, db)
+            if split_config:
+                payload["subaccounts"] = [
+                    build_split_config(split_config["subaccount_id"], split_config["split_percentage"])
+                ]
             headers = {
                 "Authorization": f"Bearer {secret_key}",
                 "Content-Type": "application/json",
@@ -372,7 +387,24 @@ def _attempt_flutterwave_renewal(user_id: int, plan: str, amount: float, currenc
                     user.subscription_status = "active"
                     user.subscription_plan = plan
                     db.commit()
-                    logger.info("[flw-renewal] ✅ renewed user %s plan=%s tx=%s", user_id, plan, tx_ref)
+                    db.refresh(new_sub)
+
+                    # Renewals never created a Commission at all before this
+                    # (only the initial Flutterwave payment did, via
+                    # subscriptions/flutterwave.py) — referrers were earning
+                    # nothing on a referred user's recurring months. Fixed
+                    # here rather than left as a separate task since a split
+                    # renewal charge with no matching Commission row would
+                    # itself be a correctness gap in the earnings history.
+                    try:
+                        from subscriptions.commission_service import CommissionService
+                        CommissionService.calculate_commission(
+                            subscription=new_sub, db=db, already_settled=bool(split_config)
+                        )
+                    except Exception as comm_exc:
+                        logger.error("[flw-renewal] commission calc failed for user %s: %s", user_id, comm_exc, exc_info=True)
+
+                    logger.info("[flw-renewal] ✅ renewed user %s plan=%s tx=%s split=%s", user_id, plan, tx_ref, bool(split_config))
                     return True
                 logger.warning("[flw-renewal] charge not successful: %s", data.get("message"))
     except Exception as exc:
@@ -1117,6 +1149,8 @@ def run_heavy_schema_migrations():
             "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS tagged_user_ids JSON DEFAULT '[]'",
             "ALTER TABLE community_discussions ADD COLUMN IF NOT EXISTS visibility VARCHAR(30) DEFAULT 'public'",
             "ALTER TABLE discussion_replies ADD COLUMN IF NOT EXISTS tagged_user_ids JSON DEFAULT '[]'",
+            "ALTER TABLE payout_accounts ADD COLUMN IF NOT EXISTS flutterwave_subaccount_id VARCHAR(255)",
+            "ALTER TABLE payout_accounts ADD COLUMN IF NOT EXISTS subaccount_status VARCHAR(50)",
             "UPDATE users SET username = LOWER(REGEXP_REPLACE(name, '[^a-zA-Z0-9]', '', 'g')) WHERE username IS NULL OR username = ''",
             "CREATE TABLE IF NOT EXISTS founder_insight_cards (id SERIAL PRIMARY KEY, highlight_stat VARCHAR(50), insight_text TEXT NOT NULL, source VARCHAR(255) NOT NULL, category VARCHAR(50) DEFAULT 'african_tech', accent_color VARCHAR(20) DEFAULT '#e87a02', is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)"
         ]

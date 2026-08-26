@@ -832,6 +832,15 @@ class PayoutAccount(Base):
     account_name = Column(String(255), nullable=True)
     bank_code = Column(String(50), nullable=True)
     flutterwave_recipient_code = Column(String(255), nullable=True)
+    # Distinct from flutterwave_recipient_code above (that one's for the
+    # existing manual Transfer API payout flow). This is a Flutterwave
+    # Subaccount id — set once, at save time, so a percentage of a future
+    # charge can be routed here automatically by Flutterwave itself at
+    # settlement (split payments), instead of Lavoo collecting the full
+    # amount and transferring a share out later. See
+    # subscriptions/flutterwave_split.py.
+    flutterwave_subaccount_id = Column(String(255), nullable=True)
+    subaccount_status = Column(String(50), nullable=True)  # None | 'active' | 'failed'
 
     # PayPal fields
     paypal_email = Column(String(255), nullable=True)

@@ -281,14 +281,27 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                             link="/dashboard/earnings"
                         )
 
-                # Calculate commission
+                # Calculate commission. already_settled reads back the
+                # subaccount id this SPECIFIC charge's checkout config was
+                # built with (echoed via Flutterwave's meta passthrough —
+                # see flutterwave_split.SPLIT_META_KEY) rather than
+                # re-checking "does a verified subaccount exist right now",
+                # which would be wrong if the referrer added one in the gap
+                # between checkout starting and this verification running —
+                # that later timing must not retroactively mark THIS charge
+                # (which was never split) as already paid.
                 from subscriptions.commission_service import CommissionService
+                from subscriptions.flutterwave_split import SPLIT_META_KEY
+
+                charge_meta = transaction_data.get("meta") or {}
+                already_settled = bool(charge_meta.get(SPLIT_META_KEY))
 
                 commission = CommissionService.calculate_commission(
                     subscription=new_subscription,
-                    db=db
+                    db=db,
+                    already_settled=already_settled,
                 )
-                
+
                 commission_info = None
                 if commission:
                     commission_info = {
@@ -297,7 +310,7 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                         "commission_status": commission.status,
                         "referrer_id": commission.user_id
                     }
-                    logger.info("[FLW verify] commission amount=%s referrer=%s", commission.amount, commission.user_id)
+                    logger.info("[FLW verify] commission amount=%s referrer=%s status=%s", commission.amount, commission.user_id, commission.status)
                 else:
                     logger.info("[FLW verify] no commission — user has no referrer")
                 
@@ -316,15 +329,30 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                     link="/dashboard/opportunity-alerts",
                 )
 
-                # Referrer builder-bonus notification (real-time)
-                if commission:
+                # Referrer builder-bonus notification (real-time).
+                # NOTE: calculate_commission() above already sends its own
+                # "Builder Bonus Earned!" notification internally, so this
+                # block was always a duplicate — and, using `commission`
+                # (the Commission ORM object) as a dict instead of
+                # `commission_info` (the dict actually built above), it
+                # raised TypeError on every referred user's payment,
+                # uncaught inside this try block. That's a severe pre-
+                # existing bug: it could roll back the whole transaction —
+                # including the subscription just verified — for anyone
+                # with a referrer, despite Flutterwave having already
+                # charged them. Fixed to use commission_info; left in place
+                # rather than removed since removing it isn't this
+                # session's task and commission_service's own notification
+                # doesn't currently reflect already_settled status changes
+                # made after it fires.
+                if commission_info:
                     NotificationService.create_notification(
                         db=db,
-                        user_id=commission["referrer_id"],
+                        user_id=commission_info["referrer_id"],
                         type="commission_earned",
                         title="🎉 Builder Bonus Earned!",
                         message=(
-                            f"You earned a builder bonus of {commission['commission_amount']:.2f} "
+                            f"You earned a builder bonus of {commission_info['commission_amount']:.2f} "
                             f"{currency} from a referral subscription."
                         ),
                         link="/dashboard/earnings",
@@ -574,6 +602,30 @@ async def flutterwave_payout_callback(
     except Exception as e:
         logger.error("[FLW webhook] error: %s", str(e), exc_info=True)
         return {"status": "error", "message": str(e)}
+
+
+@router.get("/flutterwave/split-info")
+async def get_flutterwave_split_info(
+    db: Annotated[Session, Depends(get_db)],
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Called by the frontend before building its Flutterwave checkout config
+    (see app/l/upgrade/checkoutForm.tsx). Returns the referrer's Flutterwave
+    subaccount id + split percentage to include in that config's
+    `subaccounts` field IF the current user was referred by someone with a
+    verified payout account — {"subaccount_id": null} otherwise, meaning
+    charge 100% to Lavoo as before (the referred user is never blocked on
+    this; only whether the payment splits is affected).
+    """
+    from subscriptions.commissions import extract_user_id
+    from subscriptions.flutterwave_split import get_split_config_for_referred_user
+
+    user_id = extract_user_id(current_user)
+    split_config = get_split_config_for_referred_user(user_id, db)
+    if not split_config:
+        return {"status": "success", "data": {"subaccount_id": None, "split_percentage": None}}
+    return {"status": "success", "data": split_config}
 
 
 @router.get("/flutterwave/config")
