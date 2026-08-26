@@ -761,7 +761,8 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
           the same tool.
 
         Flow:
-        1. Search for candidates per plan using ONLY that plan's steps (not user_query)
+        1. Search for candidates per STEP (not per plan, not user_query) and
+           merge each plan's per-step results into that plan's candidate pool
         2. Pool all unique candidates into a single deduplicated catalog
         3. One LLM call proposes up to 4 ranked candidates per step, each with
            the 5 criterion scores (0-100) the tool must earn for that step
@@ -848,35 +849,42 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
             # touching the shared user_query (which stays out of retrieval —
             # see _search_ai_tools docstring — to keep each plan's candidate
             # pool distinct).
-            action_description = f"{plan['title']}: {steps_text} {why_text}".strip()
-            candidates, cited = await asyncio.gather(
-                self._search_ai_tools(
+            #
+            # Search PER STEP, not once over the whole plan (raising the
+            # shared top_k 20->30->40 was the previous attempt at this — see
+            # git history — and still wasn't enough: a 9-prompt live test
+            # batch on 2026-08-26 still produced an automation stack on only
+            # 5). A step-level stack needs 2+ DIFFERENT tools to each clear
+            # task_relevance>=90 for the SAME step, but one embedding search
+            # over a multi-topic plan (e.g. email + forms + analytics) dilutes
+            # every step's candidates into a single shared pool, so a step's
+            # second genuinely-qualifying tool can get crowded out before the
+            # scoring gate ever sees it — a recall problem inherent to
+            # searching at the wrong granularity, not fixable by making the
+            # shared pool bigger. Searching each step's own text independently
+            # and merging by tool_name (keeping the higher similarity_score on
+            # a collision) gives every step a dedicated pool sized for ITS own
+            # topic instead of one diluted across the whole plan.
+            async def _search_step(step_text: str) -> list[dict]:
+                action_description = f"{plan['title']}: {step_text} {why_text}".strip()
+                return await self._search_ai_tools(
                     user_query=user_query,
                     action_description=action_description,
-                    # Wider than the old per-plan search (12, then 20) since
-                    # candidates now need to cover multiple distinct steps
-                    # within a plan, not just the plan as a whole. A
-                    # step-level automation stack needs 2+ DIFFERENT tools to
-                    # each independently clear task_relevance>=90 for the SAME
-                    # step — but retrieval here runs ONE embedding search
-                    # against the whole plan's combined text (action_description
-                    # above), not per-step, so a 4-5 step plan spanning several
-                    # distinct topics (e.g. email + forms + analytics) can
-                    # crowd out a step's second genuinely-qualifying tool from
-                    # even reaching the LLM's candidate pool, well before the
-                    # scoring gate ever gets a chance to evaluate it — a recall
-                    # problem, not a bar-strictness one, so the fix is more
-                    # candidates, not a lower bar (2026-08-14/15: bar stays
-                    # fixed at 90 by design — loosening it trades precision for
-                    # stack count instead of just recovering already-qualifying
-                    # tools that retrieval was dropping). Raised 20 -> 30, then
-                    # 30 -> 40 (2026-08-25: real test batch of 10 analyses
-                    # still produced a stack on only 3 — same recall problem,
-                    # same fix, larger pool).
-                    top_k=40,
-                ),
+                    top_k=20,
+                )
+
+            search_results, cited = await asyncio.gather(
+                asyncio.gather(*(_search_step(s) for s in what_to_do_list)) if what_to_do_list else asyncio.sleep(0, result=[]),
                 self._extract_mentioned_tools(what_to_do_list),
             )
+            merged_candidates: dict[str, dict] = {}
+            for step_results in search_results:
+                for t in step_results:
+                    name = t["tool_name"]
+                    existing = merged_candidates.get(name)
+                    if not existing or t.get("similarity_score", 0) > existing.get("similarity_score", 0):
+                        merged_candidates[name] = t
+            candidates = list(merged_candidates.values())
             # Deterministic backstop (see catalog_name_pattern above) — union
             # in any real catalog name that literally appears in this plan's
             # step text, regardless of what the LLM extraction call did.
@@ -1387,6 +1395,55 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
                         f"Assigned '{passing[0]['tool_name']}' → plan {plan_idx + 1} step {step_idx + 1} "
                         f"'{action_plans[plan_idx]['title'][:40]}'"
                     )
+
+        # Deterministic guarantee, run last: a tool literally named in a
+        # step's OWN text is always shown against that step, even if the LLM
+        # never proposed it as a scored candidate (the STEP-CITED OVERRIDE
+        # prompt instruction is advisory only — see _candidate_is_cited) or
+        # left what_it_helps blank for it (previously rejected outright at
+        # the is_stub check above). This is what makes "the engine should
+        # always recommend tools mentioned in the action plan steps, even
+        # when they're not in the database" true unconditionally rather than
+        # depending on LLM cooperation: the step's own text already grounds
+        # "why" the tool is there, so no LLM-authored explanation is needed.
+        # Only fills a step that's still empty after the LLM-driven pass
+        # above, and only with a name not already claimed elsewhere, so it
+        # never overrides or duplicates a real assignment.
+        cited_pool = [
+            (name, record) for name, record in all_tools.items()
+            if record.get("_step_cited") or record.get("_user_cited")
+        ]
+        if cited_pool:
+            for plan_idx in needy_indices:
+                what_to_do_list = action_plans[plan_idx].get("what_to_do", [])
+                step_count = len(what_to_do_list) if isinstance(what_to_do_list, list) else 0
+                for step_idx in range(step_count):
+                    if (
+                        action_plans[plan_idx]["step_tools"][step_idx]
+                        or action_plans[plan_idx]["step_stacks"][step_idx]
+                    ):
+                        continue
+                    step_text = what_to_do_list[step_idx]
+                    if not isinstance(step_text, str) or not step_text.strip():
+                        continue
+                    step_lower = step_text.lower()
+                    for name, record in cited_pool:
+                        name_lower = name.lower()
+                        if name_lower in assigned_tool_names_lower or name_lower not in step_lower:
+                            continue
+                        action_plans[plan_idx]["step_tools"][step_idx] = {
+                            "tool_name": name,
+                            "website": record.get("url") or record.get("website") or None,
+                            "what_it_helps": step_text.strip(),
+                            "scores": {},
+                        }
+                        assigned_tool_names_lower.add(name_lower)
+                        assigned_steps += 1
+                        logger.info(
+                            f"Force-assigned step-cited '{name}' → plan {plan_idx + 1} step {step_idx + 1} "
+                            f"(named directly in the step's own text, no LLM candidate required)"
+                        )
+                        break
 
         total_eligible_steps = sum(
             len(action_plans[i].get("what_to_do", []))
