@@ -604,49 +604,89 @@ def find_tool_by_name(name: str, db_session: Session) -> Optional[dict]:
     }
 
 
-def compile_catalog_name_pattern(catalog_names: list[str]) -> Optional["re.Pattern"]:
-    """Build one compiled regex matching any real catalog tool name as a
-    whole word/phrase, case-insensitively. Build ONCE per analysis (catalog
-    is ~1700 names — compiling per step or per plan would be wasteful) and
-    reuse across every plan via find_catalog_names_in_text below.
+def compile_catalog_name_pattern(
+    catalog_names: list[str],
+) -> Optional[tuple["re.Pattern", dict[str, str]]]:
+    """Build one compiled regex matching any real catalog tool name — or a
+    safe abbreviated alias of one — as a whole word/phrase, case-
+    insensitively. Build ONCE per analysis (catalog is ~1700 names —
+    compiling per step or per plan would be wasteful) and reuse across
+    every plan via find_catalog_names_in_text below.
 
-    Names are sorted longest-first so a more specific name wins over a
-    shorter one it contains (e.g. "Notion AI" matches before bare "Notion"
-    when both are present at the same text position) — alternation in `re`
+    Returns (pattern, alias_map): alias_map maps a matched alias's lowercase
+    text back to its real canonical catalog name (identity for a name
+    matched by its own full text) — find_catalog_names_in_text uses it to
+    translate a match before returning.
+
+    ~200 catalog names follow an "X AI" convention (e.g. "Airtable AI").
+    Step text routinely cites the bare product name ("Airtable") without
+    "AI" — a plain full-name regex never matches that, so a real, catalog-
+    grounded citation was silently lost unless the separate (and non-
+    deterministic) LLM extraction call happened to catch it. Adding the
+    de-suffixed base as an extra alternative closes that gap — but ONLY
+    when the base isn't ALSO its own distinct real catalog row (13 cases,
+    e.g. both "Notion" and "Notion AI" exist as separate real tools) —
+    aliasing "Notion" to "Notion AI" in that case would misattribute a
+    citation to the wrong one; the bare name already matches correctly via
+    its own real entry, so no alias is added for those.
+
+    Names/aliases are sorted longest-first so a more specific one wins over
+    a shorter one it contains (e.g. "Notion AI" matches before bare
+    "Notion" when both are real, present entries) — alternation in `re`
     takes the first alternative that matches, not the longest, so ordering
     is what makes this deterministic rather than order-of-insertion luck.
-    Names under 4 characters are dropped: a short catalog name (e.g. a
-    2-3 letter brand) risks matching generic words/substrings inside
-    unrelated step text, which is a worse failure mode than an occasional
-    miss on a very short name.
+    Names/aliases under 4 characters are dropped: a short one (e.g. a 2-3
+    letter brand) risks matching generic words/substrings inside unrelated
+    step text, which is a worse failure mode than an occasional miss.
     """
-    usable = sorted((n for n in catalog_names if n and len(n) >= 4), key=len, reverse=True)
-    if not usable:
+    names_lower = {n.lower() for n in catalog_names if n}
+    alias_map: dict[str, str] = {}
+    alternatives: list[str] = []
+    for n in catalog_names:
+        if not n or len(n) < 4:
+            continue
+        alternatives.append(n)
+        alias_map[n.lower()] = n
+        if n.endswith(" AI"):
+            base = n[:-3]
+            if len(base) >= 4 and base.lower() not in names_lower and base.lower() not in alias_map:
+                alternatives.append(base)
+                alias_map[base.lower()] = n
+
+    if not alternatives:
         return None
+    usable = sorted(alternatives, key=len, reverse=True)
     pattern = r'\b(' + '|'.join(re.escape(n) for n in usable) + r')\b'
-    return re.compile(pattern, re.IGNORECASE)
+    return re.compile(pattern, re.IGNORECASE), alias_map
 
 
-def find_catalog_names_in_text(text: str, compiled_pattern: Optional["re.Pattern"]) -> list[str]:
+def find_catalog_names_in_text(
+    text: str,
+    compiled: Optional[tuple["re.Pattern", dict[str, str]]],
+) -> list[str]:
     """Deterministic backstop for _extract_mentioned_tools (an LLM call that
     silently returns [] on any failure, with no retry): a plain regex scan
-    of `text` against every real catalog name via compiled_pattern (see
-    compile_catalog_name_pattern). This never depends on the LLM correctly
-    judging what counts as a "specific named product" — if a catalog tool's
-    exact name literally appears in the step text, it's flagged, full stop.
+    of `text` against every real catalog name (or safe alias — see
+    compile_catalog_name_pattern) via `compiled`. This never depends on the
+    LLM correctly judging what counts as a "specific named product" — if a
+    catalog tool's name or a safe alias of it literally appears in the step
+    text, it's flagged (translated to the real canonical name), full stop.
     Pure in-memory string matching, no DB access — safe to call from
     anywhere, including inside a concurrent asyncio.gather.
     """
-    if not text or compiled_pattern is None:
+    if not text or compiled is None:
         return []
+    pattern, alias_map = compiled
     seen_lower: set[str] = set()
     found: list[str] = []
-    for m in compiled_pattern.finditer(text):
-        matched = m.group(0)
-        key = matched.lower()
+    for m in pattern.finditer(text):
+        canonical = alias_map.get(m.group(0).lower())
+        if not canonical:
+            continue
+        key = canonical.lower()
         if key not in seen_lower:
             seen_lower.add(key)
-            found.append(matched)
+            found.append(canonical)
     return found
 
 
