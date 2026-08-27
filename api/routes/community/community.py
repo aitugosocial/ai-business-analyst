@@ -1412,9 +1412,12 @@ async def update_discussion(
     db.refresh(d)
     await delete_cached("community:discussions:*")
 
+    liked = {l.discussion_id for l in db.query(DiscussionLike).filter_by(user_id=current_user.id).all()} if current_user else set()
+    saved = {b.discussion_id for b in db.query(DiscussionBookmark).filter_by(user_id=current_user.id).all()} if current_user else set()
+
     return {
         "success": True,
-        "data": _discussion_dict(d, current_user_id=current_user.id)
+        "data": _discussion_dict(d, liked_ids=liked, saved_ids=saved, current_user=current_user)
     }
 
 
