@@ -1427,9 +1427,21 @@ step_index is 1-based, counting within THIS plan's own step list. Omit any step 
                     if not isinstance(step_text, str) or not step_text.strip():
                         continue
                     step_lower = step_text.lower()
+                    # Catches both a literal catalog name in the step text
+                    # and a safe alias of one (e.g. "Airtable" in the text
+                    # resolving to the catalog's "Airtable AI") via the same
+                    # matcher used to build the citation list in the first
+                    # place — a plain substring check alone would miss the
+                    # alias case, since the canonical name isn't the exact
+                    # text the step used.
+                    aliased_in_step = {
+                        n.lower() for n in find_catalog_names_in_text(step_text, catalog_name_pattern)
+                    }
                     for name, record in cited_pool:
                         name_lower = name.lower()
-                        if name_lower in assigned_tool_names_lower or name_lower not in step_lower:
+                        if name_lower in assigned_tool_names_lower:
+                            continue
+                        if name_lower not in step_lower and name_lower not in aliased_in_step:
                             continue
                         action_plans[plan_idx]["step_tools"][step_idx] = {
                             "tool_name": name,
