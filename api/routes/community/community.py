@@ -634,6 +634,15 @@ class CreateDiscussionRequest(BaseModel):
     poll_duration: Optional[str] = "none"  # "none" | "24h" | "3d" | "7d"
 
 
+class UpdateDiscussionRequest(BaseModel):
+    title: Optional[str] = None
+    content: Optional[str] = None
+    tags: Optional[List[str]] = None
+    type: Optional[str] = None
+    channel_id: Optional[int] = None
+    visibility: Optional[str] = None
+
+
 class VotePollRequest(BaseModel):
     option_index: int
 
@@ -1335,6 +1344,77 @@ async def get_public_discussion(
             **discussion_data,
             "replies_list": replies_data
         }
+    }
+
+
+@router.put("/discussions/{discussion_id}")
+async def update_discussion(
+    discussion_id: int,
+    body: UpdateDiscussionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # 1. Author / Admin Ownership check
+    if d.user_id != current_user.id and not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="You can only edit your own posts")
+    
+    # 2. Paid / Pro Account Requirement check
+    sub_status = getattr(current_user, 'subscription_status', '') or ''
+    is_subscribed = bool(sub_status.lower() in ("active", "trialing", "pro", "premium", "lifetime")) or bool(getattr(current_user, 'is_admin', False))
+    if not is_subscribed:
+        raise HTTPException(
+            status_code=403,
+            detail="Editing posts is exclusive to Lavoo Pro members. Please upgrade your account to edit discussions."
+        )
+
+    # 3. Content moderation check
+    if body.title and _contains_derogatory_content(body.title):
+        raise HTTPException(
+            status_code=422,
+            detail="Your post title contains language that isn't allowed in the Lavoo Build Room."
+        )
+    if body.content and _contains_derogatory_content(body.content):
+        raise HTTPException(
+            status_code=422,
+            detail="Your post content contains language that isn't allowed in the Lavoo Build Room."
+        )
+
+    # 4. Apply updates
+    if body.title is not None:
+        d.title = body.title.strip()
+    if body.content is not None:
+        d.content = body.content.strip()
+    if body.tags is not None:
+        d.tags = body.tags
+    if body.visibility in ("public", "tagged_only"):
+        d.visibility = body.visibility
+    if body.type is not None:
+        _all_valid_types = {'discussion', 'reflection'} | _TOPIC_SLUGS
+        raw_type = body.type.strip().lower()
+        if raw_type in _all_valid_types:
+            d.post_type = raw_type
+
+    if body.channel_id is not None and body.channel_id != d.channel_id:
+        new_ch = db.query(CommunityChannel).filter_by(id=body.channel_id).first()
+        if new_ch:
+            old_ch = db.query(CommunityChannel).filter_by(id=d.channel_id).first()
+            if old_ch and old_ch.post_count > 0:
+                old_ch.post_count -= 1
+            new_ch.post_count = (new_ch.post_count or 0) + 1
+            d.channel_id = new_ch.id
+
+    d.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(d)
+    await delete_cached("community:discussions:*")
+
+    return {
+        "success": True,
+        "data": _discussion_dict(d, current_user_id=current_user.id)
     }
 
 
