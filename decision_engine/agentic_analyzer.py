@@ -146,7 +146,10 @@ class AgenticAnalyzer:
             "in these action steps. Return a JSON array of strings. Return [] if none.\n\n"
             f"{steps_text}\n\n"
             "Rules: only named products (e.g. Zapier, HubSpot, Notion). "
-            "Exclude generic words like 'spreadsheet', 'email', 'CRM', 'software'.\n"
+            "Exclude generic words like 'spreadsheet', 'email', 'CRM', 'software'. "
+            "Also exclude column/field names from a data structure the step describes "
+            "creating (e.g. if a step says 'columns: Name, Email, Status', none of "
+            "Name/Email/Status are tools — they're header labels, not products).\n"
             "Output: JSON array only, no explanation."
         )
         try:
@@ -737,6 +740,23 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         "ease_of_implementation": 10,
         "cost_efficiency": 10,
     }
+
+    # Deterministic backstop for _extract_mentioned_tools misreading a
+    # spreadsheet/data-structure column list as a list of named tools (e.g.
+    # a step reading "columns: Name, Email, Status" got "Status" extracted
+    # as a cited tool name, which — not existing in the catalog — became a
+    # displayable ungrounded stub via the step-cited guarantee). The prompt
+    # itself was tightened to exclude this, but a single common-word label
+    # with no real catalog match is never a legitimate product citation
+    # regardless of what the LLM returns, so it's rejected outright here as
+    # a second, non-LLM-dependent layer.
+    _NON_TOOL_HEADER_WORDS = {
+        "name", "email", "phone", "date", "status", "type", "notes", "summary",
+        "amount", "price", "category", "description", "title", "address",
+        "owner", "priority", "score", "rating", "total", "tags", "id",
+        "reference", "location", "time", "comment", "action", "result",
+        "source", "country", "city", "state", "quantity", "value", "number",
+    }
     _STEP_TOOL_PASS_THRESHOLD = 4  # of 5 criteria must clear their bar
 
     async def _assign_tools_to_steps(
@@ -826,10 +846,13 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
         # shared across every plan. Resolved by exact DB lookup rather than
         # semantic search, since semantic search over an action description
         # can easily miss a specific named product.
-        user_cited_names = list(dict.fromkeys(
-            await self._extract_mentioned_tools([user_query])
-            + find_catalog_names_in_text(user_query, catalog_name_pattern)
-        ))
+        user_cited_names = [
+            n for n in dict.fromkeys(
+                await self._extract_mentioned_tools([user_query])
+                + find_catalog_names_in_text(user_query, catalog_name_pattern)
+            )
+            if n.lower() not in self._NON_TOOL_HEADER_WORDS
+        ]
 
         # Per-plan search + citation-extraction are independent of each other —
         # run them concurrently instead of one plan at a time, so the N
@@ -992,6 +1015,9 @@ OUTPUT FORMAT (JSON only, no markdown, no leading dashes in any text value):
             # from the DB — so the LLM can assign them back to this plan.
             for cited_name in cited:
                 cited_lower = cited_name.lower()
+                if cited_lower in self._NON_TOOL_HEADER_WORDS:
+                    logger.info(f"Dropped '{cited_name}' as a citation — looks like a data-field/column header, not a tool")
+                    continue
                 existing_key = next((k for k in all_tools if k.lower() == cited_lower), None)
                 if existing_key:
                     # Already present via semantic search — still flag it as
