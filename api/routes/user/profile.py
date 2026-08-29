@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional, List
 import base64
+import re
 
 from api.routes.auth.login import get_current_user
 from api.utils.sub_utils import sync_user_subscription

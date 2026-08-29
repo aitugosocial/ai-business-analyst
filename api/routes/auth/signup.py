@@ -160,20 +160,21 @@ def signup(
         logger.info(f"[SIGNUP] Processing referral for referrer ID: {referrer.id}")
         referrer.referral_count = (referrer.referral_count or 0) + 1
 
-        # Award 10 chops to the referred user for signing up via referral link
-        new_user.total_chops = (new_user.total_chops or 0) + 10
-        logger.info(f"[SIGNUP] Awarded 10 chops to referred user {new_user.email}")
+        # Award 50 chops to the referred user for signing up via referral link
+        new_user.total_chops = (new_user.total_chops or 0) + 50
+        logger.info(f"[SIGNUP] Awarded 50 chops to referred user {new_user.email}")
 
-        # Award 10 chops to the referrer for a successful signup using their code
-        referrer.total_chops = (referrer.total_chops or 0) + 10
-        referrer.referral_chops = (referrer.referral_chops or 0) + 10
-        logger.info(f"[SIGNUP] Awarded 10 chops to referrer {referrer.email}")
+        # Award 50 chops to the referrer for a successful signup using their code
+        referrer.total_chops = (referrer.total_chops or 0) + 50
+        referrer.referral_chops = (referrer.referral_chops or 0) + 50
+        logger.info(f"[SIGNUP] Awarded 50 chops to referrer {referrer.email}")
 
-        # Create referral record (chops_awarded tracks referrer's reward, set on subscription)
+        # Create referral record (chops_awarded tracks referrer's reward, added
+        # to again on subscription — see flutterwave.py's +20 conversion bonus)
         referral = Referral(
             referrer_id=referrer.id,
             referred_user_id=new_user.id,
-            chops_awarded=10,
+            chops_awarded=50,
             created_at=datetime.now(timezone.utc)
         )
         db.add(referral)
@@ -184,7 +185,7 @@ def signup(
             user_id=new_user.id,
             type=NotificationType.REFERRAL_REGISTERED.value,
             title="Welcome Bonus!",
-            message="You received 10 chops for joining via a referral link.",
+            message="You received 50 chops for joining via a referral link.",
             link="/dashboard/earnings"
         )
 
@@ -193,8 +194,8 @@ def signup(
             db=db,
             user_id=referrer.id,
             type=NotificationType.REFERRAL_REGISTERED.value,
-            title="New Referral! +10 Chops",
-            message=f"{new_user.name} signed up using your referral link. You earned 10 chops!",
+            title="New Referral! +50 Chops",
+            message=f"{new_user.name} signed up using your referral link. You earned 50 chops!",
             link="/dashboard/referrals"
         )
 
