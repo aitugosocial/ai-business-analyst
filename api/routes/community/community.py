@@ -213,9 +213,23 @@ async def cron_process_pending_voo_replies(db: Session):
                 DiscussionReply.user_id != voo_user.id
             ).order_by(DiscussionReply.created_at.asc()).all()
 
-            # Author name/tag
+            # Author lookup and Pro / Paid Account verification
             author_user = db.query(User).filter_by(id=d.user_id).first()
-            author_handle = f"@{author_user.username}" if author_user and author_user.username else (f"@{author_user.name}" if author_user and author_user.name else "there")
+            if not author_user:
+                d.voo_status = "skipped"
+                db.commit()
+                continue
+
+            author_sub = (getattr(author_user, 'subscription_status', '') or '').strip().lower()
+            author_is_paid = bool(author_sub in ("active", "trialing", "pro", "premium", "lifetime")) or bool(getattr(author_user, 'is_admin', False))
+            if not author_is_paid:
+                d.voo_status = "skipped"
+                d.voo_scheduled_for = None
+                db.commit()
+                logger.info(f"[voo-bot] Skipping Voo answer for discussion {d.id}: author {author_user.id} is a beta/free account.")
+                continue
+
+            author_handle = f"@{author_user.username}" if author_user.username else (f"@{author_user.name}" if author_user.name else "there")
 
             # Collect contributor usernames and response snippets
             contributors = []
@@ -1213,11 +1227,15 @@ async def create_discussion(
                 "expires_at": expires_at_iso
             }
 
-    # Detect if post is an inquiry / question and schedule Voo initial answer in 10 minutes
+    # Detect if post is an inquiry / question and schedule Voo initial answer in 10 minutes (paid accounts only)
     is_question = _is_question_discussion(post_type=post_type, title=body.title, content=body.content)
+    sub_status = (getattr(current_user, 'subscription_status', '') or '').strip().lower()
+    is_paid_user = bool(sub_status in ("active", "trialing", "pro", "premium", "lifetime")) or bool(getattr(current_user, 'is_admin', False))
+    should_schedule_voo = is_question and is_paid_user
+
     interval_minutes = int(os.getenv("VOO_BOT_INTERVAL_MINUTES", "10"))
-    voo_init_status = "scheduled" if is_question else "untracked"
-    voo_init_scheduled_for = (datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)) if is_question else None
+    voo_init_status = "scheduled" if should_schedule_voo else "untracked"
+    voo_init_scheduled_for = (datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)) if should_schedule_voo else None
 
     d = CommunityDiscussion(
         channel_id=body.channel_id, user_id=current_user.id,
@@ -1659,7 +1677,11 @@ async def reply_to_discussion(
     d.reply_count = (d.reply_count or 0) + 1
     current_user.total_chops = (current_user.total_chops or 0) + 5
 
-    # Trigger Voo bot 10-minute follow-up timer for questions
+    # Trigger Voo bot 10-minute answer timer for questions (paid author accounts only)
+    author_user = db.query(User).filter_by(id=d.user_id).first() if d.user_id else None
+    author_sub = (getattr(author_user, 'subscription_status', '') or '').strip().lower() if author_user else ''
+    author_is_paid = bool(author_sub in ("active", "trialing", "pro", "premium", "lifetime")) or bool(getattr(author_user, 'is_admin', False) if author_user else False)
+
     is_pending_question = getattr(d, "voo_status", "untracked") == "pending_replies"
     is_untracked_question = (
         getattr(d, "voo_status", "untracked") == "untracked"
@@ -1667,6 +1689,7 @@ async def reply_to_discussion(
     )
     if (
         (is_pending_question or is_untracked_question)
+        and author_is_paid
         and current_user.id != d.user_id
         and not getattr(current_user, "is_bot", False)
         and not getattr(d, "is_resolved", False)
@@ -1675,7 +1698,7 @@ async def reply_to_discussion(
         interval_minutes = int(os.getenv("VOO_BOT_INTERVAL_MINUTES", "10"))
         d.voo_status = "scheduled"
         d.voo_scheduled_for = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
-        logger.info(f"[voo-bot] Scheduled Voo follow-up for discussion {discussion_id} in {interval_minutes}m (at {d.voo_scheduled_for})")
+        logger.info(f"[voo-bot] Scheduled Voo answer for discussion {discussion_id} in {interval_minutes}m (at {d.voo_scheduled_for})")
 
     db.commit()
     db.refresh(reply)
@@ -2355,7 +2378,9 @@ async def get_user_profile(
         "metrics": {
             "is_hidden": hide_metrics,
             "decision_score": 88 if not hide_metrics else None,
+            "contribution_count": build_room_contributions if not hide_metrics else None,
             "contribution_chops": user.total_chops or 0 if not hide_metrics else None,
+            "chops_earned": user.total_chops or 0 if not hide_metrics else None,
             "day_streak": user.login_streak or 0 if not hide_metrics else None,
             "pots_earned": pots_earned if not hide_metrics else None,
         },

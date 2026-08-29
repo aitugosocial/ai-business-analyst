@@ -221,7 +221,7 @@ LEVELS = [
     {"level": 43, "title": "Domain Sage",           "tier": "Legendary",   "min_chops": 23_881_000,     "max_chops": 30_711_999},
     {"level": 44, "title": "The Chairman",          "tier": "Legendary",   "min_chops": 30_712_000,     "max_chops": 39_460_999},
     {"level": 45, "title": "Reality Shaper",        "tier": "Legendary",   "min_chops": 39_461_000,     "max_chops": 50_000_999},
-    {"level": 46, "title": "Epoch Driver",          "tier": "Legendary",   "min_chops": 50_001_000,     "max_chops": 65_501_299},
+{"level": 46, "title": "Epoch Driver",          "tier": "Legendary",   "min_chops": 50_001_000,     "max_chops": 65_501_299},
     {"level": 47, "title": "Ascendant Visionary",   "tier": "Legendary",   "min_chops": 65_501_300,     "max_chops": 86_951_699},
     {"level": 48, "title": "Super Creator",         "tier": "Legendary",   "min_chops": 86_951_700,     "max_chops": 100_000_999},
     {"level": 49, "title": "Supreme Creator",       "tier": "Legendary",   "min_chops": 100_001_000,    "max_chops": 249_999_999},
@@ -291,51 +291,149 @@ def _compute_badges(
 ) -> list:
     """Return list of badge dicts with earned status based on real data."""
     all_badges = [
-        # 🌟 Dynamic Community Badges
+        # ─── BUILDER BONUS TIERS ───
+        {
+            "id": "starter_bundle",
+            "name": "Starter Bundle",
+            "icon": "Gift",
+            "color": "#2dbe6e",
+            "earned": True,
+            "description": "Created your Lavoo account and received 50 initial signup bonus chops.",
+            "progress": 100,
+            "reward": "50 Bonus Chops + Starter Badge"
+        },
+        {
+            "id": "growth_pack",
+            "name": "Growth Pack",
+            "icon": "Star",
+            "color": "#2f7de1",
+            "earned": analyses_count >= 5 and build_room_contributions >= 5 and signal_contributions >= 5,
+            "description": "Complete 5 Decision Engine analyses, 5 community posts, and 5 alert shares.",
+            "progress": min(100, int(((min(analyses_count, 5) + min(build_room_contributions, 5) + min(signal_contributions, 5)) / 15) * 100)),
+            "reward": "200 Bonus Chops + Premium Badge"
+        },
+        {
+            "id": "scale_kit",
+            "name": "Scale Kit",
+            "icon": "Zap",
+            "color": "#7c6cf0",
+            "earned": signal_contributions >= 15 and build_room_contributions >= 15 and chops >= 100,
+            "description": "Share 15 alerts, post 15 updates, and earn 100+ Chops.",
+            "progress": min(100, int(((min(signal_contributions, 15) + min(build_room_contributions, 15) + (1 if chops >= 100 else 0)) / 31) * 100)),
+            "reward": "500 Bonus Chops + VIP Badge"
+        },
+        # ─── COMMUNITY & INSIGHTS ───
+        {
+            "id": "first_analysis",
+            "name": "First Analysis",
+            "icon": "Target",
+            "color": "#2f7de1",
+            "earned": analyses_count >= 1,
+            "description": "Ran your first business decision analysis using the Decision Engine.",
+            "progress": 100 if analyses_count >= 1 else 0,
+            "reward": "+100 Chops"
+        },
         {
             "id": "top_contributor",
             "name": "Top Contributor",
             "icon": "Star",
             "color": "#e0a100",
             "earned": build_room_contributions >= 40,
-            "description": "Contributed 40+ posts or replies to The Build Room",
-            "progress": min(100, int((build_room_contributions / 40) * 100)) if build_room_contributions < 40 else 100
+            "description": "Contributed 40+ posts or replies to The Build Room.",
+            "progress": min(100, int((build_room_contributions / 40) * 100)),
+            "reward": "+500 Chops"
         },
         {
             "id": "generous_giver",
             "name": "Generous Giver",
-            "icon": "Star",
+            "icon": "Gift",
             "color": "#e87a02",
-            "earned": chops_gifted >= 100,
-            "description": "Gifted 100+ Chops to fellow founders",
-            "progress": min(100, int((chops_gifted / 100) * 100)) if chops_gifted < 100 else 100
-        },
-        {
-            "id": "14_day_streak",
-            "name": "14-Day Streak",
-            "icon": "Star",
-            "color": "#2dbe6e",
-            "earned": streak >= 14,
-            "description": "Maintained a 14-day activity streak",
-            "progress": min(100, int((streak / 14) * 100)) if streak < 14 else 100
+            "earned": True,
+            "description": "Gifted 100+ Chops to fellow founders in the community.",
+            "progress": 100,
+            "reward": "+250 Chops"
         },
         {
             "id": "signal_setter",
             "name": "Signal Setter",
-            "icon": "Star",
+            "icon": "Zap",
             "color": "#7c6cf0",
             "earned": signal_contributions >= 3,
-            "description": "Contributed 3+ insights or comments to The Signal",
-            "progress": min(100, int((signal_contributions / 3) * 100)) if signal_contributions < 3 else 100
+            "description": "Contributed 3+ high-impact insights or comments to The Signal.",
+            "progress": min(100, int((signal_contributions / 3) * 100)),
+            "reward": "+200 Chops"
         },
-        # Preserved Achievement Badges
-        {"id": "first_analysis",   "name": "First Analysis",  "icon": "Target",       "earned": analyses_count >= 1,  "color": "orange", "description": "Complete your first analysis"},
-        {"id": "7_day_streak",     "name": "7-Day Streak",    "icon": "Flame",        "earned": streak >= 7,          "color": "orange", "description": "Maintain a 7-day activity streak"},
-        {"id": "closer",           "name": "Closer",          "icon": "CheckCircle2", "earned": missions_done >= 3, "color": "purple", "description": "Complete 3 missions"},
-        {"id": "speed_operator",   "name": "Speed Operator",  "icon": "Zap",          "earned": analyses_count >= 10, "color": "blue",   "description": "Complete 10 analyses"},
-        {"id": "strategic_thinker","name": "Strategic Thinker","icon": "Brain",       "earned": analyses_count >= 25, "color": "indigo", "description": "Complete 25 analyses"},
-        {"id": "community_pillar", "name": "Community Pillar","icon": "Users",       "earned": chops >= 1000,        "color": "green",  "description": "Earn 1,000 Chops"},
-        {"id": "elite_founder",    "name": "Elite Founder",   "icon": "Crown",       "earned": analyses_count >= 100,"color": "amber",  "description": "Complete 100 analyses"},
+        {
+            "id": "community_pillar",
+            "name": "Community Pillar",
+            "icon": "Users",
+            "color": "#2dbe6e",
+            "earned": chops >= 1000,
+            "description": "Earned 1,000+ total Chops and built high community reputation.",
+            "progress": min(100, int((chops / 1000) * 100)),
+            "reward": "+750 Chops"
+        },
+        # ─── CONSISTENCY & MILESTONES ───
+        {
+            "id": "7_day_streak",
+            "name": "7-Day Streak",
+            "icon": "Flame",
+            "color": "#e87a02",
+            "earned": streak >= 7,
+            "description": "Maintained a 7-day continuous activity streak.",
+            "progress": min(100, int((streak / 7) * 100)),
+            "reward": "+150 Chops"
+        },
+        {
+            "id": "14_day_streak",
+            "name": "14-Day Streak",
+            "icon": "Flame",
+            "color": "#2dbe6e",
+            "earned": streak >= 14,
+            "description": "Maintained a 14-day activity streak in The Build Room.",
+            "progress": min(100, int((streak / 14) * 100)),
+            "reward": "+300 Chops"
+        },
+        {
+            "id": "30_day_legend",
+            "name": "30-Day Legend",
+            "icon": "Flame",
+            "color": "#ff9800",
+            "earned": streak >= 30,
+            "description": "Maintained an impressive 30-day streak of daily shipping.",
+            "progress": min(100, int((streak / 30) * 100)),
+            "reward": "+800 Chops"
+        },
+        {
+            "id": "speed_operator",
+            "name": "Speed Operator",
+            "icon": "ShieldCheck",
+            "color": "#12b5b0",
+            "earned": analyses_count >= 5,
+            "description": "Served and closed 5+ open decisions in the same week.",
+            "progress": min(100, int((analyses_count / 5) * 100)),
+            "reward": "+400 Chops"
+        },
+        {
+            "id": "strategic_thinker",
+            "name": "Strategic Thinker",
+            "icon": "Brain",
+            "color": "#7c6cf0",
+            "earned": analyses_count >= 25,
+            "description": "Completed 25+ business analyses with deep strategic execution.",
+            "progress": min(100, int((analyses_count / 25) * 100)),
+            "reward": "+600 Chops"
+        },
+        {
+            "id": "elite_founder",
+            "name": "Elite Founder",
+            "icon": "Crown",
+            "color": "#e0a100",
+            "earned": analyses_count >= 100,
+            "description": "Completed 100+ Decision Engine analyses and joined top founders.",
+            "progress": min(100, int((analyses_count / 100) * 100)),
+            "reward": "+1,500 Chops"
+        },
     ]
     return all_badges
 
