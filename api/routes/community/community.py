@@ -105,17 +105,20 @@ def _is_question_discussion(post_type: str = "", title: str = "", content: str =
     return False
 
 
-def _generate_voo_checkin_message(author_handle: str, question_title: str, question_content: str, contributors: List[str], replies_text: str) -> str:
+def _generate_voo_answer_message(author_handle: str, question_title: str, question_content: str, contributors: List[str], replies_text: str) -> str:
     """
-    Generates a high-quality, friendly check-in response from Voo using xAI Grok (or OpenAI client).
+    Generates an intelligent, high-value, and direct perspective answer from Voo using xAI Grok (or OpenAI client).
     """
     api_key = os.getenv("XAI_API_KEY")
-    contributors_str = ", ".join(contributors[:3]) if contributors else "the community"
+    contributors_str = ", ".join(contributors[:3]) if contributors else ""
     
     fallback_message = (
-        f"Hey {author_handle}! 👋\n\n"
-        f"It's been a little while since you posted your question about **{question_title}**, and {contributors_str} shared some helpful thoughts!\n\n"
-        f"Did the responses so far give you clarity, or are you still working through this? If you've found your answer, feel free to mark this discussion as resolved, or turn this into a Decision Engine mission to execute the steps."
+        f"Hi {author_handle}! 👋\n\n"
+        f"Here is a key perspective on your question **{question_title}**:\n\n"
+        f"1. **Clarify the Core Objective**: Focus on the specific outcome or metric you want to improve before committing heavy resources.\n"
+        f"2. **Validate with Low-Risk Tests**: Run small-scale experiments to gather fast customer feedback and reduce execution risk.\n"
+        f"3. **Prioritize Velocity and Simplicity**: Choose the simplest path that unlocks immediate traction for your business.\n\n"
+        f"Hope this perspective helps! You can mark this question as resolved or convert these steps into a Decision Engine mission to execute."
     )
 
     if not api_key:
@@ -129,28 +132,37 @@ def _generate_voo_checkin_message(author_handle: str, question_title: str, quest
             timeout=30.0,
             max_retries=2,
         )
+        
+        community_context = (
+            f"\n\nCommunity members ({contributors_str}) also shared these points:\n{replies_text}"
+            if contributors_str and replies_text else ""
+        )
+
         prompt = (
-            f"You are Voo, the friendly and hyper-intelligent AI community assistant in the Lavoo Build Room for business owners.\n\n"
-            f"The author ({author_handle}) asked this question:\n"
+            f"You are Voo, the intelligent, strategic, and hyper-practical AI advisor for business owners and solo founders in the Lavoo Build Room.\n\n"
+            f"The founder ({author_handle}) posted this question:\n"
             f"Title: {question_title}\n"
-            f"Question details: {question_content}\n\n"
-            f"Community contributors ({contributors_str}) shared these responses:\n{replies_text}\n\n"
-            f"Write a warm, natural, and concise 2-3 paragraph follow-up comment directly to {author_handle}:\n"
-            f"1. Greet {author_handle} warmly and mention that {contributors_str} shared valuable insights on their question.\n"
-            f"2. In 1 concise sentence, summarize the core direction or solutions the community suggested.\n"
-            f"3. Ask {author_handle} if the responses so far were helpful or if they need further breakdown.\n"
-            f"4. Remind them they can mark the discussion as resolved or convert the advice into a Decision Engine mission.\n"
-            f"Keep the tone encouraging, crisp, and professional. Do NOT use markdown code fences."
+            f"Question details: {question_content}{community_context}\n\n"
+            f"Provide your own high-impact, direct, and actionable answer to solve {author_handle}'s question:\n"
+            f"1. Start with a friendly greeting directly tagging {author_handle} (e.g. 'Hi {author_handle},' or 'Hey {author_handle}! 👋').\n"
+            f"2. Directly answer their question with clear, actionable insights, strategy, or frameworks tailored for a founder/business builder.\n"
+            f"3. Give 2-3 structured, high-leverage recommendations or key decision principles that provide immediate clarity.\n"
+            f"4. If community members ({contributors_str}) shared insights, naturally synthesize or reference them alongside your own perspective.\n"
+            f"5. End with an encouraging closing note and remind them they can mark the question as resolved or turn these recommendations into a Decision Engine mission.\n"
+            f"Keep the tone encouraging, crisp, professional, and practical (2-4 paragraphs). Do NOT wrap your answer in markdown code fences."
         )
 
         completion = client.chat.completions.create(
             model="grok-4-1-fast-reasoning",
             messages=[
-                {"role": "system", "content": "You are Voo, the intelligent AI community companion for the Lavoo Build Room. Keep replies warm, concise, and helpful."},
+                {
+                    "role": "system", 
+                    "content": "You are Voo, the intelligent and practical AI advisor in the Lavoo Build Room. Deliver direct, high-value, structured answers to founder questions."
+                },
                 {"role": "user", "content": prompt}
             ],
             temperature=0.4,
-            max_tokens=350,
+            max_tokens=450,
         )
 
         if completion and completion.choices:
@@ -166,7 +178,7 @@ def _generate_voo_checkin_message(author_handle: str, question_title: str, quest
 async def cron_process_pending_voo_replies(db: Session):
     """
     Checks for discussions where voo_status == 'scheduled' AND voo_scheduled_for <= now.
-    Generates intelligent follow-up using xAI Grok and posts as Voo.
+    Generates intelligent perspective answer from Voo using xAI Grok and posts as Voo.
     """
     now = datetime.now(timezone.utc)
     eligible = db.query(CommunityDiscussion).filter(
@@ -178,7 +190,7 @@ async def cron_process_pending_voo_replies(db: Session):
     if not eligible:
         return
 
-    logger.info(f"[voo-bot] Found {len(eligible)} discussions eligible for Voo check-in")
+    logger.info(f"[voo-bot] Found {len(eligible)} discussions eligible for Voo answer")
     voo_user = ensure_voo_bot_user(db)
 
     for d in eligible:
@@ -195,22 +207,29 @@ async def cron_process_pending_voo_replies(db: Session):
                 db.commit()
                 continue
 
-            # Fetch all non-bot replies
+            # Fetch any non-bot replies if existing
             replies = db.query(DiscussionReply).filter(
                 DiscussionReply.discussion_id == d.id,
                 DiscussionReply.user_id != voo_user.id
             ).order_by(DiscussionReply.created_at.asc()).all()
 
-            if not replies:
-                # If all replies were deleted, revert back to pending_replies
-                d.voo_status = "pending_replies"
-                d.voo_scheduled_for = None
+            # Author lookup and Pro / Paid Account verification
+            author_user = db.query(User).filter_by(id=d.user_id).first()
+            if not author_user:
+                d.voo_status = "skipped"
                 db.commit()
                 continue
 
-            # Author name/tag
-            author_user = db.query(User).filter_by(id=d.user_id).first()
-            author_handle = f"@{author_user.username}" if author_user and author_user.username else (f"@{author_user.name}" if author_user and author_user.name else "there")
+            author_sub = (getattr(author_user, 'subscription_status', '') or '').strip().lower()
+            author_is_paid = bool(author_sub in ("active", "trialing", "pro", "premium", "lifetime")) or bool(getattr(author_user, 'is_admin', False))
+            if not author_is_paid:
+                d.voo_status = "skipped"
+                d.voo_scheduled_for = None
+                db.commit()
+                logger.info(f"[voo-bot] Skipping Voo answer for discussion {d.id}: author {author_user.id} is a beta/free account.")
+                continue
+
+            author_handle = f"@{author_user.username}" if author_user.username else (f"@{author_user.name}" if author_user.name else "there")
 
             # Collect contributor usernames and response snippets
             contributors = []
@@ -222,8 +241,8 @@ async def cron_process_pending_voo_replies(db: Session):
                     contributors.append(u_name)
                 reply_summaries.append(f"{u_name}: {r.content[:200]}")
 
-            # Generate synthesis via Grok
-            synthesis = _generate_voo_checkin_message(
+            # Generate perspective answer via Grok
+            synthesis = _generate_voo_answer_message(
                 author_handle=author_handle,
                 question_title=d.title,
                 question_content=d.content,
@@ -254,8 +273,8 @@ async def cron_process_pending_voo_replies(db: Session):
                     notif = UserNotification(
                         user_id=d.user_id,
                         type="voo_checkin",
-                        title="🤖 Voo checked in on your question",
-                        message=f"Voo reviewed community responses to '{d.title[:50]}'. Were they helpful?",
+                        title="🤖 Voo answered your question",
+                        message=f"Voo shared an answer to your question: '{d.title[:50]}'",
                         link=f"/dashboard/community?discussionId={d.id}",
                         is_read=False
                     )
@@ -265,7 +284,7 @@ async def cron_process_pending_voo_replies(db: Session):
                     logger.warning(f"[voo-bot] Notification creation failed: {ne}")
 
             await delete_cached("community:discussions:*")
-            logger.info(f"[voo-bot] Successfully posted Voo check-in on discussion {d.id}")
+            logger.info(f"[voo-bot] Successfully posted Voo answer on discussion {d.id}")
 
         except Exception as e:
             logger.error(f"[voo-bot] Failed processing discussion {d.id}: {e}", exc_info=True)
@@ -632,6 +651,15 @@ class CreateDiscussionRequest(BaseModel):
     visibility: Optional[str] = "public"  # "public" | "tagged_only"
     poll_options: Optional[List[str]] = None
     poll_duration: Optional[str] = "none"  # "none" | "24h" | "3d" | "7d"
+
+
+class UpdateDiscussionRequest(BaseModel):
+    title: Optional[str] = None
+    content: Optional[str] = None
+    tags: Optional[List[str]] = None
+    type: Optional[str] = None
+    channel_id: Optional[int] = None
+    visibility: Optional[str] = None
 
 
 class VotePollRequest(BaseModel):
@@ -1199,9 +1227,15 @@ async def create_discussion(
                 "expires_at": expires_at_iso
             }
 
-    # Detect if post is an inquiry / question
+    # Detect if post is an inquiry / question and schedule Voo initial answer in 10 minutes (paid accounts only)
     is_question = _is_question_discussion(post_type=post_type, title=body.title, content=body.content)
-    voo_init_status = "pending_replies" if is_question else "untracked"
+    sub_status = (getattr(current_user, 'subscription_status', '') or '').strip().lower()
+    is_paid_user = bool(sub_status in ("active", "trialing", "pro", "premium", "lifetime")) or bool(getattr(current_user, 'is_admin', False))
+    should_schedule_voo = is_question and is_paid_user
+
+    interval_minutes = int(os.getenv("VOO_BOT_INTERVAL_MINUTES", "10"))
+    voo_init_status = "scheduled" if should_schedule_voo else "untracked"
+    voo_init_scheduled_for = (datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)) if should_schedule_voo else None
 
     d = CommunityDiscussion(
         channel_id=body.channel_id, user_id=current_user.id,
@@ -1209,7 +1243,8 @@ async def create_discussion(
         tags=body.tags or [], post_type=post_type,
         tagged_user_ids=tagged_ids, visibility=visibility_val,
         poll_data=poll_payload,
-        voo_status=voo_init_status
+        voo_status=voo_init_status,
+        voo_scheduled_for=voo_init_scheduled_for
     )
     db.add(d)
     ch.post_count = (ch.post_count or 0) + 1
@@ -1335,6 +1370,80 @@ async def get_public_discussion(
             **discussion_data,
             "replies_list": replies_data
         }
+    }
+
+
+@router.put("/discussions/{discussion_id}")
+async def update_discussion(
+    discussion_id: int,
+    body: UpdateDiscussionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # 1. Author / Admin Ownership check
+    if d.user_id != current_user.id and not getattr(current_user, 'is_admin', False):
+        raise HTTPException(status_code=403, detail="You can only edit your own posts")
+    
+    # 2. Paid / Pro Account Requirement check
+    sub_status = getattr(current_user, 'subscription_status', '') or ''
+    is_subscribed = bool(sub_status.lower() in ("active", "trialing", "pro", "premium", "lifetime")) or bool(getattr(current_user, 'is_admin', False))
+    if not is_subscribed:
+        raise HTTPException(
+            status_code=403,
+            detail="Editing posts is exclusive to Lavoo Pro members. Please upgrade your account to edit discussions."
+        )
+
+    # 3. Content moderation check
+    if body.title and _contains_derogatory_content(body.title):
+        raise HTTPException(
+            status_code=422,
+            detail="Your post title contains language that isn't allowed in the Lavoo Build Room."
+        )
+    if body.content and _contains_derogatory_content(body.content):
+        raise HTTPException(
+            status_code=422,
+            detail="Your post content contains language that isn't allowed in the Lavoo Build Room."
+        )
+
+    # 4. Apply updates
+    if body.title is not None:
+        d.title = body.title.strip()
+    if body.content is not None:
+        d.content = body.content.strip()
+    if body.tags is not None:
+        d.tags = body.tags
+    if body.visibility in ("public", "tagged_only"):
+        d.visibility = body.visibility
+    if body.type is not None:
+        _all_valid_types = {'discussion', 'reflection'} | _TOPIC_SLUGS
+        raw_type = body.type.strip().lower()
+        if raw_type in _all_valid_types:
+            d.post_type = raw_type
+
+    if body.channel_id is not None and body.channel_id != d.channel_id:
+        new_ch = db.query(CommunityChannel).filter_by(id=body.channel_id).first()
+        if new_ch:
+            old_ch = db.query(CommunityChannel).filter_by(id=d.channel_id).first()
+            if old_ch and old_ch.post_count > 0:
+                old_ch.post_count -= 1
+            new_ch.post_count = (new_ch.post_count or 0) + 1
+            d.channel_id = new_ch.id
+
+    d.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(d)
+    await delete_cached("community:discussions:*")
+
+    liked = {l.discussion_id for l in db.query(DiscussionLike).filter_by(user_id=current_user.id).all()} if current_user else set()
+    saved = {b.discussion_id for b in db.query(DiscussionBookmark).filter_by(user_id=current_user.id).all()} if current_user else set()
+
+    return {
+        "success": True,
+        "data": _discussion_dict(d, liked_ids=liked, saved_ids=saved, current_user=current_user)
     }
 
 
@@ -1568,7 +1677,11 @@ async def reply_to_discussion(
     d.reply_count = (d.reply_count or 0) + 1
     current_user.total_chops = (current_user.total_chops or 0) + 5
 
-    # Trigger Voo bot 10-minute follow-up timer for questions
+    # Trigger Voo bot 10-minute answer timer for questions (paid author accounts only)
+    author_user = db.query(User).filter_by(id=d.user_id).first() if d.user_id else None
+    author_sub = (getattr(author_user, 'subscription_status', '') or '').strip().lower() if author_user else ''
+    author_is_paid = bool(author_sub in ("active", "trialing", "pro", "premium", "lifetime")) or bool(getattr(author_user, 'is_admin', False) if author_user else False)
+
     is_pending_question = getattr(d, "voo_status", "untracked") == "pending_replies"
     is_untracked_question = (
         getattr(d, "voo_status", "untracked") == "untracked"
@@ -1576,6 +1689,7 @@ async def reply_to_discussion(
     )
     if (
         (is_pending_question or is_untracked_question)
+        and author_is_paid
         and current_user.id != d.user_id
         and not getattr(current_user, "is_bot", False)
         and not getattr(d, "is_resolved", False)
@@ -1584,7 +1698,7 @@ async def reply_to_discussion(
         interval_minutes = int(os.getenv("VOO_BOT_INTERVAL_MINUTES", "10"))
         d.voo_status = "scheduled"
         d.voo_scheduled_for = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
-        logger.info(f"[voo-bot] Scheduled Voo follow-up for discussion {discussion_id} in {interval_minutes}m (at {d.voo_scheduled_for})")
+        logger.info(f"[voo-bot] Scheduled Voo answer for discussion {discussion_id} in {interval_minutes}m (at {d.voo_scheduled_for})")
 
     db.commit()
     db.refresh(reply)
@@ -2045,13 +2159,19 @@ async def get_leaderboard(
     current_user: Optional[User] = Depends(get_current_user_optional),
     db: Session = Depends(get_db)
 ):
-    top_users = db.query(User).filter(User.is_active == True)\
-        .order_by(User.total_chops.desc(), User.created_at.asc()).limit(limit).all()
+    top_users = db.query(User).filter(
+        User.is_active == True,
+        (User.is_bot == False) | (User.is_bot.is_(None)),
+        func.lower(User.username) != "voo",
+        func.lower(User.name) != "voo",
+        User.email != "voo@lavoo.io"
+    ).order_by(User.total_chops.desc(), User.created_at.asc()).limit(limit).all()
 
     return {"success": True, "data": [{
         "rank": idx + 1,
         "user_id": u.id,
         "name": u.name,
+        "username": u.username,
         "total_chops": u.total_chops or 0,
         "referral_count": u.referral_count or 0,
         "joined_at": u.created_at.isoformat() if u.created_at else None,
@@ -2258,7 +2378,9 @@ async def get_user_profile(
         "metrics": {
             "is_hidden": hide_metrics,
             "decision_score": 88 if not hide_metrics else None,
+            "contribution_count": build_room_contributions if not hide_metrics else None,
             "contribution_chops": user.total_chops or 0 if not hide_metrics else None,
+            "chops_earned": user.total_chops or 0 if not hide_metrics else None,
             "day_streak": user.login_streak or 0 if not hide_metrics else None,
             "pots_earned": pots_earned if not hide_metrics else None,
         },
