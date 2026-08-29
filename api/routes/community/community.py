@@ -105,17 +105,20 @@ def _is_question_discussion(post_type: str = "", title: str = "", content: str =
     return False
 
 
-def _generate_voo_checkin_message(author_handle: str, question_title: str, question_content: str, contributors: List[str], replies_text: str) -> str:
+def _generate_voo_answer_message(author_handle: str, question_title: str, question_content: str, contributors: List[str], replies_text: str) -> str:
     """
-    Generates a high-quality, friendly check-in response from Voo using xAI Grok (or OpenAI client).
+    Generates an intelligent, high-value, and direct perspective answer from Voo using xAI Grok (or OpenAI client).
     """
     api_key = os.getenv("XAI_API_KEY")
-    contributors_str = ", ".join(contributors[:3]) if contributors else "the community"
+    contributors_str = ", ".join(contributors[:3]) if contributors else ""
     
     fallback_message = (
-        f"Hey {author_handle}! 👋\n\n"
-        f"It's been a little while since you posted your question about **{question_title}**, and {contributors_str} shared some helpful thoughts!\n\n"
-        f"Did the responses so far give you clarity, or are you still working through this? If you've found your answer, feel free to mark this discussion as resolved, or turn this into a Decision Engine mission to execute the steps."
+        f"Hi {author_handle}! 👋\n\n"
+        f"Here is a key perspective on your question **{question_title}**:\n\n"
+        f"1. **Clarify the Core Objective**: Focus on the specific outcome or metric you want to improve before committing heavy resources.\n"
+        f"2. **Validate with Low-Risk Tests**: Run small-scale experiments to gather fast customer feedback and reduce execution risk.\n"
+        f"3. **Prioritize Velocity and Simplicity**: Choose the simplest path that unlocks immediate traction for your business.\n\n"
+        f"Hope this perspective helps! You can mark this question as resolved or convert these steps into a Decision Engine mission to execute."
     )
 
     if not api_key:
@@ -129,28 +132,37 @@ def _generate_voo_checkin_message(author_handle: str, question_title: str, quest
             timeout=30.0,
             max_retries=2,
         )
+        
+        community_context = (
+            f"\n\nCommunity members ({contributors_str}) also shared these points:\n{replies_text}"
+            if contributors_str and replies_text else ""
+        )
+
         prompt = (
-            f"You are Voo, the friendly and hyper-intelligent AI community assistant in the Lavoo Build Room for business owners.\n\n"
-            f"The author ({author_handle}) asked this question:\n"
+            f"You are Voo, the intelligent, strategic, and hyper-practical AI advisor for business owners and solo founders in the Lavoo Build Room.\n\n"
+            f"The founder ({author_handle}) posted this question:\n"
             f"Title: {question_title}\n"
-            f"Question details: {question_content}\n\n"
-            f"Community contributors ({contributors_str}) shared these responses:\n{replies_text}\n\n"
-            f"Write a warm, natural, and concise 2-3 paragraph follow-up comment directly to {author_handle}:\n"
-            f"1. Greet {author_handle} warmly and mention that {contributors_str} shared valuable insights on their question.\n"
-            f"2. In 1 concise sentence, summarize the core direction or solutions the community suggested.\n"
-            f"3. Ask {author_handle} if the responses so far were helpful or if they need further breakdown.\n"
-            f"4. Remind them they can mark the discussion as resolved or convert the advice into a Decision Engine mission.\n"
-            f"Keep the tone encouraging, crisp, and professional. Do NOT use markdown code fences."
+            f"Question details: {question_content}{community_context}\n\n"
+            f"Provide your own high-impact, direct, and actionable answer to solve {author_handle}'s question:\n"
+            f"1. Start with a friendly greeting directly tagging {author_handle} (e.g. 'Hi {author_handle},' or 'Hey {author_handle}! 👋').\n"
+            f"2. Directly answer their question with clear, actionable insights, strategy, or frameworks tailored for a founder/business builder.\n"
+            f"3. Give 2-3 structured, high-leverage recommendations or key decision principles that provide immediate clarity.\n"
+            f"4. If community members ({contributors_str}) shared insights, naturally synthesize or reference them alongside your own perspective.\n"
+            f"5. End with an encouraging closing note and remind them they can mark the question as resolved or turn these recommendations into a Decision Engine mission.\n"
+            f"Keep the tone encouraging, crisp, professional, and practical (2-4 paragraphs). Do NOT wrap your answer in markdown code fences."
         )
 
         completion = client.chat.completions.create(
             model="grok-4-1-fast-reasoning",
             messages=[
-                {"role": "system", "content": "You are Voo, the intelligent AI community companion for the Lavoo Build Room. Keep replies warm, concise, and helpful."},
+                {
+                    "role": "system", 
+                    "content": "You are Voo, the intelligent and practical AI advisor in the Lavoo Build Room. Deliver direct, high-value, structured answers to founder questions."
+                },
                 {"role": "user", "content": prompt}
             ],
             temperature=0.4,
-            max_tokens=350,
+            max_tokens=450,
         )
 
         if completion and completion.choices:
@@ -166,7 +178,7 @@ def _generate_voo_checkin_message(author_handle: str, question_title: str, quest
 async def cron_process_pending_voo_replies(db: Session):
     """
     Checks for discussions where voo_status == 'scheduled' AND voo_scheduled_for <= now.
-    Generates intelligent follow-up using xAI Grok and posts as Voo.
+    Generates intelligent perspective answer from Voo using xAI Grok and posts as Voo.
     """
     now = datetime.now(timezone.utc)
     eligible = db.query(CommunityDiscussion).filter(
@@ -178,7 +190,7 @@ async def cron_process_pending_voo_replies(db: Session):
     if not eligible:
         return
 
-    logger.info(f"[voo-bot] Found {len(eligible)} discussions eligible for Voo check-in")
+    logger.info(f"[voo-bot] Found {len(eligible)} discussions eligible for Voo answer")
     voo_user = ensure_voo_bot_user(db)
 
     for d in eligible:
@@ -195,18 +207,11 @@ async def cron_process_pending_voo_replies(db: Session):
                 db.commit()
                 continue
 
-            # Fetch all non-bot replies
+            # Fetch any non-bot replies if existing
             replies = db.query(DiscussionReply).filter(
                 DiscussionReply.discussion_id == d.id,
                 DiscussionReply.user_id != voo_user.id
             ).order_by(DiscussionReply.created_at.asc()).all()
-
-            if not replies:
-                # If all replies were deleted, revert back to pending_replies
-                d.voo_status = "pending_replies"
-                d.voo_scheduled_for = None
-                db.commit()
-                continue
 
             # Author name/tag
             author_user = db.query(User).filter_by(id=d.user_id).first()
@@ -222,8 +227,8 @@ async def cron_process_pending_voo_replies(db: Session):
                     contributors.append(u_name)
                 reply_summaries.append(f"{u_name}: {r.content[:200]}")
 
-            # Generate synthesis via Grok
-            synthesis = _generate_voo_checkin_message(
+            # Generate perspective answer via Grok
+            synthesis = _generate_voo_answer_message(
                 author_handle=author_handle,
                 question_title=d.title,
                 question_content=d.content,
@@ -254,8 +259,8 @@ async def cron_process_pending_voo_replies(db: Session):
                     notif = UserNotification(
                         user_id=d.user_id,
                         type="voo_checkin",
-                        title="🤖 Voo checked in on your question",
-                        message=f"Voo reviewed community responses to '{d.title[:50]}'. Were they helpful?",
+                        title="🤖 Voo answered your question",
+                        message=f"Voo shared an answer to your question: '{d.title[:50]}'",
                         link=f"/dashboard/community?discussionId={d.id}",
                         is_read=False
                     )
@@ -265,7 +270,7 @@ async def cron_process_pending_voo_replies(db: Session):
                     logger.warning(f"[voo-bot] Notification creation failed: {ne}")
 
             await delete_cached("community:discussions:*")
-            logger.info(f"[voo-bot] Successfully posted Voo check-in on discussion {d.id}")
+            logger.info(f"[voo-bot] Successfully posted Voo answer on discussion {d.id}")
 
         except Exception as e:
             logger.error(f"[voo-bot] Failed processing discussion {d.id}: {e}", exc_info=True)
@@ -1208,9 +1213,11 @@ async def create_discussion(
                 "expires_at": expires_at_iso
             }
 
-    # Detect if post is an inquiry / question
+    # Detect if post is an inquiry / question and schedule Voo initial answer in 10 minutes
     is_question = _is_question_discussion(post_type=post_type, title=body.title, content=body.content)
-    voo_init_status = "pending_replies" if is_question else "untracked"
+    interval_minutes = int(os.getenv("VOO_BOT_INTERVAL_MINUTES", "10"))
+    voo_init_status = "scheduled" if is_question else "untracked"
+    voo_init_scheduled_for = (datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)) if is_question else None
 
     d = CommunityDiscussion(
         channel_id=body.channel_id, user_id=current_user.id,
@@ -1218,7 +1225,8 @@ async def create_discussion(
         tags=body.tags or [], post_type=post_type,
         tagged_user_ids=tagged_ids, visibility=visibility_val,
         poll_data=poll_payload,
-        voo_status=voo_init_status
+        voo_status=voo_init_status,
+        voo_scheduled_for=voo_init_scheduled_for
     )
     db.add(d)
     ch.post_count = (ch.post_count or 0) + 1
