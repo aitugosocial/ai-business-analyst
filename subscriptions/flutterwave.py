@@ -4,6 +4,9 @@ from fastapi import APIRouter, HTTPException, Depends, status, Request
 from pydantic import BaseModel
 import requests
 import logging
+import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from decimal import Decimal, InvalidOperation
@@ -534,6 +537,148 @@ async def verify_bank_account(
     except Exception as e:
         logger.error("[FLW bank] unexpected error: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)}")
+
+
+class BankResolveRequest(BaseModel):
+    account_number: str
+
+
+# NUBAN (Nigerian Uniform Bank Account Number) doesn't encode the issuing
+# bank the way an IBAN does, so Flutterwave has no single "resolve just from
+# account number" endpoint — /accounts/resolve always requires a bank code.
+# The bank list itself barely changes, so it's cached for a day rather than
+# fetched on every lookup.
+_bank_list_cache: dict = {"data": None, "ts": 0.0}
+_BANK_LIST_TTL_SECONDS = 24 * 60 * 60
+
+
+def _fetch_nigerian_banks() -> list[dict]:
+    now = time.time()
+    if _bank_list_cache["data"] is not None and (now - _bank_list_cache["ts"]) < _BANK_LIST_TTL_SECONDS:
+        return _bank_list_cache["data"]
+    response = requests.get(
+        f"{FLUTTERWAVE_BASE_URL}/banks/NG",
+        headers={"Authorization": f"Bearer {FLUTTERWAVE_SECRET_KEY}"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    banks = response.json().get("data", []) or []
+    _bank_list_cache["data"] = banks
+    _bank_list_cache["ts"] = now
+    return banks
+
+
+def _try_resolve_against_bank(account_number: str, bank: dict) -> dict | None:
+    """One /accounts/resolve attempt against a single bank. Returns None on
+    any failure (wrong bank, timeout, error) — this is expected to fail for
+    every bank except the right one, so failure here is normal, not
+    exceptional."""
+    try:
+        response = requests.post(
+            f"{FLUTTERWAVE_BASE_URL}/accounts/resolve",
+            json={"account_number": account_number, "account_bank": bank.get("code")},
+            headers={"Authorization": f"Bearer {FLUTTERWAVE_SECRET_KEY}", "Content-Type": "application/json"},
+            timeout=8,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            account_name = data.get("data", {}).get("account_name") if data.get("status") == "success" else None
+            if account_name:
+                return {
+                    "bank_code": bank.get("code"),
+                    "bank_name": bank.get("name"),
+                    "account_name": account_name,
+                }
+    except requests.RequestException:
+        pass
+    return None
+
+
+async def _resolve_against_many(account_number: str, banks: list[dict], max_workers: int) -> dict | None:
+    """Try every bank in `banks` concurrently, capped at max_workers threads
+    at once (asyncio.to_thread's default executor caps out around ~32
+    workers, which serializes a large bank list into multiple slow waves —
+    a dedicated pool sized to the list avoids that).
+
+    Deliberately NOT a `with ThreadPoolExecutor(...) as pool:` block: that
+    context manager's __exit__ calls shutdown(wait=True), which blocks
+    until every submitted future finishes — silently defeating the whole
+    point of returning as soon as the first real match is found via
+    as_completed, since the request would still sit there waiting out the
+    slow-failing stragglers' full timeout regardless. shutdown here is
+    explicit and non-blocking once a match is found.
+    """
+    if not banks:
+        return None
+    loop = asyncio.get_running_loop()
+    pool = ThreadPoolExecutor(max_workers=min(max_workers, len(banks)))
+    try:
+        futures = [
+            loop.run_in_executor(pool, _try_resolve_against_bank, account_number, bank)
+            for bank in banks
+        ]
+        for done in asyncio.as_completed(futures):
+            result = await done
+            if result:
+                return result
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return None
+
+
+@router.post("/flutterwave/resolve-bank")
+async def resolve_bank_from_account_number(
+    body: BankResolveRequest,
+    current_user=Depends(get_current_user),
+):
+    """Given only an account number, find which Nigerian bank it belongs to
+    and the account holder's name — lets the payout-account form auto-fill
+    the bank code instead of asking the user to know/look it up themselves.
+
+    NUBAN doesn't encode the issuing bank the way an IBAN does, so there is
+    no cheaper single-call lookup — this has to try candidate banks against
+    /accounts/resolve until one matches. Flutterwave's NG bank list has
+    ~700 entries (not the ~25 well-known commercial banks one might expect
+    — it includes hundreds of microfinance banks, mobile-money wallets, and
+    fintechs), and brute-forcing all 700 at once serializes behind Python's
+    default ~32-worker thread pool into a 100s+ wait. Tiered instead:
+    Tier 1 tries only the ~25 traditional deposit-money banks (Access,
+    GTBank, Zenith, etc. — identifiable by their short, legacy 3-digit CBN
+    codes, unlike newer institutions' 6-digit codes), which covers the
+    large majority of real accounts in a few seconds. Tier 2 — only
+    reached if tier 1 finds nothing — sweeps the remaining ~675 fintech/
+    microfinance banks (Kuda, Opay, Moniepoint, etc.) with a wider thread
+    pool, still well under the naive full-serial time.
+    """
+    if not FLUTTERWAVE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Flutterwave secret key not configured")
+
+    account_number = (body.account_number or "").strip()
+    if len(account_number) != 10 or not account_number.isdigit():
+        raise HTTPException(status_code=400, detail="Enter a valid 10-digit account number")
+
+    try:
+        banks = await asyncio.to_thread(_fetch_nigerian_banks)
+    except Exception as e:
+        logger.error(f"[FLW bank resolve] Failed to fetch bank list: {e}")
+        raise HTTPException(status_code=502, detail="Could not fetch the bank list from Flutterwave")
+
+    if not banks:
+        raise HTTPException(status_code=502, detail="No banks returned by Flutterwave")
+
+    major_banks = [b for b in banks if len(str(b.get("code") or "")) <= 3]
+    other_banks = [b for b in banks if len(str(b.get("code") or "")) > 3]
+
+    match = await _resolve_against_many(account_number, major_banks, max_workers=30)
+    if not match:
+        logger.info(f"[FLW bank resolve] No match among {len(major_banks)} major banks, sweeping {len(other_banks)} others")
+        match = await _resolve_against_many(account_number, other_banks, max_workers=80)
+
+    if not match:
+        raise HTTPException(status_code=404, detail="Could not find a matching bank for this account number")
+
+    logger.info(f"[FLW bank resolve] {account_number} -> {match['bank_name']} ({match['bank_code']})")
+    return {"status": "success", **match}
 
 
 # Note: The /flutterwave/callback endpoint below handles transfer webhooks
