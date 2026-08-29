@@ -594,22 +594,23 @@ def _try_resolve_against_bank(account_number: str, bank: dict) -> dict | None:
     return None
 
 
-async def _resolve_against_many(account_number: str, banks: list[dict], max_workers: int) -> dict | None:
+async def _resolve_against_many(account_number: str, banks: list[dict], max_workers: int) -> list[dict]:
     """Try every bank in `banks` concurrently, capped at max_workers threads
     at once (asyncio.to_thread's default executor caps out around ~32
     workers, which serializes a large bank list into multiple slow waves —
     a dedicated pool sized to the list avoids that).
 
-    Deliberately NOT a `with ThreadPoolExecutor(...) as pool:` block: that
-    context manager's __exit__ calls shutdown(wait=True), which blocks
-    until every submitted future finishes — silently defeating the whole
-    point of returning as soon as the first real match is found via
-    as_completed, since the request would still sit there waiting out the
-    slow-failing stragglers' full timeout regardless. shutdown here is
-    explicit and non-blocking once a match is found.
+    Returns EVERY bank that resolved successfully, not just the first —
+    the same NUBAN-style account number can validly resolve against more
+    than one institution (reported directly: an Opay account resolved
+    against a wrong-but-real bank first, silently auto-filling it, and the
+    user only found the real Opay code by looking it up manually). Racing
+    to the first hit made that failure mode invisible; a full sweep surfaces
+    every candidate so the caller can decide (auto-fill only when there is
+    exactly one, otherwise ask the user to pick).
     """
     if not banks:
-        return None
+        return []
     loop = asyncio.get_running_loop()
     pool = ThreadPoolExecutor(max_workers=min(max_workers, len(banks)))
     try:
@@ -617,13 +618,10 @@ async def _resolve_against_many(account_number: str, banks: list[dict], max_work
             loop.run_in_executor(pool, _try_resolve_against_bank, account_number, bank)
             for bank in banks
         ]
-        for done in asyncio.as_completed(futures):
-            result = await done
-            if result:
-                return result
+        results = await asyncio.gather(*futures)
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
-    return None
+        pool.shutdown(wait=False)
+    return [r for r in results if r]
 
 
 @router.post("/flutterwave/resolve-bank")
@@ -631,24 +629,29 @@ async def resolve_bank_from_account_number(
     body: BankResolveRequest,
     current_user=Depends(get_current_user),
 ):
-    """Given only an account number, find which Nigerian bank it belongs to
-    and the account holder's name — lets the payout-account form auto-fill
-    the bank code instead of asking the user to know/look it up themselves.
+    """Given only an account number, find every Nigerian bank it validly
+    resolves against — lets the payout-account form auto-fill the bank
+    code when there's exactly one match, or ask the user to pick when
+    there's more than one, instead of asking them to know/look up the
+    code themselves from scratch.
 
     NUBAN doesn't encode the issuing bank the way an IBAN does, so there is
     no cheaper single-call lookup — this has to try candidate banks against
-    /accounts/resolve until one matches. Flutterwave's NG bank list has
-    ~700 entries (not the ~25 well-known commercial banks one might expect
-    — it includes hundreds of microfinance banks, mobile-money wallets, and
-    fintechs), and brute-forcing all 700 at once serializes behind Python's
-    default ~32-worker thread pool into a 100s+ wait. Tiered instead:
-    Tier 1 tries only the ~25 traditional deposit-money banks (Access,
-    GTBank, Zenith, etc. — identifiable by their short, legacy 3-digit CBN
-    codes, unlike newer institutions' 6-digit codes), which covers the
-    large majority of real accounts in a few seconds. Tier 2 — only
-    reached if tier 1 finds nothing — sweeps the remaining ~675 fintech/
-    microfinance banks (Kuda, Opay, Moniepoint, etc.) with a wider thread
-    pool, still well under the naive full-serial time.
+    /accounts/resolve. It has to try ALL of them and collect every match,
+    not stop at the first: the same account number can validly resolve
+    against more than one institution (confirmed directly — an Opay account
+    number also resolved successfully against an unrelated bank, and a
+    first-match-wins design would have auto-filled that wrong bank with no
+    way for the user to notice). Flutterwave's NG bank list has ~700
+    entries (not the ~25 well-known commercial banks one might expect — it
+    includes hundreds of microfinance banks, mobile-money wallets, and
+    fintechs). Tiered to keep the common case fast: Tier 1 sweeps only the
+    ~25 traditional deposit-money banks (Access, GTBank, Zenith, etc. —
+    identifiable by their short, legacy 3-digit CBN codes, unlike newer
+    institutions' 6-digit codes), covering the large majority of real
+    accounts in a few seconds. Tier 2 — only reached if tier 1 finds
+    nothing — sweeps the remaining ~675 fintech/microfinance banks (Kuda,
+    Opay, Moniepoint, etc.) with a wider thread pool.
     """
     if not FLUTTERWAVE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Flutterwave secret key not configured")
@@ -669,16 +672,17 @@ async def resolve_bank_from_account_number(
     major_banks = [b for b in banks if len(str(b.get("code") or "")) <= 3]
     other_banks = [b for b in banks if len(str(b.get("code") or "")) > 3]
 
-    match = await _resolve_against_many(account_number, major_banks, max_workers=30)
-    if not match:
+    matches = await _resolve_against_many(account_number, major_banks, max_workers=30)
+    if not matches:
         logger.info(f"[FLW bank resolve] No match among {len(major_banks)} major banks, sweeping {len(other_banks)} others")
-        match = await _resolve_against_many(account_number, other_banks, max_workers=80)
+        matches = await _resolve_against_many(account_number, other_banks, max_workers=80)
 
-    if not match:
+    if not matches:
         raise HTTPException(status_code=404, detail="Could not find a matching bank for this account number")
 
-    logger.info(f"[FLW bank resolve] {account_number} -> {match['bank_name']} ({match['bank_code']})")
-    return {"status": "success", **match}
+    match_summary = [f"{m['bank_name']} ({m['bank_code']})" for m in matches]
+    logger.info(f"[FLW bank resolve] {account_number} -> {len(matches)} candidate(s): {match_summary}")
+    return {"status": "success", "matches": matches}
 
 
 # Note: The /flutterwave/callback endpoint below handles transfer webhooks
