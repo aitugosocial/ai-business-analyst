@@ -2128,13 +2128,19 @@ async def get_leaderboard(
     current_user: Optional[User] = Depends(get_current_user_optional),
     db: Session = Depends(get_db)
 ):
-    top_users = db.query(User).filter(User.is_active == True)\
-        .order_by(User.total_chops.desc(), User.created_at.asc()).limit(limit).all()
+    top_users = db.query(User).filter(
+        User.is_active == True,
+        (User.is_bot == False) | (User.is_bot.is_(None)),
+        func.lower(User.username) != "voo",
+        func.lower(User.name) != "voo",
+        User.email != "voo@lavoo.io"
+    ).order_by(User.total_chops.desc(), User.created_at.asc()).limit(limit).all()
 
     return {"success": True, "data": [{
         "rank": idx + 1,
         "user_id": u.id,
         "name": u.name,
+        "username": u.username,
         "total_chops": u.total_chops or 0,
         "referral_count": u.referral_count or 0,
         "joined_at": u.created_at.isoformat() if u.created_at else None,
