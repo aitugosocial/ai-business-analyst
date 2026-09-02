@@ -118,7 +118,7 @@ def _generate_voo_answer_message(author_handle: str, question_title: str, questi
         f"1. **Clarify the Core Objective**: Focus on the specific outcome or metric you want to improve before committing heavy resources.\n"
         f"2. **Validate with Low-Risk Tests**: Run small-scale experiments to gather fast customer feedback and reduce execution risk.\n"
         f"3. **Prioritize Velocity and Simplicity**: Choose the simplest path that unlocks immediate traction for your business.\n\n"
-        f"Hope this perspective helps! You can mark this question as resolved or convert these steps into a Decision Engine mission to execute."
+        f"Hope this perspective helps! You can mark this question as resolved when you're ready."
     )
 
     if not api_key:
@@ -148,7 +148,7 @@ def _generate_voo_answer_message(author_handle: str, question_title: str, questi
             f"2. Directly answer their question with clear, actionable insights, strategy, or frameworks tailored for a founder/business builder.\n"
             f"3. Give 2-3 structured, high-leverage recommendations or key decision principles that provide immediate clarity.\n"
             f"4. If community members ({contributors_str}) shared insights, naturally synthesize or reference them alongside your own perspective.\n"
-            f"5. End with an encouraging closing note and remind them they can mark the question as resolved or turn these recommendations into a Decision Engine mission.\n"
+            f"5. End with an encouraging closing note and remind them they can mark the question as resolved once they have the clarity they need.\n"
             f"Keep the tone encouraging, crisp, professional, and practical (2-4 paragraphs). Do NOT wrap your answer in markdown code fences."
         )
 
@@ -1759,7 +1759,7 @@ async def resolve_discussion(
 ):
     """
     Marks a question discussion as resolved.
-    Awards +15 Chops to the author for community resolution and completes Voo bot tracking.
+    Awards +5 Chops to the author for community resolution and completes Voo bot tracking.
     """
     d = db.query(CommunityDiscussion).filter_by(id=discussion_id).first()
     if not d:
@@ -1770,11 +1770,11 @@ async def resolve_discussion(
     
     d.is_resolved = True
     d.voo_status = "completed"
-    current_user.total_chops = (current_user.total_chops or 0) + 15
+    current_user.total_chops = (current_user.total_chops or 0) + 5
     db.commit()
     await delete_cached("community:discussions:*")
     logger.info(f"[voo-bot] Discussion {discussion_id} marked as resolved by user {current_user.id}")
-    return {"success": True, "message": "Discussion marked as resolved", "is_resolved": True, "chops_awarded": 15}
+    return {"success": True, "message": "Discussion marked as resolved", "is_resolved": True, "chops_awarded": 5}
 
 
 @router.post("/discussions/{discussion_id}/replies/{reply_id}/like")
