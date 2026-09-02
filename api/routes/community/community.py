@@ -116,9 +116,9 @@ def _generate_voo_answer_message(author_handle: str, question_title: str, questi
         f"Hi {author_handle}! 👋\n\n"
         f"Here is a key perspective on your question **{question_title}**:\n\n"
         f"1. **Clarify the Core Objective**: Focus on the specific outcome or metric you want to improve before committing heavy resources.\n"
-        f"2. **Validate with Low-Risk Tests**: Run small-scale experiments to gather fast customer feedback and reduce execution risk.\n"
+        f"2. **Validate with Low Risk Tests**: Run small scale experiments to gather fast customer feedback and reduce execution risk.\n"
         f"3. **Prioritize Velocity and Simplicity**: Choose the simplest path that unlocks immediate traction for your business.\n\n"
-        f"Hope this perspective helps! You can mark this question as resolved when you're ready."
+        f"Test one adjustment this week and track your progress. You have got this. Feel free to mark this question resolved once you have the clarity you need."
     )
 
     if not api_key:
@@ -148,7 +148,8 @@ def _generate_voo_answer_message(author_handle: str, question_title: str, questi
             f"2. Directly answer their question with clear, actionable insights, strategy, or frameworks tailored for a founder/business builder.\n"
             f"3. Give 2-3 structured, high-leverage recommendations or key decision principles that provide immediate clarity.\n"
             f"4. If community members ({contributors_str}) shared insights, naturally synthesize or reference them alongside your own perspective.\n"
-            f"5. End with an encouraging closing note and remind them they can mark the question as resolved once they have the clarity they need.\n"
+            f"5. End with an encouraging closing note formulated like this: 'Test one adjustment this week and track your progress. You have got this. Feel free to mark this question resolved once you have the clarity you need.' (Do NOT mention Decision Engine missions or task conversions).\n"
+            f"STRICT PUNCTUATION INSTRUCTION: Strictly do NOT use em-dashes (—), en-dashes (–), or hyphens (-) anywhere in your response. Do not use dashes for pauses, parentheticals, compound terms, or bullet points. Use clean commas, colons, periods, or standard complete sentences instead.\n"
             f"Keep the tone encouraging, crisp, professional, and practical (2-4 paragraphs). Do NOT wrap your answer in markdown code fences."
         )
 
@@ -157,7 +158,7 @@ def _generate_voo_answer_message(author_handle: str, question_title: str, questi
             messages=[
                 {
                     "role": "system", 
-                    "content": "You are Voo, the intelligent and practical AI advisor in the Lavoo Build Room. Deliver direct, high-value, structured answers to founder questions."
+                    "content": "You are Voo, the intelligent and practical AI advisor in the Lavoo Build Room. Deliver direct, high-value, structured answers to founder questions. STRICT RULE: Never use em-dashes (—), en-dashes (–), or hyphens (-) in your writing. Use natural commas, colons, and periods instead."
                 },
                 {"role": "user", "content": prompt}
             ],
