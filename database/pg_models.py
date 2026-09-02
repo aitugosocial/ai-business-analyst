@@ -2207,3 +2207,27 @@ class SignalCommentListResponse(BaseModel):
     page: int
     limit: int
     total_pages: int
+
+
+# =============================================================================
+# CONTACT FORM / INQUIRIES MODEL
+# =============================================================================
+
+class ContactMessage(Base):
+    """
+    Stores contact form inquiries submitted through the public website.
+    Ensures zero message loss and gives admins an audit trail.
+    """
+    __tablename__ = "contact_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    email = Column(String(255), nullable=False, index=True)
+    company = Column(String(255), nullable=True)
+    reason = Column(String(100), nullable=False, default="general")
+    subject = Column(String(255), nullable=True)
+    message = Column(Text, nullable=False)
+    status = Column(String(50), default="unread", server_default="unread")  # unread, in_progress, resolved
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    notes = Column(Text, nullable=True)

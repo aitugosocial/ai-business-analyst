@@ -750,47 +750,6 @@ async def resolve_bank_from_account_number(
     return {"status": "success", "matches": matches}
 
 
-class FeePreviewRequest(BaseModel):
-    amount: float
-    currency: str = "NGN"
-    payment_type: str = "card"
-
-
-@router.post("/flutterwave/fee-preview")
-async def flutterwave_fee_preview(
-    body: FeePreviewRequest,
-    current_user=Depends(get_current_user),
-):
-    """Gross up a subscription's base price by Flutterwave's own processing
-    fee + VAT, so the customer pays fee+base and the full base amount is
-    what's left for the referrer/Lavoo split — see
-    flutterwave_split.get_flutterwave_processing_fee's docstring. Used by
-    checkout before opening the Flutterwave widget.
-    """
-    from subscriptions.flutterwave_split import get_flutterwave_processing_fee
-
-    base_amount = Decimal(str(body.amount))
-    fee = await asyncio.to_thread(
-        get_flutterwave_processing_fee, base_amount, body.currency, body.payment_type
-    )
-    if fee is None:
-        raise HTTPException(status_code=502, detail="Could not fetch Flutterwave's processing fee")
-
-    charge_amount = base_amount + fee
-    logger.info(
-        "[FLW fee preview] base=%s fee=%s currency=%s payment_type=%s -> charge=%s",
-        base_amount, fee, body.currency, body.payment_type, charge_amount,
-    )
-    return {
-        "status": "success",
-        "data": {
-            "base_amount": float(base_amount),
-            "fee": float(fee),
-            "charge_amount": float(charge_amount),
-        },
-    }
-
-
 # Note: The /flutterwave/callback endpoint below handles transfer webhooks
 
 
