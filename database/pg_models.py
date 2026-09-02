@@ -810,6 +810,16 @@ class Payout(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
     requested_at = Column(DateTime(timezone=True), nullable=True)
 
+    # Audit trail for a currency-converted payout (e.g. a USD/GBP commission
+    # paid out in NGN since the referrer's only payout method is
+    # Flutterwave/NGN) — original_currency/original_amount preserve exactly
+    # what was earned, fx_rate records the rate actually used, so `amount`/
+    # `currency` above (what was actually sent) is never the only number on
+    # file. NULL for a same-currency payout with nothing to convert.
+    original_currency = Column(String(10), nullable=True)
+    original_amount = Column(Numeric(precision=10, scale=2), nullable=True)
+    fx_rate = Column(Numeric(precision=18, scale=6), nullable=True)
+
     # Relationships
     user = relationship("User", foreign_keys=[user_id])
 

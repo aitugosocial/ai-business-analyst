@@ -94,14 +94,18 @@ async def get_user_stats(
         paid_commissions = 0.0
 
         try:
+            # 'auto_settled' (Flutterwave subaccount split, or the
+            # immediate-payout path) is included in both totals — it's
+            # money already moved, same as 'paid', just not yet flipped to
+            # 'paid' by the async payout-webhook confirmation.
             total_commissions = db.query(func.sum(Commission.amount)).filter(
                 Commission.user_id == user_id,
-                Commission.status.in_(['paid', 'pending', 'processing', 'approved'])
+                Commission.status.in_(['paid', 'auto_settled', 'pending', 'processing', 'approved'])
             ).scalar() or 0.0
 
             paid_commissions = db.query(func.sum(Commission.amount)).filter(
                 Commission.user_id == user_id,
-                Commission.status == 'paid'
+                Commission.status.in_(['paid', 'auto_settled'])
             ).scalar() or 0.0
         except Exception as e:
              logger.warning(f"Commission stats partial fail for user {user_id}: {e}")
