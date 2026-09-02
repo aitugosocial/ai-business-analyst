@@ -24,10 +24,10 @@ logger = logging.getLogger(__name__)
 class MailerLiteEmailService:
     def __init__(self):
         self.api_key = os.getenv("MAILERLITE_API_KEY")
-        self.from_email = os.getenv("FROM_EMAIL", "hello@lavoo.io")
+        self.support_email = os.getenv("SUPPORT_EMAIL", "support@lavoo.io")
+        self.from_email = os.getenv("FROM_EMAIL", self.support_email)
         self.from_name = os.getenv("FROM_NAME", "Lavoo | The Business Doctor")
         self.frontend_url = os.getenv("FRONTEND_URL", "https://lavoo.io")
-        self.support_email = os.getenv("SUPPORT_EMAIL", "hello@lavoo.io")
         self.base_url = "https://connect.mailerlite.com/api"
 
         # SMTP configuration (optional fallback or primary transport)
@@ -990,8 +990,8 @@ class MailerLiteEmailService:
         subject: Optional[str],
         message: str
     ):
-        """Send contact form submission to Lavoo team inbox (hello@lavoo.io)"""
-        recipient_email = os.getenv("CONTACT_RECIPIENT_EMAIL", "hello@lavoo.io")
+        """Send contact form submission to Lavoo team inbox (support@lavoo.io)"""
+        recipient_email = os.getenv("CONTACT_RECIPIENT_EMAIL", os.getenv("SUPPORT_EMAIL", "support@lavoo.io"))
         clean_reason = (reason or "general").replace("_", " ").title()
         email_subject = f"[Lavoo Contact] {clean_reason}: {name}" if not subject else f"[Lavoo Contact] {clean_reason}: {subject}"
 
