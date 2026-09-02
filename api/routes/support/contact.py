@@ -1,7 +1,7 @@
 """
 Contact Form API Route
 Handles public contact form submissions, anti-spam honeypot checks,
-database persistence in PostgreSQL, and background email dispatch to hello@lavoo.io
+database persistence in PostgreSQL, and background email dispatch to support@lavoo.io
 and user confirmation receipt.
 """
 
@@ -71,7 +71,7 @@ async def submit_contact_form(
     1. Validates input fields and checks anti-bot honeypot.
     2. Persists inquiry into `contact_messages` table in PostgreSQL.
     3. Triggers background emails:
-       - To admin (hello@lavoo.io) with reply-to set to user's email.
+       - To admin (support@lavoo.io) with reply-to set to user's email.
        - To user with immediate auto-receipt confirmation.
     """
     # 1. Anti-bot honeypot check: If filled, silently acknowledge without saving/sending
@@ -110,7 +110,7 @@ async def submit_contact_form(
         # Continue to dispatch emails even if DB write encounters an error
 
     # 3. Dispatch background emails (non-blocking)
-    # Email 1: To Lavoo team (hello@lavoo.io)
+    # Email 1: To Lavoo team (support@lavoo.io)
     background_tasks.add_task(
         email_service.send_contact_inquiry_to_admin,
         name=clean_name,
