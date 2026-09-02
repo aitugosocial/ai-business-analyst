@@ -237,18 +237,40 @@ class PayoutService:
         """
         Process payout via Flutterwave Transfer API
         """
+        logger.info(
+            f"[FLW payout] START | payout={payout.id} user={payout.user_id} "
+            f"amount={payout.amount} {payout.currency}"
+            + (f" (converted from {payout.original_amount} {payout.original_currency} @ rate {payout.fx_rate})"
+               if payout.original_currency else "")
+        )
         try:
             payout_account = db.query(PayoutAccount).filter(
                 PayoutAccount.user_id == payout.user_id
             ).first()
-            
+
             if not payout_account:
                 raise ValueError("Payout account not configured")
-            
+
             if not payout_account.bank_name or not payout_account.account_number:
                 raise ValueError("Bank details not configured")
-            
-            # Prepare transfer payload
+
+            logger.info(
+                f"[FLW payout] destination | payout={payout.id} bank={payout_account.bank_name} "
+                f"bank_code={payout_account.bank_code} account=***{payout_account.account_number[-4:]} "
+                f"name={payout_account.account_name}"
+            )
+
+            # Prepare transfer payload. No debit_currency override: Flutterwave
+            # debits the balance matching the transfer `currency` by default,
+            # which is correct here since payout.currency is always set to
+            # NGN for a Flutterwave bank transfer (commission_service.py
+            # converts any non-NGN commission to NGN before creating this
+            # Payout row). A hardcoded "debit_currency": "USD" here
+            # previously tried to debit a USD balance Lavoo doesn't actually
+            # hold in Flutterwave (dollar/pound revenue arrives via Stripe,
+            # not Flutterwave) for what should just be a plain NGN transfer
+            # from Lavoo's existing, well-funded NGN balance — the direct
+            # cause of a reported payout never arriving.
             payload = {
                 "account_bank": payout_account.bank_code or payout_account.bank_name,
                 "account_number": payout_account.account_number,
@@ -257,7 +279,6 @@ class PayoutService:
                 "narration": f"Commission payout - {payout.id}",
                 "reference": f"PAYOUT-{payout.id}-{int(datetime.now(timezone.utc).timestamp())}",
                 "callback_url": f"{os.getenv('BASE_URL')}/api/payouts/flutterwave/callback",
-                "debit_currency": "USD",
                 "beneficiary_name": payout_account.account_name or payout.recipient_name
             }
             
@@ -265,35 +286,51 @@ class PayoutService:
                 "Authorization": f"Bearer {FLUTTERWAVE_SECRET_KEY}",
                 "Content-Type": "application/json"
             }
-            
+
+            logger.info(
+                f"[FLW payout] request | payout={payout.id} POST {FLUTTERWAVE_BASE_URL}/transfers "
+                f"account_bank={payload['account_bank']} amount={payload['amount']} currency={payload['currency']} "
+                f"reference={payload['reference']}"
+            )
+
             # Make transfer request
             response = requests.post(
                 f"{FLUTTERWAVE_BASE_URL}/transfers",
                 json=payload,
                 headers=headers
             )
-            
+
+            logger.info(
+                f"[FLW payout] response | payout={payout.id} status={response.status_code} "
+                f"body={response.text[:500]}"
+            )
+
             if response.status_code != 200:
                 raise ValueError(f"Flutterwave API error: {response.text}")
-            
+
             data = response.json()
-            
+
             if data.get("status") != "success":
                 raise ValueError(f"Transfer failed: {data.get('message')}")
-            
+
             transfer_data = data.get("data", {})
-            
+
             # Update payout record
             payout.status = 'processing'  # Flutterwave transfers are async
             payout.provider_payout_id = str(transfer_data.get("id"))
             payout.provider_response = json.dumps(data)
             payout.processed_at = datetime.now(timezone.utc)
-            
+
             db.commit()
             db.refresh(payout)
-            
-            logger.info(f"Flutterwave payout initiated: {payout.id}")
-            
+
+            logger.info(
+                f"[FLW payout] SUCCESS | payout={payout.id} transfer_id={transfer_data.get('id')} "
+                f"amount={payout.amount} {payout.currency} status={payout.status} — "
+                f"Flutterwave transfers are async, watch for the /flutterwave/callback webhook "
+                f"to confirm final completion vs. failure"
+            )
+
             return {
                 "status": "processing",
                 "payout_id": payout.id,
@@ -301,17 +338,28 @@ class PayoutService:
                 "amount": float(payout.amount),
                 "message": "Payout is being processed"
             }
-            
-        except requests.RequestException as e:
+
+        except Exception as e:
+            # Broadened from requests.RequestException only: a non-200 or a
+            # non-"success" Flutterwave response (by far the most likely
+            # real-world failure — bad account details, insufficient
+            # balance, unsupported bank) raises plain ValueError above,
+            # which this previously did NOT catch at all — the payout row
+            # was left stuck at status='pending' forever with no
+            # failure_reason recorded, indistinguishable from "still in
+            # progress." Also removed two references to payout.retry_count
+            # and payout.failed_at, neither of which exist as columns on
+            # Payout — hitting this block would itself raise AttributeError
+            # before even reaching db.commit(), so a genuine transfer
+            # failure was silently swallowed by a second, hidden crash.
+            db.rollback()
             payout.status = 'failed'
             payout.failure_reason = str(e)
-            payout.failed_at = datetime.now(timezone.utc)
-            payout.retry_count += 1
             db.commit()
-            
-            logger.error(f"Flutterwave payout failed: {str(e)}")
+
+            logger.error(f"[FLW payout] FAILED | payout={payout.id} error={e}", exc_info=True)
             raise ValueError(f"Payout failed: {str(e)}")
-    
+
 
     @staticmethod
     def complete_flutterwave_payout( payout_id: int, background_tasks: BackgroundTasks, transfer_status: str, db: Session) -> None:

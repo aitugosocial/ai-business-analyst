@@ -88,11 +88,18 @@ async def get_earnings_summary(
             func.lower(User.subscription_status) == "active"
         ).scalar() or 0
         
-        # Calculate commissions from the Commission table (more accurate)
+        # Calculate commissions from the Commission table (more accurate).
+        # 'auto_settled' (a Flutterwave subaccount split, or the new
+        # immediate-payout path) counts as paid — it previously matched
+        # neither case here, so a freshly auto-settled commission vanished
+        # from both totals until something else (like an admin action)
+        # happened to touch it. It's later flipped to 'paid' once the
+        # payout webhook confirms completion; both statuses mean money
+        # already moved, so both belong in the paid bucket.
         commission_stats = db.query(
-            func.sum(case((Commission.status == 'paid', Commission.amount), else_=0)).label('paid_amount'),
+            func.sum(case((Commission.status.in_(['paid', 'auto_settled']), Commission.amount), else_=0)).label('paid_amount'),
             func.sum(case((Commission.status.in_(['pending', 'processing', 'approved']), Commission.amount), else_=0)).label('pending_amount'),
-            func.count(case((Commission.status == 'paid', 1), else_=None)).label('paid_count')
+            func.count(case((Commission.status.in_(['paid', 'auto_settled']), 1), else_=None)).label('paid_count')
         ).filter(Commission.user_id == user_id).first()
         
         print(f"[DEBUG] Raw Commission Stats for User {user_id}: {commission_stats}")

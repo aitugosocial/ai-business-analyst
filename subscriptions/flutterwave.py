@@ -157,12 +157,17 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
         
         if data.get("status") == "success":
             transaction_data = data.get("data", {})
-            
+            # Extracted before the successful/failed branch below (not just
+            # inside the successful branch, where they used to live) — the
+            # failed branch references the raw amount for its failure email,
+            # and reading an unset local there raised NameError, crashing
+            # the failed-payment path itself instead of notifying the user.
+            amount = transaction_data.get("amount")
+            currency = transaction_data.get("currency")
+
             if transaction_data.get("status") == "successful":
-                amount = transaction_data.get("amount")
-                currency = transaction_data.get("currency")
                 tx_ref = transaction_data.get("tx_ref")
-                
+
                 try:
                     verified_amount = Decimal(str(amount))
                 except InvalidOperation:
@@ -170,6 +175,29 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="Invalid amount received from Flutterwave API."
                     )
+
+                # If checkout grossed up the charge with Flutterwave's own
+                # fee/VAT (see flutterwave_split.get_flutterwave_processing_fee
+                # and checkoutForm.tsx), verified_amount above is the INFLATED
+                # total the customer's card/account was actually debited for
+                # (base + fee) — not the subscription's real price. Everything
+                # we store or show the user (Subscriptions.amount, the
+                # commission/builder-bonus basis, the success notification/
+                # email) must use the true base price instead, echoed back via
+                # meta the same deterministic way SPLIT_META_KEY already is.
+                # Legacy exact-amount plan matching below still needs the RAW
+                # verified_amount, since that path is only ever hit for
+                # non-NGN flows that never had fee gross-up applied.
+                from subscriptions.flutterwave_split import BASE_AMOUNT_META_KEY
+                charge_meta = transaction_data.get("meta") or {}
+                base_amount_meta = charge_meta.get(BASE_AMOUNT_META_KEY)
+                if base_amount_meta is not None:
+                    try:
+                        recorded_amount = Decimal(str(base_amount_meta))
+                    except InvalidOperation:
+                        recorded_amount = verified_amount
+                else:
+                    recorded_amount = verified_amount
                 
                 # Determine subscription plan — prefer explicit plan_type from the
                 # frontend request (required for NGN/Flutterwave where we don't
@@ -211,7 +239,7 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                         "status": "success",
                         "message": "Payment verified successfully (already processed).",
                         "data": {
-                            "amount": str(verified_amount), 
+                            "amount": str(recorded_amount),
                             "currency": currency,
                             "tx_ref": tx_ref,
                             "transaction_id": transaction_id,
@@ -246,7 +274,7 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                     user_id=user.id,
                     tx_ref=tx_ref,
                     transaction_id=transaction_id,
-                    amount=verified_amount,
+                    amount=recorded_amount,
                     payment_provider="Flutterwave",
                     currency=currency,
                     subscription_plan=current_plan,
@@ -296,8 +324,13 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                 from subscriptions.commission_service import CommissionService
                 from subscriptions.flutterwave_split import SPLIT_META_KEY
 
-                charge_meta = transaction_data.get("meta") or {}
                 already_settled = bool(charge_meta.get(SPLIT_META_KEY))
+                logger.info(
+                    "[FLW verify] [BUILDER BONUS] split check | tx_ref=%s meta=%s already_settled=%s "
+                    "(true = this charge was placed with a Flutterwave subaccount split, "
+                    "the referrer's share landed with them directly at payment time)",
+                    tx_ref, charge_meta, already_settled,
+                )
 
                 commission = CommissionService.calculate_commission(
                     subscription=new_subscription,
@@ -313,9 +346,18 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                         "commission_status": commission.status,
                         "referrer_id": commission.user_id
                     }
-                    logger.info("[FLW verify] commission amount=%s referrer=%s status=%s", commission.amount, commission.user_id, commission.status)
+                    logger.info(
+                        "[FLW verify] [BUILDER BONUS] awarded | tx_ref=%s referred_user=%s referrer=%s "
+                        "amount=%s %s rate=%s%% status=%s already_settled=%s commission_id=%s",
+                        tx_ref, user.id, commission.user_id, commission.amount, currency,
+                        commission.commission_rate, commission.status, already_settled, commission.id,
+                    )
                 else:
-                    logger.info("[FLW verify] no commission — user has no referrer")
+                    logger.info(
+                        "[FLW verify] [BUILDER BONUS] none | tx_ref=%s referred_user=%s has no referrer "
+                        "on record — no commission to award",
+                        tx_ref, user.id,
+                    )
                 
                 # In-app payment success notification (real-time via WebSocket)
                 from api.services.notification_service import NotificationService
@@ -327,7 +369,7 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                     message=(
                         f"Your {current_plan.title()} plan is now active until "
                         f"{end_date.strftime('%B %d, %Y')}. "
-                        f"Amount: {currency} {verified_amount}."
+                        f"Amount: {currency} {recorded_amount}."
                     ),
                     link="/dashboard/opportunity-alerts",
                 )
@@ -370,17 +412,40 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                     email_service.send_payment_success_email,
                     user.email,
                     user.name,
-                    float(verified_amount),
+                    float(recorded_amount),
                     current_plan,
                     end_date.strftime("%B %d, %Y")
                 )
-                logger.info("[FLW verify] subscription created user=%s plan=%s", user_email, current_plan)
-                
+
+                # One consolidated summary per payment, so the full story of
+                # a single event (subscription + referral chops + builder
+                # bonus) is readable as one block instead of pieced together
+                # from separate lines scattered earlier in this function.
+                if commission_info:
+                    bonus_line = (
+                        f"BUILDER BONUS: {commission_info['commission_amount']:.2f} {currency} "
+                        f"to referrer user={commission_info['referrer_id']} "
+                        f"(status={commission_info['commission_status']}, "
+                        f"{'auto-settled via Flutterwave split' if already_settled else 'pending manual payout'})"
+                    )
+                elif referral_record:
+                    bonus_line = "BUILDER BONUS: none (referrer has no commission record for this subscription)"
+                else:
+                    bonus_line = "BUILDER BONUS: none (user was not referred)"
+                logger.info(
+                    "[FLW verify] PAYMENT EVENT COMPLETE | tx_id=%s tx_ref=%s user=%s(id=%s) "
+                    "plan=%s charged=%s %s recorded=%s %s %s | %s",
+                    transaction_id, tx_ref, user_email, user.id, current_plan,
+                    verified_amount, currency, recorded_amount, currency,
+                    "(fee/VAT-inclusive charge)" if recorded_amount != verified_amount else "",
+                    bonus_line,
+                )
+
                 return {
                     "status": "success",
                     "message": "Payment verified successfully",
                     "data": {
-                        "amount": str(verified_amount), 
+                        "amount": str(recorded_amount),
                         "currency": currency,
                         "tx_ref": tx_ref,
                         "user_email": user_email,
@@ -401,7 +466,7 @@ async def verify_flutterwave_payment(verify_data: PaymentVerifyRequest, backgrou
                 )
                 background_tasks.add_task(
                     email_service.send_payment_failed_email,
-                    user.email, user.name, float(verified_amount),
+                    user.email, user.name, float(amount) if amount is not None else 0.0,
                     f"Transaction status: {transaction_data.get('status')}"
                 )
                 raise HTTPException(
@@ -685,6 +750,47 @@ async def resolve_bank_from_account_number(
     return {"status": "success", "matches": matches}
 
 
+class FeePreviewRequest(BaseModel):
+    amount: float
+    currency: str = "NGN"
+    payment_type: str = "card"
+
+
+@router.post("/flutterwave/fee-preview")
+async def flutterwave_fee_preview(
+    body: FeePreviewRequest,
+    current_user=Depends(get_current_user),
+):
+    """Gross up a subscription's base price by Flutterwave's own processing
+    fee + VAT, so the customer pays fee+base and the full base amount is
+    what's left for the referrer/Lavoo split — see
+    flutterwave_split.get_flutterwave_processing_fee's docstring. Used by
+    checkout before opening the Flutterwave widget.
+    """
+    from subscriptions.flutterwave_split import get_flutterwave_processing_fee
+
+    base_amount = Decimal(str(body.amount))
+    fee = await asyncio.to_thread(
+        get_flutterwave_processing_fee, base_amount, body.currency, body.payment_type
+    )
+    if fee is None:
+        raise HTTPException(status_code=502, detail="Could not fetch Flutterwave's processing fee")
+
+    charge_amount = base_amount + fee
+    logger.info(
+        "[FLW fee preview] base=%s fee=%s currency=%s payment_type=%s -> charge=%s",
+        base_amount, fee, body.currency, body.payment_type, charge_amount,
+    )
+    return {
+        "status": "success",
+        "data": {
+            "base_amount": float(base_amount),
+            "fee": float(fee),
+            "charge_amount": float(charge_amount),
+        },
+    }
+
+
 # Note: The /flutterwave/callback endpoint below handles transfer webhooks
 
 
@@ -773,7 +879,7 @@ async def get_flutterwave_split_info(
     user_id = extract_user_id(current_user)
     split_config = get_split_config_for_referred_user(user_id, db)
     if not split_config:
-        return {"status": "success", "data": {"subaccount_id": None, "split_percentage": None}}
+        return {"status": "success", "data": {"subaccount_id": None, "main_account_charge_percentage": None}}
     return {"status": "success", "data": split_config}
 
 

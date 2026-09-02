@@ -327,11 +327,28 @@ def _attempt_flutterwave_renewal(user_id: int, plan: str, amount: float, currenc
 
             tx_ref = f"LAVOO-RENEW-{plan.upper()}-{int(datetime.now(timezone.utc).timestamp())}-{secrets.token_hex(3).upper()}"
             parts = (user.name or "Customer Name").split()
+
+            # Gross up the charge by Flutterwave's own processing fee + VAT
+            # (NGN only — the same reasoning as the initial-checkout path in
+            # subscriptions/flutterwave.py) so the card on file absorbs the
+            # fee and the full `amount` (the real plan price) is what's left
+            # for the referrer/Lavoo split. new_sub.amount below still uses
+            # the original `amount` param, not this inflated charge — a
+            # renewal has no frontend checkout round-trip to echo a base
+            # amount back through meta, so it's simply kept as a local
+            # variable instead.
+            charge_amount = amount
+            if currency == "NGN":
+                from subscriptions.flutterwave_split import get_flutterwave_processing_fee
+                fee = get_flutterwave_processing_fee(Decimal(str(amount)), currency, "card")
+                if fee is not None:
+                    charge_amount = float(Decimal(str(amount)) + fee)
+
             payload = {
                 "token": user.flutterwave_card_token,
                 "currency": currency,
                 "country": "NG",
-                "amount": amount,
+                "amount": charge_amount,
                 "email": user.email,
                 "first_name": parts[0],
                 "last_name": parts[-1] if len(parts) > 1 else ".",
@@ -351,7 +368,7 @@ def _attempt_flutterwave_renewal(user_id: int, plan: str, amount: float, currenc
             split_config = get_split_config_for_referred_user(user_id, db)
             if split_config:
                 payload["subaccounts"] = [
-                    build_split_config(split_config["subaccount_id"], split_config["split_percentage"])
+                    build_split_config(split_config["subaccount_id"], split_config["main_account_charge_percentage"])
                 ]
             headers = {
                 "Authorization": f"Bearer {secret_key}",
@@ -1151,6 +1168,9 @@ def run_heavy_schema_migrations():
             "ALTER TABLE discussion_replies ADD COLUMN IF NOT EXISTS tagged_user_ids JSON DEFAULT '[]'",
             "ALTER TABLE payout_accounts ADD COLUMN IF NOT EXISTS flutterwave_subaccount_id VARCHAR(255)",
             "ALTER TABLE payout_accounts ADD COLUMN IF NOT EXISTS subaccount_status VARCHAR(50)",
+            "ALTER TABLE payouts ADD COLUMN IF NOT EXISTS original_currency VARCHAR(10)",
+            "ALTER TABLE payouts ADD COLUMN IF NOT EXISTS original_amount NUMERIC(10,2)",
+            "ALTER TABLE payouts ADD COLUMN IF NOT EXISTS fx_rate NUMERIC(18,6)",
             "UPDATE users SET username = LOWER(REGEXP_REPLACE(name, '[^a-zA-Z0-9]', '', 'g')) WHERE username IS NULL OR username = ''",
             "CREATE TABLE IF NOT EXISTS founder_insight_cards (id SERIAL PRIMARY KEY, highlight_stat VARCHAR(50), insight_text TEXT NOT NULL, source VARCHAR(255) NOT NULL, category VARCHAR(50) DEFAULT 'african_tech', accent_color VARCHAR(20) DEFAULT '#e87a02', is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)"
         ]
