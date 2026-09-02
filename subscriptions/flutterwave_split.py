@@ -128,6 +128,44 @@ def get_flutterwave_fx_rate(source_currency: str, destination_currency: str) -> 
         return None
 
 
+def find_existing_flutterwave_subaccount(account_number: str, bank_code: str) -> Optional[str]:
+    """Search Flutterwave's own subaccount list for one already registered
+    against this exact bank account, and return its subaccount_id. Used as
+    the recovery path when create_flutterwave_subaccount hits "already
+    exists" — confirmed directly (2026-09-02): a real subaccount existed on
+    Flutterwave for a referrer's bank details that our own PayoutAccount row
+    had no record of, so no split was ever possible for them despite a
+    genuinely working subaccount sitting right there. Paginated defensively
+    (capped at 20 pages / ~2000 subaccounts) — small in practice today, but
+    a hard cap keeps this from looping forever if that ever changes.
+    """
+    if not FLUTTERWAVE_SECRET_KEY:
+        return None
+    try:
+        for page in range(1, 21):
+            resp = requests.get(
+                f"{FLUTTERWAVE_BASE_URL}/subaccounts",
+                params={"page": page},
+                headers={"Authorization": f"Bearer {FLUTTERWAVE_SECRET_KEY}"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if data.get("status") != "success":
+                return None
+            for row in data.get("data", []) or []:
+                if str(row.get("account_number")) == str(account_number) and str(row.get("account_bank")) == str(bank_code):
+                    return row.get("subaccount_id")
+            total_pages = (data.get("meta", {}) or {}).get("page_info", {}).get("total_pages", 1)
+            if page >= total_pages:
+                break
+        return None
+    except requests.RequestException as e:
+        logger.error("[FLW subaccount] lookup failed: %s", e)
+        return None
+
+
 def create_flutterwave_subaccount(
     account_number: str,
     bank_code: str,
@@ -181,6 +219,25 @@ def create_flutterwave_subaccount(
             resp.status_code, resp.text[:500],
         )
         if resp.status_code not in (200, 201):
+            # Flutterwave rejects creating a second subaccount for a bank
+            # account that already has one ("A subaccount with the account
+            # number and bank already exists") — hit directly, for a
+            # referrer whose subaccount was created in an earlier session
+            # but whose id was never saved to our own PayoutAccount row
+            # (e.g. before flutterwave_subaccount_id existed as a column,
+            # or a save that silently failed). Recover the existing
+            # subaccount's id instead of giving up — the row it belongs to
+            # is real and already correctly split-configured on
+            # Flutterwave's side, our database was just the thing out of
+            # sync with it.
+            existing_id = find_existing_flutterwave_subaccount(account_number, bank_code)
+            if existing_id:
+                logger.info(
+                    "[FLW subaccount] recovered existing subaccount instead of creating a duplicate | "
+                    "account=%s bank=%s subaccount_id=%s",
+                    account_number, bank_code, existing_id,
+                )
+                return {"subaccount_id": existing_id}
             return None
         data = resp.json()
         if data.get("status") != "success":
@@ -202,17 +259,25 @@ def get_split_config_for_referred_user(referred_user_id: int, db: Session) -> Op
     charges 100% to Lavoo, same as before this module existed.
 
     main_account_charge_percentage is deliberately named for exactly what
-    Flutterwave's API does with it, not what the referrer earns — this is
-    the field previous code got backwards. Flutterwave's own
-    `transaction_charge` (with transaction_charge_type: "percentage") is
-    the cut the MAIN account keeps; the subaccount automatically gets
-    whatever remains, not the number you pass. A referrer earning 40%
-    (COMMISSION_RATE_STANDARD) means Lavoo's main account keeps the other
-    60% — so this must be 100 - the referrer's rate, not the referrer's
-    rate itself. Confirmed directly against Flutterwave's own dashboard:
-    passing the referrer's 40% as transaction_charge produced "Your share:
-    40%, Subaccount's share: 60%" — inverted from the intended 40%
-    referrer / 60% Lavoo split.
+    Flutterwave's API does with it, not what the referrer earns. Two
+    separate bugs lived here, fixed at two different times — both
+    confirmed directly against real behavior, not just documentation:
+
+    1. DIRECTION: Flutterwave's own `transaction_charge` (with
+       transaction_charge_type: "percentage") is the cut the MAIN account
+       keeps; the subaccount automatically gets whatever remains, not the
+       number you pass. A referrer earning 40% (COMMISSION_RATE_STANDARD)
+       means Lavoo's main account keeps the other 60% — so this must be
+       1 - the referrer's rate, not the referrer's rate itself. Confirmed
+       against Flutterwave's dashboard: passing the referrer's 40% produced
+       "Your share: 40%, Subaccount's share: 60%" — inverted.
+
+    2. SCALE: the value must be a decimal FRACTION (0.6 for 60%), not a
+       0-100 number. Flutterwave's docs state it plainly: "To collect a 9%
+       commission, transaction_charge_type will be 'percentage' and
+       transaction_charge will be 0.09." Sending 60 for "60%" was read as a
+       6000% charge — confirmed directly at checkout: "The total subaccount
+       transaction charge cannot be greater than the amount to be charged."
     """
     from database.pg_models import PayoutAccount, Referral
     from subscriptions.commission_service import CommissionService
@@ -289,14 +354,23 @@ def get_split_config_for_referred_user(referred_user_id: int, db: Session) -> Op
         return None
 
     rate = CommissionService._get_rate_for_referrer(referral.referrer_id, db)
+    main_account_charge_fraction = float(Decimal("1") - rate)
     logger.info(
         f"[FLW split] split config ready | referrer={referral.referrer_id} "
         f"subaccount={account.flutterwave_subaccount_id} referrer_rate={float(rate) * 100}% "
-        f"main_account_keeps={float((Decimal('1') - rate) * 100)}%"
+        f"main_account_keeps={main_account_charge_fraction * 100}% (sent to Flutterwave as {main_account_charge_fraction})"
     )
     return {
         "subaccount_id": account.flutterwave_subaccount_id,
-        "main_account_charge_percentage": float((Decimal("1") - rate) * 100),
+        # A DECIMAL FRACTION (0.6 for 60%), not a 0-100 number — Flutterwave's
+        # own docs are explicit: "To collect a 9% commission,
+        # transaction_charge_type will be 'percentage' and transaction_charge
+        # will be 0.09." Sending 60 (meant as "60%") was read literally as a
+        # 6000% charge, which is why checkout showed "the total subaccount
+        # transaction charge cannot be greater than the amount to be
+        # charged" — the *0-100 scaling itself* was the bug, not the 40/60
+        # split direction fixed earlier.
+        "main_account_charge_percentage": main_account_charge_fraction,
     }
 
 
@@ -305,11 +379,12 @@ def build_split_config(subaccount_id: str, main_account_charge_percentage: float
     shared by the tokenized renewal charge (server-side) and the split-info
     endpoint the frontend reads before building its checkout config.
 
-    main_account_charge_percentage must already be Lavoo's cut (see
-    get_split_config_for_referred_user's docstring) — this function does
-    not invert it; it only shapes it into the field name Flutterwave's API
-    expects (`transaction_charge`, which — despite the name — is what the
-    MAIN account keeps, not what the subaccount receives)."""
+    main_account_charge_percentage must already be Lavoo's cut, as a
+    decimal fraction (0.6, not 60) — see get_split_config_for_referred_user's
+    docstring for both of those. This function does not transform it at
+    all; it only shapes it into the field name Flutterwave's API expects
+    (`transaction_charge`, which — despite the name — is what the MAIN
+    account keeps, not what the subaccount receives)."""
     return {
         "id": subaccount_id,
         "transaction_charge_type": "percentage",
