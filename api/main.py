@@ -78,7 +78,7 @@ from api.routes import dependencies
 from api.routes.auth import login, signup, forgot_password, google_oauth
 from api.routes.decision_engine import analyzer as business_analyzer
 from api.routes.user import stats as user_stats, alerts, insights, referrals, earnings, settings as user_settings, missions as user_missions, profile as user_profile
-from api.routes.support import customer_service, reviews
+from api.routes.support import customer_service, reviews, contact as support_contact
 from api.routes.admin import admin, security, firewall_scanner, revenue, users, dashboard, settings, permissions, content as admin_content
 
 # Payment routes
@@ -1367,6 +1367,8 @@ app.include_router(paypal.router) # endpoints start with /api/paypal
 app.include_router(flutterwave.router) # internally prefix /api/payments
 app.include_router(stripe.router) # internally prefix /api/stripe
 app.include_router(customer_service.router, prefix="/api") # internally prefix /api/customer-service
+app.include_router(support_contact.router, prefix="/api") # endpoints: /api/support/contact
+app.include_router(support_contact.router) # endpoints: /support/contact
 app.include_router(reviews.router, prefix="/api") # endpoints: /api/reviews, /api/admin/reviews
 app.include_router(alerts.router, prefix="/api")
 app.include_router(insights.router, prefix="/api")  # internally prefix /api
