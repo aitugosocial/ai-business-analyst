@@ -830,7 +830,7 @@ class PayoutAccount(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True)
-    payment_method = Column("default_payout_method", String(50), nullable=False)
+    payment_method = Column("default_payout_method", String(50), nullable=True)
 
     # Stripe fields
     stripe_account_id = Column(String(255), nullable=True)
