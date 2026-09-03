@@ -1168,6 +1168,7 @@ def run_heavy_schema_migrations():
             "ALTER TABLE discussion_replies ADD COLUMN IF NOT EXISTS tagged_user_ids JSON DEFAULT '[]'",
             "ALTER TABLE payout_accounts ADD COLUMN IF NOT EXISTS flutterwave_subaccount_id VARCHAR(255)",
             "ALTER TABLE payout_accounts ADD COLUMN IF NOT EXISTS subaccount_status VARCHAR(50)",
+            "ALTER TABLE payout_accounts ALTER COLUMN default_payout_method DROP NOT NULL",
             "ALTER TABLE payouts ADD COLUMN IF NOT EXISTS original_currency VARCHAR(10)",
             "ALTER TABLE payouts ADD COLUMN IF NOT EXISTS original_amount NUMERIC(10,2)",
             "ALTER TABLE payouts ADD COLUMN IF NOT EXISTS fx_rate NUMERIC(18,6)",
