@@ -354,40 +354,25 @@ async def get_all_payout_accounts(
     return {"status": "success", "data": [_serialise(r) for r in rows]}
 
 
-@router.delete("/payout-account/{account_id}")
-async def delete_payout_account_by_id(
-    account_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Delete a specific payout account row by its primary key."""
-    user_id = extract_user_id(current_user)
-    account = db.query(PayoutAccount).filter(
-        PayoutAccount.id == account_id,
-        PayoutAccount.user_id == user_id,
-    ).first()
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
-    db.delete(account)
-    db.commit()
-    from api.services.notification_service import NotificationService
-    NotificationService.create_notification(
-        db=db, user_id=user_id,
-        type="payout_account_removed",
-        title="🏦 Bank Account Removed",
-        message="A bank account has been removed from your payout accounts.",
-        link="/dashboard/upgrade",
-    )
-    logger.info("[payout-account] deleted id=%s user=%s", account_id, user_id)
-    return {"status": "success", "message": "Account removed"}
-
-
 @router.delete("/payout-account/bank")
 async def remove_bank_payout_account(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Remove bank/Flutterwave payout account details."""
+    """Remove bank/Flutterwave payout account details.
+
+    Registered BEFORE /payout-account/{account_id} below, deliberately —
+    FastAPI/Starlette match routes in registration order, and a literal
+    path like this one is a valid match for a parameterized path with the
+    same prefix. With {account_id} registered first (as this used to be),
+    a DELETE to /payout-account/bank was matched by THAT route instead,
+    with "bank" bound to account_id — which FastAPI then tried to coerce
+    to int, failing validation and returning 422 Unprocessable Entity
+    before this function's body ever ran. Reported directly: a real
+    "remove bank account" click producing exactly that 422. The fix is
+    ordering, not the body of either function — a more specific literal
+    route must be declared before a parameterized one that could shadow it.
+    """
     try:
         user_id = extract_user_id(current_user)
         payout_account = db.query(PayoutAccount).filter(
@@ -429,6 +414,36 @@ async def remove_bank_payout_account(
             status_code=500,
             detail=f"Failed to remove bank account: {str(e)}",
         )
+
+
+@router.delete("/payout-account/{account_id}")
+async def delete_payout_account_by_id(
+    account_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a specific payout account row by its primary key. Must stay
+    registered AFTER /payout-account/bank above — see that route's
+    docstring for why the order matters."""
+    user_id = extract_user_id(current_user)
+    account = db.query(PayoutAccount).filter(
+        PayoutAccount.id == account_id,
+        PayoutAccount.user_id == user_id,
+    ).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    db.delete(account)
+    db.commit()
+    from api.services.notification_service import NotificationService
+    NotificationService.create_notification(
+        db=db, user_id=user_id,
+        type="payout_account_removed",
+        title="🏦 Bank Account Removed",
+        message="A bank account has been removed from your payout accounts.",
+        link="/dashboard/upgrade",
+    )
+    logger.info("[payout-account] deleted id=%s user=%s", account_id, user_id)
+    return {"status": "success", "message": "Account removed"}
 
 
 @router.post("/request-payout")
