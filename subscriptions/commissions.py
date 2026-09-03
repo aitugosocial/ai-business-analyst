@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Depends, status, Request, Header, 
 import logging
 logger = logging.getLogger(__name__)
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime, timezone
@@ -277,16 +278,35 @@ async def get_payout_account(
         if not user_id:
             raise HTTPException(status_code=401, detail="User ID not found in token")
             
+        # A user can hold several PayoutAccount rows (multiple saved bank
+        # accounts — see the /payout-account POST insert-per-account logic
+        # above). An unordered .first() here would happily return a stale,
+        # emptied-out row left behind by a bank removal (see the DELETE
+        # /payout-account/bank docstring) instead of the account the user
+        # actually has configured, making a freshly added account invisible
+        # on the upgrade page. Prefer the most recently updated row that
+        # actually has something configured on it; fall back to any row
+        # (including an empty one) only if none do.
         payout_account = db.query(PayoutAccount).filter(
-            PayoutAccount.user_id == user_id
-        ).first()
-        
+            PayoutAccount.user_id == user_id,
+            or_(
+                PayoutAccount.bank_name.isnot(None),
+                PayoutAccount.stripe_account_id.isnot(None),
+                PayoutAccount.paypal_email.isnot(None),
+            ),
+        ).order_by(PayoutAccount.updated_at.desc().nullslast(), PayoutAccount.id.desc()).first()
+
+        if not payout_account:
+            payout_account = db.query(PayoutAccount).filter(
+                PayoutAccount.user_id == user_id
+            ).order_by(PayoutAccount.updated_at.desc().nullslast(), PayoutAccount.id.desc()).first()
+
         if not payout_account:
             return {
                 "status": "not_configured",
                 "message": "No payout account configured"
             }
-        
+
         account_num = str(payout_account.account_number) if payout_account.account_number else ""
         has_bank = bool(getattr(payout_account, "bank_name", None) and account_num)
         payload = {
@@ -372,26 +392,31 @@ async def remove_bank_payout_account(
     "remove bank account" click producing exactly that 422. The fix is
     ordering, not the body of either function — a more specific literal
     route must be declared before a parameterized one that could shadow it.
+
+    Deletes the row outright rather than nulling its fields in place.
+    Nulling used to leave an empty, all-null PayoutAccount row behind —
+    harmless on its own, but every unordered `.filter(user_id=...).first()`
+    lookup elsewhere (GET /payout-account included) could then return that
+    dead row instead of a real one, e.g. making a bank account added right
+    after a removal invisible on the upgrade page. Since a Flutterwave bank
+    account never shares a row with Stripe/PayPal details (each is inserted
+    as its own row — see POST /payout-account above), deleting the row is
+    safe and leaves nothing stale to trip up future lookups.
     """
     try:
         user_id = extract_user_id(current_user)
         payout_account = db.query(PayoutAccount).filter(
-            PayoutAccount.user_id == user_id
-        ).first()
+            PayoutAccount.user_id == user_id,
+            or_(
+                PayoutAccount.bank_name.isnot(None),
+                PayoutAccount.account_number.isnot(None),
+            ),
+        ).order_by(PayoutAccount.updated_at.desc().nullslast(), PayoutAccount.id.desc()).first()
 
-        if not payout_account or not (payout_account.bank_name or payout_account.account_number):
+        if not payout_account:
             raise HTTPException(status_code=404, detail="No bank account configured")
 
-        payout_account.bank_name = None
-        payout_account.account_number = None
-        payout_account.account_name = None
-        payout_account.bank_code = None
-
-        if payout_account.payment_method in ("flutterwave", None) and not payout_account.stripe_account_id:
-            payout_account.payment_method = None
-            payout_account.is_verified = False
-
-        payout_account.updated_at = datetime.now(timezone.utc)
+        db.delete(payout_account)
         db.commit()
 
         from api.services.notification_service import NotificationService
