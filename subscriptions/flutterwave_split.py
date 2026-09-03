@@ -49,6 +49,20 @@ SPLIT_META_KEY = "lavoo_split_subaccount_id"
 BASE_AMOUNT_META_KEY = "lavoo_base_amount"
 
 
+# Nigerian VAT on Flutterwave's processing fee (FIRS-mandated, applied by
+# Flutterwave to its own fee, not to the transaction amount). Confirmed
+# directly, 2026-09-03, two independent ways: (1) a live /transactions/fee
+# response only ever returns "fee" (6.12 for a 306 NGN charge) — no VAT
+# field exists in that response at all, despite this function's old
+# docstring claiming it already covered "fee + VAT". (2) a real settled
+# transaction's receipt showed "Transaction fee: NGN 6.12" AND a separate
+# "VAT: NGN 0.46" — and 6.12 * 0.075 = 0.459 ≈ 0.46, to the kobo. Omitting
+# this was the exact gap behind the very first report of this feature ("in
+# the completed 300 naira transaction, the fee and vat is about 6.45" —
+# 6 (fee on 300) + 0.45 (VAT) = 6.45, not just the bare fee).
+FLUTTERWAVE_FEE_VAT_RATE = Decimal("0.075")
+
+
 def get_flutterwave_processing_fee(
     amount: Decimal, currency: str, payment_type: str = "card"
 ) -> Optional[Decimal]:
@@ -61,6 +75,10 @@ def get_flutterwave_processing_fee(
     charging the bare `amount` unmodified rather than blocking checkout —
     an un-grossed-up charge is a smaller inconvenience (Lavoo/referrer
     absorb the fee, same as before this feature) than a broken payment flow.
+
+    The returned value is fee + VAT (see FLUTTERWAVE_FEE_VAT_RATE above) —
+    the API's own "fee" field is VAT-exclusive, which previously left every
+    gross-up short by exactly the VAT portion.
     """
     if not FLUTTERWAVE_SECRET_KEY:
         return None
@@ -80,7 +98,9 @@ def get_flutterwave_processing_fee(
         fee = data.get("data", {}).get("fee")
         if fee is None:
             return None
-        return Decimal(str(fee))
+        fee = Decimal(str(fee))
+        vat = (fee * FLUTTERWAVE_FEE_VAT_RATE).quantize(Decimal("0.01"))
+        return fee + vat
     except requests.RequestException as e:
         logger.error("[FLW fee] request failed: %s", e)
         return None
@@ -171,6 +191,7 @@ def create_flutterwave_subaccount(
     bank_code: str,
     business_name: str,
     business_email: str,
+    main_account_charge_percentage: float,
 ) -> Optional[dict]:
     """
     Register a Flutterwave Subaccount for a payout account. Returns the
@@ -181,6 +202,25 @@ def create_flutterwave_subaccount(
     common real failure is a bad/unsupported bank_code, which the existing
     verify_bank_account endpoint (used by the frontend's bank-account form)
     should already have caught before this ever runs.
+
+    main_account_charge_percentage sets the subaccount's own STORED default
+    split (its `split_value`), as a decimal fraction — same meaning and
+    scale as build_split_config's main_account_charge_percentage (Lavoo's
+    cut). This used to be hardcoded to 0.40 regardless of the referrer's
+    actual rate. The per-transaction override (build_split_config, sent on
+    every real charge) settles correctly — confirmed directly, 2026-09-03,
+    against a real transaction's actual settled amounts (subaccount
+    received ~40% of the settled total, matching the referrer's Commission
+    ledger entry to the naira). But Flutterwave's own dashboard summarises
+    a subaccount using its STORED default, not the last transaction's
+    override — so with the old hardcoded 0.40 that summary permanently
+    read "Your share: 40%, Subaccount's share: 60%" even though every real
+    charge was correctly splitting 60/40, which is exactly the "why is my
+    share still 40%" confusion reported directly. Passing the real
+    computed value here keeps that dashboard summary honest, and removes
+    the one path (a charge that somehow reaches Flutterwave with no
+    per-transaction override at all) where the stored default is what
+    actually gets used to move money.
     """
     if not FLUTTERWAVE_SECRET_KEY:
         logger.error("[FLW subaccount] secret key not configured")
@@ -205,12 +245,10 @@ def create_flutterwave_subaccount(
                 "business_mobile": "N/A",
                 "country": "NG",
                 "split_type": "percentage",
-                # Fallback split value on the subaccount itself. Always
-                # overridden per-transaction (build_split_config below) with
-                # the actual referrer/partner rate from commission_service —
-                # this only applies if a charge is ever sent without an
-                # explicit transaction_charge, which should not happen.
-                "split_value": float(Decimal("0.40")),
+                # Stored default split on the subaccount itself — see this
+                # function's docstring for why this must already be
+                # correct, not just a same-value safety net.
+                "split_value": float(main_account_charge_percentage),
             },
             timeout=20,
         )
@@ -304,6 +342,14 @@ def get_split_config_for_referred_user(referred_user_id: int, db: Session) -> Op
         .first()
     )
 
+    # Computed up front (not just after the self-heal block below) so a
+    # freshly self-healed subaccount is created with the correct stored
+    # default split too — see create_flutterwave_subaccount's docstring for
+    # why that stored default matters even though a correct per-transaction
+    # override is also sent on every charge.
+    rate = CommissionService._get_rate_for_referrer(referral.referrer_id, db)
+    main_account_charge_fraction = float(Decimal("1") - rate)
+
     if not account:
         # Self-heal: a verified Flutterwave bank account with no subaccount
         # yet is a real, observed case — id 1 (the very first referrer this
@@ -336,6 +382,7 @@ def get_split_config_for_referred_user(referred_user_id: int, db: Session) -> Op
                 bank_code=candidate.bank_code,
                 business_name=candidate.account_name or (referrer_user.name if referrer_user else "Lavoo Referral Partner"),
                 business_email=referrer_user.email if referrer_user else "",
+                main_account_charge_percentage=main_account_charge_fraction,
             )
             if subaccount and subaccount.get("subaccount_id"):
                 candidate.flutterwave_subaccount_id = subaccount["subaccount_id"]
@@ -353,8 +400,6 @@ def get_split_config_for_referred_user(referred_user_id: int, db: Session) -> Op
         logger.info(f"[FLW split] no usable subaccount | referrer={referral.referrer_id} — no split, falls back to pending commission")
         return None
 
-    rate = CommissionService._get_rate_for_referrer(referral.referrer_id, db)
-    main_account_charge_fraction = float(Decimal("1") - rate)
     logger.info(
         f"[FLW split] split config ready | referrer={referral.referrer_id} "
         f"subaccount={account.flutterwave_subaccount_id} referrer_rate={float(rate) * 100}% "

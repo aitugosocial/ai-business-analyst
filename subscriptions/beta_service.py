@@ -94,15 +94,15 @@ class BetaService:
     
     @staticmethod
     def get_grace_period_days() -> int:
-        """Get grace period duration (default: 5 days)"""
+        """Get grace period duration (default: 7 days)"""
         env_vars = BetaService._get_dynamic_env()
         days = env_vars.get("GRACE_PERIOD_DAYS")
         if days is None:
-            days = os.getenv("GRACE_PERIOD_DAYS", "5")
+            days = os.getenv("GRACE_PERIOD_DAYS", "7")
         try:
             return int(days)
         except:
-            return 5
+            return 7
     
     @staticmethod
     def calculate_grace_period_end(launch_date: datetime) -> datetime:
@@ -241,7 +241,7 @@ class BetaService:
                     "is_beta_user": True
                 }
         
-        # GRACE PERIOD (Launch Day + 5 Days OR Signup Day + 5 Days)
+        # GRACE PERIOD (Launch Day + N Days OR Signup Day + N Days (N = GRACE_PERIOD_DAYS, default 7))
         
 
         if BetaService.is_in_grace_period(user):
@@ -349,8 +349,8 @@ class BetaService:
     def initialize_grace_period(user: User, db: Session):
         """
         Initialize grace period based on user type:
-        - Beta users: 5 days from launch date
-        - New users: 5 days from signup date
+        - Beta users: GRACE_PERIOD_DAYS (default 7) from launch date
+        - New users: GRACE_PERIOD_DAYS (default 7) from signup date
         """
         is_beta = BetaService.is_beta_mode()
         launch_date = BetaService.get_launch_date()

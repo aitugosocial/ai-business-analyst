@@ -198,12 +198,20 @@ async def setup_payout_account(
         subaccount_created = False
         if account_data.payment_method == 'flutterwave':
             from subscriptions.flutterwave_split import create_flutterwave_subaccount
+            from subscriptions.commission_service import CommissionService
             requester = db.query(User).filter(User.id == user_id).first()
+            # This user IS the referrer setting up their own payout account —
+            # the subaccount's stored default split must reflect their own
+            # rate, same computation used everywhere else (see
+            # flutterwave_split.py::create_flutterwave_subaccount docstring).
+            referrer_rate = CommissionService._get_rate_for_referrer(user_id, db)
+            main_account_charge_fraction = float(Decimal("1") - referrer_rate)
             subaccount = create_flutterwave_subaccount(
                 account_number=account_data.account_number,
                 bank_code=account_data.bank_code or "",
                 business_name=account_data.account_name or (requester.name if requester else ""),
                 business_email=requester.email if requester else "",
+                main_account_charge_percentage=main_account_charge_fraction,
             )
             if subaccount and subaccount.get("subaccount_id"):
                 payout_account.flutterwave_subaccount_id = subaccount["subaccount_id"]
