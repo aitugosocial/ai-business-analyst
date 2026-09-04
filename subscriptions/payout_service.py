@@ -276,7 +276,7 @@ class PayoutService:
                 "account_number": payout_account.account_number,
                 "amount": float(payout.amount),
                 "currency": payout.currency,
-                "narration": f"Commission payout - {payout.id}",
+                "narration": f"Lavoo Builder Bonus payout #{payout.id}",
                 "reference": f"PAYOUT-{payout.id}-{int(datetime.now(timezone.utc).timestamp())}",
                 "callback_url": f"{os.getenv('BASE_URL')}/api/payouts/flutterwave/callback",
                 "beneficiary_name": payout_account.account_name or payout.recipient_name
@@ -362,20 +362,41 @@ class PayoutService:
 
 
     @staticmethod
-    def complete_flutterwave_payout( payout_id: int, background_tasks: BackgroundTasks, transfer_status: str, db: Session) -> None:
+    def complete_flutterwave_payout(
+        payout_id: int, background_tasks: BackgroundTasks, transfer_status: str, db: Session,
+        settled_amount: float | None = None, fee: float | None = None,
+    ) -> None:
         """
-        Complete Flutterwave payout after webhook confirmation
+        Complete Flutterwave payout after webhook confirmation.
+
+        settled_amount/fee come straight from Flutterwave's webhook payload
+        (see flutterwave.py's flutterwave_payout_callback) — recorded as-is
+        so a gap between what was requested (payout.amount) and what
+        actually arrived is visible after the fact, instead of silently
+        lost the way it previously was (a referrer reported receiving
+        119.73 NGN for a requested 120 NGN payout with nothing on file to
+        explain it).
         """
         payout = db.query(Payout).filter(Payout.id == payout_id).first()
-        
+
         if not payout:
             logger.error(f"Payout {payout_id} not found")
             return
-        
+
         if transfer_status == "successful":
             payout.status = 'completed'
             payout.completed_at = datetime.now(timezone.utc)
-            
+            if settled_amount is not None:
+                payout.provider_settled_amount = Decimal(str(settled_amount))
+            if fee is not None:
+                payout.provider_fee = Decimal(str(fee))
+            if settled_amount is not None and Decimal(str(settled_amount)) != payout.amount:
+                logger.warning(
+                    f"[FLW payout] requested={payout.amount} {payout.currency} but Flutterwave "
+                    f"settled={settled_amount} (fee={fee}) for payout {payout_id} — dashboard/email "
+                    f"still show the requested amount; provider_settled_amount now has the real figure"
+                )
+
             # Update commissions
             commissions = db.query(Commission).filter(
                 Commission.payout_id == payout.id

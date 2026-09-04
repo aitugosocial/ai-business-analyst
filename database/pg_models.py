@@ -764,6 +764,26 @@ class Referral(Base):
     referred_user = relationship("User",foreign_keys=[referred_user_id], back_populates="referred_by")
 
 
+'''Pending Signups Table — holds a not-yet-real account until its email is
+verified via a Resend code (see api/routes/auth/signup.py). Nothing here
+becomes a real User row until POST /signup/verify succeeds; this exists
+specifically so a fake/typo'd email can never complete registration.'''
+class PendingSignup(Base):
+    __tablename__ = "pending_signups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, nullable=False)
+    password_hash = Column(String, nullable=False)
+    confirm_password_hash = Column(String, nullable=False)
+    company_name = Column(String, nullable=True)
+    referrer_code = Column(String, nullable=True)
+    verification_code = Column(String(6), nullable=False)
+    code_expires_at = Column(DateTime(timezone=True), nullable=False)
+    attempts = Column(Integer, default=0)  # failed verify attempts against this code
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 '''Commissions Table'''
 class Commission(Base):
     __tablename__ = "commissions"
@@ -819,6 +839,16 @@ class Payout(Base):
     original_currency = Column(String(10), nullable=True)
     original_amount = Column(Numeric(precision=10, scale=2), nullable=True)
     fx_rate = Column(Numeric(precision=18, scale=6), nullable=True)
+
+    # What Flutterwave's transfer-completion webhook actually reports —
+    # `amount` is what was requested (may not be what settles: a referrer
+    # reported receiving 119.73 NGN for a 120 NGN payout, and the webhook
+    # handler previously read only `status`, discarding whatever `data`
+    # said about the real settled amount/fee, so there was no way to see
+    # why. NULL until a completion webhook arrives; NULL forever for a
+    # provider/version whose webhook doesn't report these fields.
+    provider_settled_amount = Column(Numeric(precision=10, scale=2), nullable=True)
+    provider_fee = Column(Numeric(precision=10, scale=2), nullable=True)
 
     # Relationships
     user = relationship("User", foreign_keys=[user_id])

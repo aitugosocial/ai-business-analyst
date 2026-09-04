@@ -859,9 +859,29 @@ async def flutterwave_payout_callback(
             from subscriptions.payout_service import PayoutService
             from database.pg_models import Payout, Commission
 
+            # Flutterwave's webhook `data` reports what actually settled —
+            # `amount`/`fee` at the top level for the older v3-style API
+            # this integration otherwise uses (the transfer request payload
+            # above is plain flat fields, not v4's nested amount/fee
+            # objects), so read both shapes defensively rather than assume
+            # one. Previously nothing here was captured at all: a referrer
+            # reported receiving 119.73 NGN for a 120 NGN payout with no way
+            # to see why, because only `status` was ever read from this
+            # payload — everything else Flutterwave sent was discarded.
+            raw_amount = transfer_data.get("amount")
+            raw_fee = transfer_data.get("fee")
+            settled_amount = raw_amount.get("value") if isinstance(raw_amount, dict) else raw_amount
+            fee = raw_fee.get("value") if isinstance(raw_fee, dict) else raw_fee
+
             if event_type == "transfer.completed" or transfer_status == "successful":
-                PayoutService.complete_flutterwave_payout(payout_id, background_tasks, "successful", db)
-                logger.info("[FLW webhook] payout %s completed", payout_id)
+                PayoutService.complete_flutterwave_payout(
+                    payout_id, background_tasks, "successful", db,
+                    settled_amount=settled_amount, fee=fee,
+                )
+                logger.info(
+                    "[FLW webhook] payout %s completed | settled_amount=%s fee=%s (per Flutterwave's webhook payload)",
+                    payout_id, settled_amount, fee,
+                )
             elif event_type == "transfer.failed" or transfer_status == "failed":
                 PayoutService.complete_flutterwave_payout(payout_id, background_tasks, "failed", db)
                 logger.warning("[FLW webhook] payout %s failed", payout_id)

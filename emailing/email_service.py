@@ -38,6 +38,15 @@ class MailerLiteEmailService:
         self.smtp_tls = os.getenv("SMTP_TLS", "true").lower() == "true"
         self.smtp_ssl = os.getenv("SMTP_SSL", "false").lower() == "true"
 
+        # Resend — used specifically for the signup email-verification code
+        # (see send_verification_code below), not the general _send_email
+        # fallback chain above, so this doesn't change delivery behaviour
+        # for any of the other already-working transactional emails.
+        self.resend_api_key = os.getenv("RESEND_API_KEY")
+        self.resend_base_url = "https://api.resend.com"
+        if not self.resend_api_key:
+            logger.warning("⚠️ RESEND_API_KEY is not set - signup verification codes will fall back to MailerLite/SMTP/log")
+
         if not self.api_key and not self.smtp_host:
             logger.warning("⚠️ Neither MAILERLITE_API_KEY nor SMTP_HOST is set - emails will be logged only")
 
@@ -202,6 +211,88 @@ class MailerLiteEmailService:
         """
 
         text_content = f"Welcome to Lavoo Business Intelligence Engine!\n\nHi {name},\n\nWe're thrilled to have you on board!"
+
+        return self._send_email(user_email, name, subject, html_content, text_content)
+
+    def send_verification_code(self, user_email: str, name: str, code: str):
+        """
+        Send the signup email-verification code via Resend. Guards against
+        fake/typo'd signup emails: nothing creates a real account until the
+        code sent here is submitted back (see api/routes/auth/signup.py).
+        Falls back to _send_email's MailerLite/SMTP/log chain if
+        RESEND_API_KEY isn't set, so signup keeps working in an environment
+        without it configured (e.g. local dev).
+        """
+        subject = f"{code} is your Lavoo verification code"
+
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; }}
+                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+                .header {{
+                    background: linear-gradient(135deg, #f97316 0%, #ea580c 100%);
+                    color: white; padding: 30px; text-align: center;
+                    border-radius: 10px 10px 0 0;
+                }}
+                .content {{ background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; text-align: center; }}
+                .code {{
+                    display: inline-block; margin: 20px 0; padding: 16px 28px;
+                    background: white; border: 2px solid #f97316; border-radius: 8px;
+                    font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #ea580c;
+                }}
+                .footer {{ text-align: center; padding: 20px; color: #666; font-size: 12px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1 style="margin: 0;">Verify your email</h1>
+                </div>
+                <div class="content">
+                    <p>Hi {name},</p>
+                    <p>Enter this code to finish creating your Lavoo account:</p>
+                    <div class="code">{code}</div>
+                    <p style="color: #666; font-size: 13px;">This code expires in 15 minutes. If you didn't try to sign up for Lavoo, you can ignore this email.</p>
+                </div>
+                <div class="footer">
+                    <p>&copy; {datetime.now().year} Lavoo | The Business Doctor. All rights reserved.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        text_content = f"Your Lavoo verification code is {code}. It expires in 15 minutes."
+
+        if self.resend_api_key:
+            try:
+                headers = {
+                    "Authorization": f"Bearer {self.resend_api_key}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "from": f"{self.from_name} <{self.from_email}>",
+                    "to": [user_email],
+                    "subject": subject,
+                    "html": html_content,
+                    "text": text_content,
+                }
+                response = requests.post(
+                    f"{self.resend_base_url}/emails",
+                    headers=headers,
+                    json=payload,
+                    timeout=10,
+                )
+                if response.status_code in (200, 201, 202):
+                    logger.info(f"✅ Verification code sent via Resend to {user_email}")
+                    return {"success": True, "message_id": response.json().get("id", ""), "status": "sent"}
+                logger.warning(f"⚠️ Resend delivery returned {response.status_code}: {response.text[:200]}")
+            except Exception as e:
+                logger.warning(f"⚠️ Resend send failed: {str(e)}")
 
         return self._send_email(user_email, name, subject, html_content, text_content)
 
