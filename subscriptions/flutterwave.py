@@ -766,17 +766,37 @@ async def flutterwave_fee_preview(
     what's left for the referrer/Lavoo split — see
     flutterwave_split.get_flutterwave_processing_fee's docstring. Used by
     checkout before opening the Flutterwave widget.
+
+    Iterates instead of a single fee(base_amount) lookup: Flutterwave's fee
+    is itself a function of the amount charged, so a fee computed on the
+    bare base_amount is smaller than the fee actually deducted once the
+    charge is grossed up to base_amount + fee — a real gap, confirmed
+    directly (2026-09-03) against a live transaction: previewed fee left
+    the charge ~0.58 NGN short of the true base once Flutterwave's real
+    fee on the grossed-up amount was deducted, so "amount to be settled"
+    landed at 299.42 instead of the intended 300.00. Re-quoting the fee on
+    each successive candidate charge amount converges in 1-2 passes (fees
+    are percentage-plus-fixed, not compounding indefinitely) — capped at 4
+    passes as a hard bound, and stops early once the candidate stops
+    moving by more than half a kobo.
     """
     from subscriptions.flutterwave_split import get_flutterwave_processing_fee
 
     base_amount = Decimal(str(body.amount))
-    fee = await asyncio.to_thread(
-        get_flutterwave_processing_fee, base_amount, body.currency, body.payment_type
-    )
-    if fee is None:
-        raise HTTPException(status_code=502, detail="Could not fetch Flutterwave's processing fee")
+    charge_amount = base_amount
+    fee = None
+    for _ in range(4):
+        fee = await asyncio.to_thread(
+            get_flutterwave_processing_fee, charge_amount, body.currency, body.payment_type
+        )
+        if fee is None:
+            raise HTTPException(status_code=502, detail="Could not fetch Flutterwave's processing fee")
+        next_charge_amount = base_amount + fee
+        if abs(next_charge_amount - charge_amount) < Decimal("0.005"):
+            charge_amount = next_charge_amount
+            break
+        charge_amount = next_charge_amount
 
-    charge_amount = base_amount + fee
     logger.info(
         "[FLW fee preview] base=%s fee=%s currency=%s payment_type=%s -> charge=%s",
         base_amount, fee, body.currency, body.payment_type, charge_amount,
