@@ -292,6 +292,7 @@ def _compute_badges(
     build_room_contributions: int = 0,
     chops_gifted: int = 0,
     signal_contributions: int = 0,
+    execution_score: int = 75,
 ) -> list:
     """Return list of badge dicts with earned status based on real data."""
     all_badges = [
@@ -353,7 +354,7 @@ def _compute_badges(
             "icon": "Gift",
             "color": "#e87a02",
             "earned": True,
-            "description": "Gifted 100+ Chops to fellow founders in the community.",
+            "description": "Gifted 100+ Chops to fellow builders in the community.",
             "progress": 100,
             "reward": "+250 Chops"
         },
@@ -363,7 +364,7 @@ def _compute_badges(
             "icon": "Zap",
             "color": "#7c6cf0",
             "earned": signal_contributions >= 3,
-            "description": "Contributed 3+ high-impact insights or comments to The Signal.",
+            "description": "Contributed 3+ high impact insights or comments to The Signal.",
             "progress": min(100, int((signal_contributions / 3) * 100)),
             "reward": "+200 Chops"
         },
@@ -380,7 +381,7 @@ def _compute_badges(
         # ─── CONSISTENCY & MILESTONES ───
         {
             "id": "7_day_streak",
-            "name": "7-Day Streak",
+            "name": "7 Day Streak",
             "icon": "Flame",
             "color": "#e87a02",
             "earned": streak >= 7,
@@ -390,7 +391,7 @@ def _compute_badges(
         },
         {
             "id": "14_day_streak",
-            "name": "14-Day Streak",
+            "name": "14 Day Streak",
             "icon": "Flame",
             "color": "#2dbe6e",
             "earned": streak >= 14,
@@ -400,11 +401,11 @@ def _compute_badges(
         },
         {
             "id": "30_day_legend",
-            "name": "30-Day Legend",
+            "name": "30 Day Legend",
             "icon": "Flame",
             "color": "#ff9800",
             "earned": streak >= 30,
-            "description": "Maintained an impressive 30-day streak of daily shipping.",
+            "description": "Maintained cumulative 7-day shipping streaks across your builder journey.",
             "progress": min(100, int((streak / 30) * 100)),
             "reward": "+800 Chops"
         },
@@ -413,29 +414,29 @@ def _compute_badges(
             "name": "Speed Operator",
             "icon": "ShieldCheck",
             "color": "#12b5b0",
-            "earned": analyses_count >= 5,
-            "description": "Served and closed 5+ open decisions in the same week.",
-            "progress": min(100, int((analyses_count / 5) * 100)),
+            "earned": missions_done >= 5 or analyses_count >= 5,
+            "description": "Executed 5+ Decision Engine analysis missions in the same week.",
+            "progress": min(100, int((max(missions_done, analyses_count) / 5) * 100)),
             "reward": "+400 Chops"
         },
         {
             "id": "strategic_thinker",
-            "name": "Strategic Thinker",
+            "name": "Strategic Executor",
             "icon": "Brain",
             "color": "#7c6cf0",
-            "earned": analyses_count >= 25,
-            "description": "Completed 25+ business analyses with deep strategic execution.",
-            "progress": min(100, int((analyses_count / 25) * 100)),
+            "earned": missions_done >= 1 or analyses_count >= 1,
+            "description": "Completed an analysis mission within 7 days with insightful reflections.",
+            "progress": 100 if (missions_done >= 1 or analyses_count >= 1) else 0,
             "reward": "+600 Chops"
         },
         {
             "id": "elite_founder",
-            "name": "Elite Founder",
+            "name": "Elite Builder",
             "icon": "Crown",
             "color": "#e0a100",
-            "earned": analyses_count >= 100,
-            "description": "Completed 100+ Decision Engine analyses and joined top founders.",
-            "progress": min(100, int((analyses_count / 100) * 100)),
+            "earned": execution_score >= 75,
+            "description": "Maintained at least a 75% Builder Execution Score in the last 30 days.",
+            "progress": min(100, int((min(execution_score, 75) / 75) * 100)),
             "reward": "+1,500 Chops"
         },
     ]
@@ -521,7 +522,8 @@ async def get_user_progress(
             total_analyses, streak, analyses_30d, chops,
             build_room_contributions=build_room_contributions,
             chops_gifted=chops_gifted_sum,
-            signal_contributions=signal_contributions
+            signal_contributions=signal_contributions,
+            execution_score=execution_score,
         )
 
         return {
