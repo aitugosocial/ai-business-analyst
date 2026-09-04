@@ -9,8 +9,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-COMMISSION_RATE_STANDARD = Decimal("0.40")   # 40% — shown on screen, paid to regular users
+COMMISSION_RATE_STANDARD = Decimal("0.40")   # 40% — shown on screen, paid to subscribed regular users
 COMMISSION_RATE_PARTNER  = Decimal("0.50")   # 50% — paid internally to partners/staff (screen still shows 40%)
+COMMISSION_RATE_FREE     = Decimal("0.15")   # 15% — paid to a referrer who is on the free plan themselves
 
 # Keep legacy alias so any other callsite referencing COMMISSION_RATE still works
 COMMISSION_RATE = COMMISSION_RATE_STANDARD
@@ -21,13 +22,20 @@ class CommissionService:
     @staticmethod
     def _get_rate_for_referrer(referrer_id: int, db: Session) -> Decimal:
         """Return the actual payout rate for a referrer.
-        Partners/staff earn 50%; all other users earn 40%.
-        The displayed rate on the earnings dashboard is always 40%.
+        Partners/staff earn 50% regardless of their own subscription (the
+        displayed rate on the earnings dashboard still shows 40% for them,
+        same as before). Otherwise the rate depends on the referrer's own
+        subscription: an active/paying referrer earns the standard 40%; a
+        referrer on the free plan earns 15%.
         """
         referrer = db.query(User).filter(User.id == referrer_id).first()
-        if referrer and getattr(referrer, "is_partner", False):
+        if not referrer:
+            return COMMISSION_RATE_STANDARD
+        if getattr(referrer, "is_partner", False):
             return COMMISSION_RATE_PARTNER
-        return COMMISSION_RATE_STANDARD
+        if (referrer.subscription_status or "").lower() == "active":
+            return COMMISSION_RATE_STANDARD
+        return COMMISSION_RATE_FREE
 
     @staticmethod
     def calculate_commission(subscription, db: Session, already_settled: bool = False):

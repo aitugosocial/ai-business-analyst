@@ -9,12 +9,13 @@ from decimal import Decimal
 
 from database.pg_connections import get_db
 from database.pg_models import User, Referral, Subscriptions, Commission
+from subscriptions.commission_service import CommissionService
 
 from api.routes.auth.login import get_current_user
 
 router = APIRouter(prefix="", tags=["earnings"])
 
-COMMISSION_RATE = 0.4           # 40% — displayed rate for all users
+COMMISSION_RATE = 0.4           # 40% — fallback/legacy flat rate; see CommissionService._get_rate_for_referrer
 COMMISSION_RATE_PARTNER = 0.5   # 50% — actual payout for partners/staff (not shown)
 
 
@@ -152,7 +153,10 @@ async def get_earnings_summary(
             "totalRevenue": total_commissions,
             "transactions": total_referrals,
             "avgOrderValue": round(total_commissions / paid_referrals, 2) if paid_referrals > 0 else 0,
-            "commissionRate": 40  # Always display 40% regardless of actual partner payout rate
+            # 40% for a subscribed/active referrer (and for partners — their
+            # actual 50% payout stays hidden, same as before); 15% for a
+            # referrer on the free plan. See _get_rate_for_referrer.
+            "commissionRate": int(CommissionService._get_rate_for_referrer(user_id, db) * 100) if not getattr(current_user, "is_partner", False) else 40
         }
         print(f"[/earnings/summary] RETURNING PAYLOAD: {result_payload}")
         return result_payload
@@ -225,6 +229,7 @@ async def get_monthly_performance(
     user_id = current_user.id
     try:
         print(f"[/earnings/monthly] Starting for user {user_id}")
+        user_commission_rate = CommissionService._get_rate_for_referrer(user_id, db)
         today = datetime.now()
         monthly_data = []
         
@@ -298,9 +303,11 @@ async def get_monthly_performance(
                 if month_start <= payment.created_at <= month_end
             ]
             
-            # Calculate commissions for this month
+            # Calculate commissions for this month, at this user's own actual
+            # rate (40% subscribed / 15% free / 50% partner) rather than a
+            # flat assumption — see CommissionService._get_rate_for_referrer.
             month_subscription_total = sum(float(p.amount) for p in month_payments)
-            month_commissions = round(month_subscription_total * COMMISSION_RATE, 2)
+            month_commissions = round(month_subscription_total * float(user_commission_rate), 2)
             
             # Count paid users this month (users who made payment)
             paid_users_this_month = len(set(p.user_id for p in month_payments))
@@ -428,7 +435,8 @@ async def get_monthly_metrics_for_period(
         ).first()
         
         total_subscription_amount = float(month_payments.total_amount or 0)
-        month_commission = round(total_subscription_amount * COMMISSION_RATE, 2)
+        user_commission_rate = CommissionService._get_rate_for_referrer(user_id, db)
+        month_commission = round(total_subscription_amount * float(user_commission_rate), 2)
         
         print(f"[/earnings/monthly/{year}/{month}] Commission from payments in month: ${month_commission}")
         
